@@ -1,0 +1,17 @@
+# Build trees (build.ps1 writes build/Release and build/Debug)
+build/
+out/
+CMakeUserPresets.json
+
+# Editor and OS files
+.vs/
+.vscode/
+*.user
+.DS_Store
+Thumbs.db
+
+# Compiler outputs outside the build tree
+*.obj
+*.exe
+*.pdb
+*.ilk
