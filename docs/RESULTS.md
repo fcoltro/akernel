@@ -14,7 +14,7 @@ Twenty-two test programs, one per module.
 | Build | Result on the final sources |
 |---|---|
 | Release | 22 of 22 pass |
-| Debug | 21 of 21 pass on the Phase 1 sources (782 s); `seam_certificate_test` and `contact_point_test`, changed or added since, pass on their own (43 s and 0.06 s) |
+| Debug | 22 of 22 pass |
 
 On this machine Windows refuses some freshly built executables ("An Application Control policy has blocked this file"), in either build, and which file is refused changes from build to build. That is an operating-system policy decision, not a test failure. Every test program has run and passed on the final sources.
 
@@ -858,7 +858,15 @@ whose root at a contact with definite relative curvature is regular, so a 5-dime
 | A rational cap (weights 1, 2, 1 in each direction, apex at height 5/4) against z = 5/4 / 2^-30 above | Isolated touch / separated |
 | The cap shifted by 1/3 (apex at non-dyadic parameters) | Undecided: the root is unique in its box, but no exact candidate exists |
 
-With the exact check disabled, 6 of its 15 checks fail. The classifier is not yet called by the surface/surface search or the Booleans; that is the next step (the curated box touching the hill top is the first target). Its statements are local: "separated" and "loop" describe the neighbourhood of the certified pair, and showing that nothing else intersects in a region remains the search's job.
+With the exact check disabled, 6 of its 15 checks fail. Its statements are local: "separated" and "loop" describe the neighbourhood of the certified pair, and showing that nothing else intersects in a region remains the search's job.
+
+**In the Booleans: a curved face touching a plane at one point.** Where the surface/surface search of a curved patch and a plane cannot finish, and the boxes it leaves are small, the imprint now tries a point contact (`point_touch`, `op/boolean.hpp`), decided exactly on the plane function g of the patch (its exact Bernstein form, homogeneous, so rational patches are covered):
+- a dyadic point p* near the boxes left where g, g_u and g_v vanish, in expansion arithmetic;
+- g's Hessian definite over a dyadic box containing every box left (its second derivatives restricted exactly to that box, their coefficient hulls giving a positive determinant): g is strictly convex or concave there, so p* is its only zero.
+
+Since the search proved everything outside those boxes, the pair meets in the curves found and at p*. The faces are not split there. If the point lies strictly inside a face of each solid, the two regions are recorded as touching at a point, and a result that keeps both reports a point contact and is not manifold; a point on a face's boundary is refused.
+
+The curated case of §3 ("not in general position") is now solved: a box whose bottom z = 1.3 touches the top of the hill z = 1 + 1.2·B₁(u)B₁(v) at its apex (u, v) = (1/2, 1/2), where the top's height 1 + (2.2 − 1)/4 is the double 1.3 exactly. The intersection is empty, the union is both solids touching at the apex (3.933333333333 = 2.8 + 1.133333333333, two components, one point contact, not manifold), and the difference is the hill (1.133333333333 = 1 + 1.2/9), all to 1e-12 (`tests/op/boolean_test.cpp`). The same box moved so that the apex lies on an edge of its bottom face is still refused. With the point-contact proof disabled, the case is refused as before and 2 checks fail.
 
 ### A compiler fault
 
@@ -888,7 +896,8 @@ Each of these stops with a message naming the two faces involved. None returns a
 
 | Configuration | Outcome |
 |---|---|
-| A box whose bottom touches the top of the hill in one point | Not solved: tangential contact |
+| A box whose bottom touches the top of the hill in one point | Solved since tangent points (§3): the apex is proven the only contact; union with one point contact, not manifold |
+| The same, with the apex on an edge of the box's bottom face | Not solved: the edge touches the surface |
 | A tilted box whose edge leaves the unit box exactly through one of its edges | Solved since the classification clash (§3): intersection 1/8 |
 | An edge crossing an edge at one point, all faces otherwise transversal | Solved since edges through edges (§3): the crossing point (1, 1, 0.5) is exact; intersection 1/48 |
 | Two curved faces meeting tangentially along a shared edge | Refused by the fan check around the edge |
@@ -1099,6 +1108,8 @@ Phase 1 of the survey's roadmap (v0.17) changes no result. The outward rounding 
 | `quadric_test` | 4,479 | 3,689 | −18 % |
 
 The Release suite takes 110 s (151 s before; `identity_test` 64 s against 98 s), and the Debug suite 782 s (916 s). The full benchmark took 484 s with exact points and 465 s without; the earlier runs ran beside the Debug suite, so those totals are not compared. All 21 test programs pass in Release and in Debug.
+
+Point contacts in the Booleans (§3, "Tangent points, certified"): both benchmark runs, with exact points on and off, reproduce every hash above bit for bit. The new proof runs only where the surface/surface search has already failed, and no Boolean of the benchmark has a point contact. All 22 test programs pass in Release and in Debug (that run's timings, 189 s and 1,123 s, came from a busier machine: `identity_test` took 114 s in Release against 64 s before on unchanged code).
 
 Timings of the tangency-along-a-ruling round are not comparable with the earlier ones. The full benchmark took 503 s in one run and 679 s in another (925 s before), both with the Debug test suite running beside it; sections whose code and results are unchanged ran in about half their earlier time in the first of those runs (a random-box chain step at depth 6: 204 ms against 362 ms), so the difference is the state of the machine, not the code.
 

@@ -167,6 +167,7 @@ struct ImprintStats {
     int edge_crossings = 0;          ///< edges proven to cross an edge of the other solid in space, at an exact point
     int line_tangencies = 0;         ///< curved surfaces proven to touch a plane along a line inside the patch
     int graph_crossings = 0;         ///< pairs of graphs crossing where they share boundary lines, desingularised exactly
+    int point_contacts = 0;          ///< pairs of a curved surface and a plane touching at one point, proven exactly
     int ssi_pairs_empty = 0;          ///< intersected surface pairs that gave no curve
     double ssi_ms_empty = 0.0, ssi_ms_curves = 0.0; ///< time in surface pairs without and with curves
     std::size_t ssi_nodes_empty = 0, ssi_nodes_curves = 0; ///< completeness-pass nodes, likewise
@@ -236,6 +237,9 @@ struct Imprint {
     /// Pairs of regions, of the two solids, that touch along a line inside
     /// both (a curved face against a plane tangent to it along a ruling).
     std::vector<std::pair<int, int>> touching_regions;
+    /// Pairs of regions, of the two solids, that touch at one point inside
+    /// both (a curved face against a plane tangent to it at a point).
+    std::vector<std::pair<int, int>> point_touching_regions;
     ImprintStats stats;
     std::vector<std::string> trace; ///< filled when BooleanOptions::trace is set
 };
@@ -573,6 +577,14 @@ class Builder {
         Interval r;
     };
     std::vector<LineTouch> line_touches;
+    /// A curved surface `a` touching the plane `b` at one point: its exact
+    /// parameters on `a`, and the point.
+    struct PointTouch {
+        int a = -1, b = -1;
+        double u = 0.0, v = 0.0;
+        geom::Vec3<Interval> P;
+    };
+    std::vector<PointTouch> point_touches;
     std::vector<Touch> touches;
 
     const Brep& S(int k) const { return *im.solid[k]; }
@@ -1705,6 +1717,9 @@ private:
                         swap_xy = true;
                     if (!res.complete && !graph_crossing_refusal.empty()) return fail(where + ": " + graph_crossing_refusal);
                 }
+                // A curved surface touching a plane at one point, inside the
+                // region the search could not finish: proven exactly.
+                if (!res.complete && known.empty() && point_touch(x, y, res, where)) res.complete = true;
                 if (!res.complete && iso_side_tangent)
                     return fail(where + ": a side of one lies in the other along one of its lines but they do not "
                                         "meet transversally along it (tangent along it; not in general position)");
@@ -2377,6 +2392,81 @@ private:
         res = std::move(out);
         ++im.stats.graph_crossings;
         graph_crossing_seen = true;
+        return true;
+    }
+
+    /// A curved patch that touches a plane at one point, inside the region the
+    /// surface/surface search could not finish (roadmap phase 2; RESULTS.md
+    /// §3, "Tangent points, certified"). The plane function g of the patch
+    /// (exact Bernstein form, homogeneous, so rational patches are covered)
+    /// vanishes together with its gradient at dyadic parameters p*, and g's
+    /// Hessian is definite over a dyadic box U containing every box the
+    /// search left: g is then strictly convex or concave on U, so p* is its
+    /// only zero there. Since the search proved everything outside those
+    /// boxes, the pair meets in the curves found and in that one point.
+    bool point_touch(int x, int y, const solve::SsiResult& res, const std::string& where) {
+        using E = num::Expansion;
+        using contact_detail::restrict_dir;
+        const bool px = is_planar[static_cast<std::size_t>(x)], py = is_planar[static_cast<std::size_t>(y)];
+        if (px == py) return false;
+        const int c = px ? y : x, pl = px ? x : y;
+        const PolyPatchD& X = im.carriers[static_cast<std::size_t>(c)];
+        const PolyPatchD& Y = im.carriers[static_cast<std::size_t>(pl)];
+        if (!planar_affine(Y)) return false;
+        const Interval hu = res.unverified_hull[px ? 2u : 0u], hv = res.unverified_hull[px ? 3u : 1u];
+        if (!(hu.hi - hu.lo < 1e-3 && hv.hi - hv.lo < 1e-3)) return false; // a small region only
+        const ExactBernstein g = plane_function(X, Y);
+        auto deriv = [](const ExactBernstein& f, bool in_u) {
+            const int n = in_u ? f.p : f.q;
+            ExactBernstein d(in_u ? std::max(f.p - 1, 0) : f.p, in_u ? f.q : std::max(f.q - 1, 0));
+            if (n == 0) {
+                for (auto& e : d.c) e = E(0.0);
+                return d;
+            }
+            for (int i = 0; i <= d.p; ++i)
+                for (int j = 0; j <= d.q; ++j)
+                    d.at(i, j) = (in_u ? f.at(i + 1, j) - f.at(i, j) : f.at(i, j + 1) - f.at(i, j)) * E(static_cast<double>(n));
+            return d;
+        };
+        auto value = [&](const ExactBernstein& f, double u, double v) {
+            return restrict_dir(restrict_dir(f, true, u, u), false, v, v).c[0];
+        };
+        // The box U: the hull of the boxes left, widened, with dyadic ends.
+        auto down = [](double t) { return std::ldexp(std::floor(std::ldexp(t, 24)), -24); };
+        auto up = [](double t) { return std::ldexp(std::ceil(std::ldexp(t, 24)), -24); };
+        const double mu = std::max(hu.hi - hu.lo, std::ldexp(1.0, -20)), mv = std::max(hv.hi - hv.lo, std::ldexp(1.0, -20));
+        const double u0 = down(hu.lo - mu), u1 = up(hu.hi + mu), v0 = down(hv.lo - mv), v1 = up(hv.hi + mv);
+        // p*: the dyadic point of fewest bits near the middle where g and its
+        // gradient vanish exactly.
+        const ExactBernstein gu = deriv(g, true), gv = deriv(g, false);
+        double us = 0.0, vs = 0.0;
+        bool found = false;
+        for (int bits = 1; bits <= 40 && !found; ++bits) {
+            us = std::ldexp(std::nearbyint(std::ldexp(num::mid(hu), bits)), -bits);
+            vs = std::ldexp(std::nearbyint(std::ldexp(num::mid(hv), bits)), -bits);
+            if (!(us >= u0 && us <= u1 && vs >= v0 && vs <= v1)) continue;
+            found = value(g, us, vs).sign() == 0 && value(gu, us, vs).sign() == 0 && value(gv, us, vs).sign() == 0;
+        }
+        if (!found) return false;
+        // Definite Hessian over U, from the coefficient hulls.
+        auto hull_over = [&](const ExactBernstein& f) {
+            const ExactBernstein r = restrict_dir(restrict_dir(f, true, u0, u1), false, v0, v1);
+            Interval h = enclose(r.c[0]);
+            for (const E& e : r.c) h = num::hull(h, enclose(e));
+            return h;
+        };
+        const Interval huu = hull_over(deriv(gu, true)), huv = hull_over(deriv(gu, false)), hvv = hull_over(deriv(gv, false));
+        const Interval det = huu * hvv - huv * huv;
+        if (!(det.lo > 0.0 && (huu.lo > 0.0 || huu.hi < 0.0))) {
+            note(where + ": a point where the surface touches the plane exactly, but its curvature against the plane is not "
+                         "proven definite there (not an isolated contact)");
+            return false;
+        }
+        const auto h = icarrier[static_cast<std::size_t>(c)].eval(Interval(us), Interval(vs));
+        point_touches.push_back({c, pl, us, vs, {h.x / h.w, h.y / h.w, h.z / h.w}});
+        ++im.stats.point_contacts;
+        note(where + ": surface " + str(c) + " touches the plane " + str(pl) + " at one point, at parameters (" + std::to_string(us) +
+             ", " + std::to_string(vs) + "), proven exactly, and nowhere else in the region left");
         return true;
     }
 
@@ -4844,6 +4934,29 @@ private:
                     if (found) im.touching_regions.push_back({r1, r2});
                 }
             }
+        // Regions of the two solids that touch at one point inside both. A
+        // point on a face's boundary would need a vertex there: refused.
+        for (const PointTouch& t : point_touches)
+            for (int r1 = 0; r1 < nR; ++r1) {
+                Region& R1 = im.regions[static_cast<std::size_t>(r1)];
+                if (gid(R1.solid, S(R1.solid).faces[static_cast<std::size_t>(R1.face)].carrier) != t.a) continue;
+                const Where w1 = locate(R1.geom, Interval(t.u), Interval(t.v), opt.refine_depth);
+                if (w1 == Where::Outside) continue;
+                if (w1 != Where::Inside) return fail("a curved face touches a plane at one point on the boundary of the face");
+                for (int r2 = 0; r2 < nR; ++r2) {
+                    Region& R2 = im.regions[static_cast<std::size_t>(r2)];
+                    if (R2.solid == R1.solid) continue;
+                    const int gb = gid(R2.solid, S(R2.solid).faces[static_cast<std::size_t>(R2.face)].carrier);
+                    if (!equiv(gb, t.b)) continue;
+                    Interval pu, pv;
+                    if (!plane_params(im.carriers[static_cast<std::size_t>(gb)], t.P, pu, pv))
+                        return fail("a point where a curved face touches a plane could not be placed in the plane's face");
+                    const Where w2 = locate(R2.geom, pu, pv, opt.refine_depth);
+                    if (w2 == Where::Outside) continue;
+                    if (w2 != Where::Inside) return fail("a curved face touches a plane at one point on the boundary of a flat face");
+                    im.point_touching_regions.push_back({r1, r2});
+                }
+            }
         // On the other solid's boundary: a region of a shared surface inside a
         // face of the other solid there.
         for (Region& reg : im.regions) {
@@ -5439,6 +5552,9 @@ struct BooleanResult {
     /// its two faces touching that face's surface from one side: the parts
     /// touch there without sharing an edge (the face is not split).
     int line_contacts = 0;
+    /// Points at which a curved face of the result touches a flat face of it
+    /// inside both (not at a vertex): the parts touch there.
+    int point_contacts = 0;
 };
 
 /// Assemble the result of one Boolean operation from an imprint.
@@ -5569,6 +5685,13 @@ inline BooleanResult select(const Imprint& im, Op op) {
             if (edge_kept) ++r.line_contacts;
         }
         if (r.line_contacts > 0) r.manifold = false;
+    }
+    if (r.ok && !r.empty && !im.point_touching_regions.empty()) {
+        std::vector<char> kept(im.regions.size(), 0);
+        for (int ri : r.regions) kept[static_cast<std::size_t>(ri)] = 1;
+        for (const auto& [r1, r2] : im.point_touching_regions)
+            if (kept[static_cast<std::size_t>(r1)] && kept[static_cast<std::size_t>(r2)]) ++r.point_contacts;
+        if (r.point_contacts > 0) r.manifold = false;
     }
     return r;
 }

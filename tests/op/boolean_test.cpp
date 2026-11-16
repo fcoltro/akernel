@@ -484,19 +484,45 @@ int main() {
 
     // --- 7. not in general position: reported, never answered wrongly ------------
     {
-        // An imprint that is not solved gives no result.
-        const Brep B = op::to_brep(op::make_box({-0.5, -0.5, 1.3}, {1.5, 1.5, 2.0}));
+        // An imprint that is not solved gives no result. Here the box's bottom
+        // touches the hill's apex (0.5, 0.5, 1.3) exactly on an edge of that
+        // face: a point contact on a face's boundary, still refused.
+        const Brep B = op::to_brep(op::make_box({0.5, -0.5, 1.3}, {1.5, 1.5, 2.0}));
         const Imprint im = op::imprint(op::to_brep(op::make_bump_box({0, 0, 0}, 1, 1, 1, 0.3)), B);
         AK_CHECK(!im.ok);
         const BooleanResult r = op::select(im, Op::Union);
         AK_CHECK(!r.ok && r.solid.faces.empty());
+        std::printf("box touching a hill on an edge of its bottom: %s\n", im.error.c_str());
     }
     {
-        // A box whose bottom touches the top of a hill in one point.
+        // A box whose bottom touches the top of a hill in one point, inside
+        // both faces: the plane z = 1.3 touches the hill's top at its apex
+        // (u, v) = (1/2, 1/2), where the top's height 1 + (2.2 - 1) / 4 is
+        // the double 1.3 exactly. Proven exactly (an exact zero of the plane
+        // function with its gradient, and a definite Hessian over the region
+        // the search left). The intersection is that point: empty. The union
+        // is both solids, touching at it (not manifold); the difference is
+        // the hill. The hill's volume is 1 + 1.2 (1/3)^2.
         const Brep B = op::to_brep(op::make_box({-0.5, -0.5, 1.3}, {1.5, 1.5, 2.0}));
         const Imprint im = op::imprint(hill, B);
-        AK_CHECK(!im.ok);
-        std::printf("box touching a hill: %s\n", im.error.c_str());
+        AK_CHECK(im.ok);
+        AK_CHECK(im.stats.point_contacts == 1);
+        const double vh = 1.0 + 4.0 * bump / 9.0, vb = 2.0 * 2.0 * 0.7;
+        if (im.ok) {
+            const BooleanResult i = op::select(im, Op::Intersection), u = op::select(im, Op::Union), d = op::select(im, Op::Difference);
+            AK_CHECK(i.ok && i.empty);
+            AK_CHECK(u.ok && !u.empty && u.audit.closed() && !u.manifold && u.point_contacts == 1);
+            AK_CHECK(d.ok && !d.empty && d.manifold && d.point_contacts == 0);
+            if (u.ok && d.ok && !u.empty && !d.empty) {
+                AK_CHECK_NEAR(op::volume(u.solid), vh + vb, 1e-12);
+                AK_CHECK_NEAR(op::volume(d.solid), vh, 1e-12);
+            }
+            std::printf("box touching a hill at one point: solved; union %.12f (%.12f), difference %.12f (%.12f), point contacts %d\n",
+                        u.ok && !u.empty ? op::volume(u.solid) : 0.0, vh + vb, d.ok && !d.empty ? op::volume(d.solid) : 0.0, vh,
+                        u.point_contacts);
+        } else {
+            std::printf("box touching a hill at one point: %s\n", im.error.c_str());
+        }
     }
     {
         // A tilted box whose edge from (0.5, 0.5, 0.5) to (0.5, 1.5, 1.5)
