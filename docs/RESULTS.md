@@ -1,6 +1,6 @@
 # akernel — measured results
 
-Measured on 2026-11-11, 2026-11-12 (tessellation, the vertex-manifoldness check, algebraic identities, non-manifold results, exact quadrics, curved chains) 2026-11-13 (spatial index, plane pairs, arc searches, tangential contact, flat faces on rational carriers), 2026-11-14 (contact cases left after the flat-face work) and 2026-11-15 (exact points) with `ak_bench.exe` and the test suite.
+Measured on 2026-11-11, 2026-11-12 (tessellation, the vertex-manifoldness check, algebraic identities, non-manifold results, exact quadrics, curved chains) 2026-11-13 (spatial index, plane pairs, arc searches, tangential contact, flat faces on rational carriers), 2026-11-14 (contact cases left after the flat-face work) 2026-11-15 (exact points, hill-top crossings) and 2026-11-16 (roadmap phases 1 and 2: certified seam bounds, the faster interval step, tangent points) with `ak_bench.exe` and the test suite.
 
 - Build: every number and timing below is from the Release benchmark (`/O2`) unless a row says otherwise. Rows taken from the test programs are marked as such.
 - Setup: Windows 11 x64, MSVC 19.51, `/fp:strict`, single thread, fixed random seeds.
@@ -9,12 +9,12 @@ Measured on 2026-11-11, 2026-11-12 (tessellation, the vertex-manifoldness check,
 
 ## Test suite status
 
-Twenty-one test programs, one per module.
+Twenty-two test programs, one per module.
 
 | Build | Result on the final sources |
 |---|---|
-| Release | 20 of 20 pass |
-| Debug | 20 of 20 pass |
+| Release | 22 of 22 pass |
+| Debug | 21 of 21 pass on the Phase 1 sources (782 s); `seam_certificate_test` and `contact_point_test`, changed or added since, pass on their own (43 s and 0.06 s) |
 
 On this machine Windows refuses some freshly built executables ("An Application Control policy has blocked this file"), in either build, and which file is refused changes from build to build. That is an operating-system policy decision, not a test failure. Every test program has run and passed on the final sources.
 
@@ -832,6 +832,33 @@ The second kind of tangency above: two hill tops of equal base height whose bump
 Without `graph_crossing` both checks fail (the first is refused as tangency, the second with the older message).
 
 **On the curved chains (§3):** 209 of 214 steps committed (200 of 208 before), and 29 chains run all six steps. Chains 29 and 32 run to the end. Chain 7 is refused with the reason above. Chain 33 passes its crossing and stops at a different case: an arc of the earlier result (a cylinder against the first top) ends exactly on the shared line, so it meets the second top at its end vertex, and the search along arcs cannot place a root at an arc's end. Worst Monte Carlo deviation 2.62 sigma, none beyond 3. All 202 committed non-empty results tessellate closed (4 non-manifold), with the Brep's Euler characteristic and components. The 5 refusals left: the blurred touch of chain 7, two curves tangent at a vertex (chain 35), and three three-surface searches (chains 23, 31 and 33).
+
+### Tangent points, certified (roadmap phase 2, first step)
+
+Where two surfaces touch at a single point, their intersection is a singular root of A(u,v) = B(s,t): interval methods can prove that no root exists but never that one does, since an arbitrarily small perturbation removes it. Every refusal of the kind "a box whose bottom touches the top of the hill in one point" comes from this. The survey ([SURVEY.md](SURVEY.md)) points to deflation, which turns the question into a regular one. `solve/contact_point.hpp` (new) solves the square system in (u, v, s, t, μ)
+
+- A(u,v) − B(s,t) + μ N_A(u,v) = 0 (three equations, N_A = A_u × A_v),
+- N_A · B_s = 0 and N_A · B_t = 0 (parallel tangent planes),
+
+whose root at a contact with definite relative curvature is regular, so a 5-dimensional Krawczyk test proves it the only one in a box. μ is the signed distance between the facing points along A's normal. Then:
+- **μ proven nonzero.** With the relative curvature D = II_B − II_A definite (decided with intervals over the box), B's height over A near there is μ|N_A| + ½ xᵀDx + …: the surfaces are **separated** there if μ and D have the same sign, and cross in a **small loop** around the point otherwise.
+- **μ's enclosure contains 0.** A dyadic candidate near the root is checked in expansion arithmetic, in homogeneous form, so rational patches are covered: the two points are proportional, and B_s, B_t lie in A's projective tangent plane span(P, P_u, P_v) (two 4×4 determinants vanish). The candidate is then a root with μ = 0, the only one in the box: the surfaces **touch** exactly there, at an isolated point if D is definite, at a **singular crossing** of two intersection curves if D is indefinite.
+- Otherwise it is **undecided**, with the reason.
+
+`tests/solve/contact_point_test.cpp` (new, the 22nd test program), a paraboloid cap z = 1 − (x² + y²)/2 against horizontal planes:
+
+| Case | Result |
+|---|---|
+| Plane through the apex | Isolated touch, exactly at (u, v, s, t) = (1/2, 1/2, 3/8, 3/8) |
+| Plane 2^-20 above | Separated; μ = 2.384e-07 = 2^-20 / \|N_A\| |
+| Plane 2^-20 below | Small loop |
+| Plane 2^-44 (6e-14) above | Separated; μ ∈ [1.28e-14, 1.56e-14] |
+| Saddle z = (x² − y²)/2 against its tangent plane | Singular crossing, exactly at the saddle point |
+| The cap with every weight 2 (rational form), plane through the apex / 2^-20 below | Isolated touch / small loop |
+| A rational cap (weights 1, 2, 1 in each direction, apex at height 5/4) against z = 5/4 / 2^-30 above | Isolated touch / separated |
+| The cap shifted by 1/3 (apex at non-dyadic parameters) | Undecided: the root is unique in its box, but no exact candidate exists |
+
+With the exact check disabled, 6 of its 15 checks fail. The classifier is not yet called by the surface/surface search or the Booleans; that is the next step (the curated box touching the hill top is the first target). Its statements are local: "separated" and "loop" describe the neighbourhood of the certified pair, and showing that nothing else intersects in a region remains the search's job.
 
 ### A compiler fault
 
