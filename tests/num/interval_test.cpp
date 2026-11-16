@@ -3,6 +3,11 @@
 #include <akernel/num/expansion.hpp>
 #include <akernel/num/interval.hpp>
 
+#include <bit>
+#include <cstdint>
+#include <limits>
+#include <vector>
+
 #include "check.hpp"
 
 using namespace ak::num;
@@ -100,6 +105,33 @@ int main() {
         const Interval s = Interval(0.1) + Interval(0.2);
         AK_CHECK(contains(s, 0.3));
         AK_CHECK(width(s) < 1e-15);
+    }
+
+    // The outward step is std::nextafter towards -inf / +inf, bit for bit:
+    // special values, and random doubles over the whole exponent range.
+    {
+        const double inf = std::numeric_limits<double>::infinity();
+        auto same = [](double a, double b) {
+            return (std::isnan(a) && std::isnan(b)) || std::bit_cast<std::uint64_t>(a) == std::bit_cast<std::uint64_t>(b);
+        };
+        std::vector<double> xs = {0.0, -0.0, inf, -inf, std::numeric_limits<double>::quiet_NaN(),
+                                  std::numeric_limits<double>::denorm_min(), -std::numeric_limits<double>::denorm_min(),
+                                  std::numeric_limits<double>::min(), -std::numeric_limits<double>::min(),
+                                  std::numeric_limits<double>::max(), -std::numeric_limits<double>::max(), 1.0, -1.0,
+                                  0.1, -0.1};
+        for (int i = 0; i < 100000; ++i) {
+            std::uint64_t bits = rng.next();
+            const double x = std::bit_cast<double>(bits);
+            xs.push_back(x);
+        }
+        int mismatches = 0;
+        for (double x : xs) {
+            if (!same(detail::step_up(x), std::nextafter(x, inf))) ++mismatches;
+            if (!same(detail::step_down(x), std::nextafter(x, -inf))) ++mismatches;
+        }
+        AK_CHECK(mismatches == 0);
+        std::printf("  outward step against std::nextafter: %d values, %d mismatches\n", static_cast<int>(xs.size()),
+                    mismatches);
     }
 
     return akt::finish("interval_test");

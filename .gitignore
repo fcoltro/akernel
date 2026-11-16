@@ -15,3 +15,7 @@ Thumbs.db
 *.exe
 *.pdb
 *.ilk
+
+# Research notes and reports from literature surveys (kept local)
+research_notes/
+reports/

@@ -11,7 +11,9 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 
 #include <akernel/num/escalation_policy.hpp>
@@ -34,11 +36,22 @@ public:
 };
 
 namespace detail {
+// One representable double outward, by stepping the bit pattern: the same
+// result as std::nextafter towards -inf / +inf for every input (NaN, both
+// zeros, subnormals, the largest finite values and both infinities), without
+// a library call. IEEE-754 doubles of one sign are ordered like their bit
+// patterns read as integers.
 inline double step_down(double x) noexcept {
-    return std::nextafter(x, -std::numeric_limits<double>::infinity());
+    if (!(x == x) || x == -std::numeric_limits<double>::infinity()) return x;
+    if (x == 0.0) return -std::numeric_limits<double>::denorm_min();
+    const std::uint64_t b = std::bit_cast<std::uint64_t>(x);
+    return std::bit_cast<double>(x > 0.0 ? b - 1 : b + 1);
 }
 inline double step_up(double x) noexcept {
-    return std::nextafter(x, std::numeric_limits<double>::infinity());
+    if (!(x == x) || x == std::numeric_limits<double>::infinity()) return x;
+    if (x == 0.0) return std::numeric_limits<double>::denorm_min();
+    const std::uint64_t b = std::bit_cast<std::uint64_t>(x);
+    return std::bit_cast<double>(x > 0.0 ? b + 1 : b - 1);
 }
 /// Widen computed bounds by one double each side; NaN becomes "anything".
 inline Interval outward(double l, double h) noexcept {

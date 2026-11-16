@@ -9,7 +9,7 @@ Measured on 2026-11-11, 2026-11-12 (tessellation, the vertex-manifoldness check,
 
 ## Test suite status
 
-Twenty test programs, one per module.
+Twenty-one test programs, one per module.
 
 | Build | Result on the final sources |
 |---|---|
@@ -885,8 +885,39 @@ A square hole in the surface z = 0.2 sin(2.5x + 0.3) cos(2y) + 0.1xy is filled b
 - Observed convergence orders in the knot spacing: 7.4 (G1), 6.4 (G2), 5.4 (G3), consistent with degree 7.
 - The fill is a different surface from the original: at the centre it differs by 4.0e-05.
 - A cubic surface has zero fourth-order energy, so the fill must reproduce it. It does, to 5.6e-15 (`tests/var/fill_test.cpp`).
-- These jumps are sampled in doubles. They are not yet certified interval bounds, which the blueprint calls for.
+- These jumps are sampled in doubles, on a surface that is not polynomial. Certified bounds, for fills whose neighbour is a polynomial patch, follow below.
 - The joins are C^3 in a shared parameterisation. Joins that need a reparameterisation (gauge functions) are not implemented.
+
+### Certified seam bounds
+
+`geom/seam_certificate.hpp` (new) bounds the jumps over a whole seam, rigorously, for two polynomial patches in one common parameterisation (the setting of the fill). It is the first step of the roadmap in [SURVEY.md](SURVEY.md), and it turns this section's sampled check into a certificate. On each part of the seam:
+- **Residuals in Bernstein form.** Every jet entry D^(k,l), k + l ≤ 3, is a polynomial along the seam. Its Bernstein coefficients for both patches are computed by de Casteljau steps in interval arithmetic, raised to a common degree and subtracted; the largest coefficient bounds the residual Δ = J_B − J_A.
+- **Mean value.** Each jump is H(J_A, J_B) with H(J_A, J_A) = 0, so it equals ∂H/∂J_B · Δ at an intermediate point. The gradient is enclosed by forward differentiation in interval arithmetic, with A's jet over the hull of its coefficients and B's over the hull of both, and the jump is bounded by Σ |∂H/∂J_i| ε_i, rounded upward.
+
+A bound computed this way shrinks with the residual, however small it is. Enclosing each surface's invariants separately could not resolve a jump smaller than the variation of the invariants along a part (here 1e-9 against variations of order 1).
+
+`tests/geom/seam_certificate_test.cpp` (new, the 21st test program) checks:
+
+| Case | Certified | Sampled maximum (401 points) |
+|---|---|---|
+| Patches equal to third order (rows 0 to 3 shared) | every jump ≤ 2.6e-11 | 0 |
+| Row 1 moved by about 1e-4: G1 jump | normal angle 8.629e-04 rad | 8.616e-04 |
+| Row 2 moved: G2 jump | b(ν,ν) 4.357e-03, normal angle 1.5e-14 | 4.224e-03, 0 |
+| Row 3 moved: G3 jump | C(ν,ν,ν) 1.736e-02, b(ν,ν) 6.1e-14 | 1.657e-02, 0 |
+
+(64 parts per seam.) On 24 seams between random patches with differences of 1e-6 to 1e-2, on all four sides, every certified bound covers every sampled jump. A rational patch, and a neighbour whose normal points the other way, are refused with a reason.
+
+The G3 fill of a hole in a polynomial surface of degree 9 (which the fill, reproducing cubics, does not reproduce), certified on every boundary piece of the fill against that surface, 32 parts per seam:
+
+| Fill | Seams | G1, rad: certified (sampled) | G2: certified (sampled) | G3: certified (sampled) | Gap, certified |
+|---|---|---|---|---|---|
+| 12 × 12 | 20 | 6.37e-06 (6.00e-06) | 2.63e-04 (1.27e-04) | 2.87e-02 (6.03e-03) | 9.98e-07 |
+| 16 × 16 | 36 | 1.21e-07 (1.20e-07) | 5.15e-06 (3.72e-06) | 6.55e-04 (3.52e-04) | 9.50e-09 |
+| 24 × 24 | 68 | 1.08e-09 (1.05e-09) | 9.39e-08 (8.04e-08) | 1.97e-05 (1.50e-05) | 6.11e-11 |
+
+The certified G1 bound is within 6 % of the sampled maximum at every resolution; G2 and G3 come within 17 % and 31 % at 24 × 24. They are looser on the coarse fill, where the positional gap is largest and the bound adds the contributions of all 30 jet coordinates without cancellation. With the derivative residuals left out of the bound (a red check), 999 of the test's 1,407 checks fail.
+
+Limits: polynomial patches only (all weights 1), a common parameterisation (no gauge functions), and the fill's Bezier pieces are taken as polynomial (knot insertion in doubles leaves their weights within rounding of 1, and the pieces are defined with weight 1).
 
 ## 5. Energy-order rule
 
@@ -1016,6 +1047,17 @@ Tangency along a ruling (§3): with exact points on, only the curved-chain hash 
 
 Hill-top crossings (§3): with exact points on, only the curved-chain hash changes. With them off, every hash is the same as before, the curved chains' included (`076cc79a80b0285b`): no step that the new rules decide is reached without exact points. The tessellation hash is unchanged in both runs, so the new splitting of chords shared by two faces changed no earlier mesh. All 20 test programs pass in Release (151 s) and in Debug (916 s).
 
+Phase 1 of the survey's roadmap (v0.17) changes no result. The outward rounding step of the interval arithmetic (`num/interval.hpp`) is now a step of the bit pattern instead of a call to `std::nextafter`. It returns the same double for every input; `interval_test` compares the two on 100,015 values, including both zeros, subnormals, the largest finite values, both infinities and NaN, with no mismatch. Both benchmark runs, with exact points on and off, reproduce every hash of the hill-top crossing run bit for bit. The certified seam bounds (§4) are new code that no benchmark section calls. Speed, measured on an otherwise idle machine, best of three runs each:
+
+| Program | Before, ms | After, ms | Change |
+|---|---|---|---|
+| `ssi_test` | 1,685 | 1,243 | −26 % |
+| `csi_test` | 491 | 359 | −27 % |
+| `boolean_test` | 4,449 | 3,560 | −20 % |
+| `quadric_test` | 4,479 | 3,689 | −18 % |
+
+The Release suite takes 110 s (151 s before; `identity_test` 64 s against 98 s), and the Debug suite 782 s (916 s). The full benchmark took 484 s with exact points and 465 s without; the earlier runs ran beside the Debug suite, so those totals are not compared. All 21 test programs pass in Release and in Debug.
+
 Timings of the tangency-along-a-ruling round are not comparable with the earlier ones. The full benchmark took 503 s in one run and 679 s in another (925 s before), both with the Debug test suite running beside it; sections whose code and results are unchanged ran in about half their earlier time in the first of those runs (a random-box chain step at depth 6: 204 ms against 362 ms), so the difference is the state of the machine, not the code.
 
 So the Boolean results are bitwise identical between Debug and Release; the rewrite for trimmed operands, and the later rewrite for shared geometry, did not change any earlier result. The reuse chains have been run in Release only. All of this covers one machine, one compiler and single-threaded execution; other platforms and parallel execution are untested.
@@ -1032,7 +1074,7 @@ So the Boolean results are bitwise identical between Debug and Release; the rewr
 | Tolerance growth over chained Booleans | Met on 40 random chains of up to 6 operations: the certified edge gap stays at or below 7.7e-13 and vertex enclosures below 7.2e-13, with no growth from step 2 to step 6 (§3) |
 | Bitwise reproducibility | See §8; one compiler and one machine only |
 | Speed and memory relative to a legacy kernel | Not measured |
-| Certified G1/G2/G3 bounds | Sampled jumps only (§4) |
+| Certified G1/G2/G3 bounds | Met for seams between polynomial patches in a common parameterisation (§4, certified seam bounds): the bounds are within 6 % (G1) and 31 % (G3) of the sampled maxima on the finest fill. Rational patches and reparameterised joins are not covered |
 | Healing success rate | Not built |
 
 ## 10. What these results do not show
