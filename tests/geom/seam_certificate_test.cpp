@@ -85,6 +85,7 @@ const std::vector<std::vector<double>> kBase = {
 } // namespace
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     akt::Rng rng(20261115);
 
     // 1. Patches that agree to third order along v = 0 (rows 0..3 equal,
@@ -151,23 +152,101 @@ int main() {
             worst_ratio = std::max(worst_ratio, sound(c, m, 1e-12, false, ""));
             ++cases;
         }
-        std::printf("  random differences: %d seams, every bound covers its samples; worst bound / sample %.2f\n", cases,
+        std::printf("  random differences: %d seams checked against their samples; worst bound / sample %.2f\n", cases,
                     worst_ratio);
     }
 
-    // 4. Refusals: a rational patch, and a seam where the normals disagree in
-    //    orientation (B's u reversed).
+    // 4. A neighbour whose normal points the other way is refused.
     {
         const PolyPatchD A = graph(4, kBase);
-        PolyPatchD R = A;
-        R.at(2, 2) = R.at(2, 2) * 1.5; // weight 1.5
-        AK_CHECK(!certify_seam(A, R, kSeamV0).ok);
         PolyPatchD F = A;
         for (int i = 0; i <= 4; ++i)
             for (int j = 0; j <= 4; ++j) F.at(i, j).x = 1.0 - A.at(i, j).x; // mirrored: normal flips
         const SeamCertificate c = certify_seam(A, F, kSeamV0);
         AK_CHECK(!c.ok);
-        std::printf("  refused: rational patch; mirrored neighbour (%s)\n", c.why.c_str());
+        std::printf("  refused: mirrored neighbour (%s)\n", c.why.c_str());
+    }
+
+    // 4b. Rational patches: the residual is taken in homogeneous form. A
+    //     rational patch (weights 0.7 to 1.5) and copies of it that agree to
+    //     third order, or differ first in order 1, 2 or 3; then random
+    //     differences including the weights, on all four sides.
+    {
+        PolyPatchD R = graph(5, kBase);
+        for (int i = 0; i <= 5; ++i)
+            for (int j = 0; j <= 5; ++j) R.at(i, j) = R.at(i, j) * (1.1 + 0.4 * std::sin(0.7 * i + 1.3 * j));
+        {
+            PolyPatchD B = R;
+            for (int i = 0; i <= 5; ++i)
+                for (int j = 4; j <= 5; ++j) B.at(i, j) = B.at(i, j) * 1.3;
+            const SeamCertificate c = certify_seam(R, B, kSeamV0, 64);
+            AK_CHECK(c.ok);
+            const double all[9] = {c.gap, c.normal_angle, c.db_tt, c.db_tn, c.db_nn, c.dC_ttt, c.dC_ttn, c.dC_tnn, c.dC_nnn};
+            double worst = 0.0;
+            for (double x : all) worst = std::max(worst, x);
+            std::printf("  rational, third-order contact: largest certified jump %.2e\n", worst);
+            AK_CHECK(worst < 1e-10);
+        }
+        const char* names[3] = {"rational G1 jump", "rational G2 jump", "rational G3 jump"};
+        for (int row = 1; row <= 3; ++row) {
+            PolyPatchD B = R;
+            for (int i = 0; i <= 5; ++i) B.at(i, row).z += 1e-4 * B.at(i, row).w * (1.0 + 0.5 * std::cos(1.3 * i));
+            const SeamCertificate c = certify_seam(R, B, kSeamV0, 256);
+            AK_CHECK(c.ok);
+            if (!c.ok) continue;
+            const Measured m = sample(R, B, kSeamV0);
+            sound(c, m, 1e-12, true, names[row - 1]);
+            // Looser through the projection: within 1.25 for G1, 3 for G2 and G3.
+            const double first_c = row == 1 ? c.normal_angle : row == 2 ? c.db_nn : c.dC_nnn;
+            const double first_m = row == 1 ? m.angle : row == 2 ? m.db[2] : m.dC[3];
+            AK_CHECK(first_c <= (row == 1 ? 1.25 : 3.0) * first_m);
+        }
+        int cases = 0;
+        double worst_ratio = 0.0;
+        for (int trial = 0; trial < 16; ++trial) {
+            PolyPatchD B = R;
+            const double scale = std::pow(10.0, -2.0 - 4.0 * rng.unit());
+            for (auto& cp : B.c) {
+                cp.x += scale * rng.range(-1, 1);
+                cp.y += scale * rng.range(-1, 1);
+                cp.z += scale * rng.range(-1, 1);
+                cp.w += scale * rng.range(-1, 1);
+            }
+            const int side = trial % 4;
+            const SeamCertificate c = certify_seam(R, B, side, 64);
+            AK_CHECK(c.ok);
+            if (!c.ok) continue;
+            worst_ratio = std::max(worst_ratio, sound(c, sample(R, B, side), 1e-12, false, ""));
+            ++cases;
+        }
+        std::printf("  rational random differences: %d seams checked against their samples; worst bound / sample %.2f\n",
+                    cases, worst_ratio);
+    }
+
+    // 4c. Two adjacent sectors of one cylinder, exact rational carriers (the
+    //     construction of op::make_cylinder_sector, radius 1.25, heights 0 to
+    //     1): t in [0, 1/4] and [1/4, 1/2]. The second, continued backwards
+    //     over [-1, 0] of its parameter, meets the first along its side
+    //     u = 1 in one parameterisation; the seam is smooth, and every bound
+    //     is at rounding level.
+    {
+        auto sector = [](double t0, double t1) {
+            PolyPatchD P(2, 1);
+            const double pairs[3][2] = {{t0, t0}, {t0, t1}, {t1, t1}};
+            for (int j = 0; j < 3; ++j)
+                for (int k = 0; k < 2; ++k) {
+                    const double x = pairs[j][0], y = pairs[j][1], w = 1.0 + x * y;
+                    P.at(j, k) = {1.25 * (1.0 - x * y), 1.25 * (x + y), k * w, w};
+                }
+            return P;
+        };
+        const PolyPatchD A = sector(0.0, 0.25), B = sector(0.25, 0.5);
+        const PolyPatchI Bc = to_interval(B).restricted(-1.0, 0.0, 0.0, 1.0);
+        const SeamCertificate c = certify_seam(to_interval(A), Bc, kSeamU1, 8);
+        AK_CHECK(c.ok);
+        std::printf("  cylinder sectors: certified gap %.2e, normal angle %.2e, db_nn %.2e, dC_nnn %.2e\n", c.gap, c.normal_angle,
+                    c.db_nn, c.dC_nnn);
+        AK_CHECK(c.gap < 1e-13 && c.normal_angle < 1e-12 && c.db_nn < 1e-11 && c.dC_nnn < 1e-10);
     }
 
     // 5. The G3 fill of a hole in a degree-9 polynomial surface, certified on

@@ -1,13 +1,12 @@
 // akernel — certified bounds on the geometric-continuity jumps across a seam
-// between two polynomial Bezier patches (docs/BLUEPRINT.md §1.7; RESULTS.md
-// §4, "Certified seam bounds").
+// between two Bezier patches, polynomial or rational (docs/BLUEPRINT.md
+// §1.7; RESULTS.md §4, "Certified seam bounds").
 //
 // geom/continuity.hpp measures the jumps of the normal, of the second
 // fundamental form b and of its covariant derivative C at sample points.
 // Here they are bounded over the whole seam, rigorously.
 //
-// Setting. A and B are polynomial patches (all weights 1) in one common
-// parameterisation: the seam is the same side of [0,1]^2 for both (for
+// Setting. A and B are patches in one common parameterisation: the seam is the same side of [0,1]^2 for both (for
 // example v = 0), and B's jets along it are compared with A's at the same
 // parameter. A neighbour that meets A along its own opposite side is
 // brought to this form by restricting its polynomial beyond [0,1]^2 (the
@@ -18,7 +17,11 @@
 //
 // Method, on each of `pieces` equal parts of the seam:
 //  1. Residuals. Every jet entry D^(k,l) along the seam, k + l <= 3, is a
-//     polynomial in the seam parameter. Its Bernstein coefficients on the
+//     polynomial in the seam parameter: of the surface for polynomial
+//     patches (weights exactly 1), of its homogeneous form for rational
+//     ones, whose projection then belongs to H below. Rational patches must
+//     therefore agree in homogeneous form up to the residual (pieces of one
+//     rational parameterisation do). Its Bernstein coefficients on the
 //     part are computed for A and for B by exact-structure de Casteljau
 //     steps in interval arithmetic, raised to a common degree, and
 //     subtracted. By the convex-hull property the largest coefficient
@@ -32,6 +35,10 @@
 // The bounds therefore shrink with the residual, however small it is,
 // where enclosing each surface's invariants separately could not resolve
 // a jump below the variation of the invariants along a part.
+//  4. Parts. The enclosure of G over a part shrinks with the part, so more
+//     parts give tighter bounds; through the projection of a rational patch
+//     it shrinks more slowly, and its bounds are looser. A part on which the
+//     orientation, a weight or the metric is not proven is halved.
 //
 // Normal: the bound is on |n_B - n_A|, turned into an angle by
 // angle = 2 asin(d / 2) <= d / sqrt(1 - d^2 / 4). b and C: their jumps in the
@@ -171,9 +178,9 @@ T form3(const Frame<T>& f, const std::array<T, 2>& x, const std::array<T, 2>& y,
     return s;
 }
 
-using Curve = std::vector<Vec3<Interval>>; ///< Bernstein coefficients in the seam parameter
+using Curve = std::vector<Vec4<Interval>>; ///< homogeneous Bernstein coefficients in the seam parameter
 
-/// Jet entry (k, l) of P along `side`, as a curve in the seam parameter.
+/// Homogeneous jet entry (k, l) of P along `side`, as a curve in the seam parameter.
 inline Curve jet_curve(const PolyPatchI& P, int k, int l, int side) {
     PolyPatchI d = P;
     for (int i = 0; i < k; ++i) d = d.deriv_u();
@@ -181,10 +188,10 @@ inline Curve jet_curve(const PolyPatchI& P, int k, int l, int side) {
     Curve c;
     if (side == kSeamV0 || side == kSeamV1) {
         const int j = side == kSeamV0 ? 0 : d.q;
-        for (int i = 0; i <= d.p; ++i) c.push_back(xyz(d.at(i, j)));
+        for (int i = 0; i <= d.p; ++i) c.push_back(d.at(i, j));
     } else {
         const int i = side == kSeamU0 ? 0 : d.p;
-        for (int j = 0; j <= d.q; ++j) c.push_back(xyz(d.at(i, j)));
+        for (int j = 0; j <= d.q; ++j) c.push_back(d.at(i, j));
     }
     return c;
 }
@@ -208,15 +215,41 @@ inline Curve elevate(Curve c, int n) {
 /// The curve restricted to [a, b] of its parameter.
 inline Curve restrict_curve(Curve c, double a, double b) {
     if (c.size() <= 1 || (a == 0.0 && b == 1.0)) return c;
-    detail::restrict1d<Vec3<Interval>, Interval>(c.data(), static_cast<int>(c.size()) - 1, a, b);
+    detail::restrict1d<Vec4<Interval>, Interval>(c.data(), static_cast<int>(c.size()) - 1, a, b);
     return c;
 }
 
-inline Interval hull_of(const Curve& c, int coord) {
-    auto get = [coord](const Vec3<Interval>& p) { return coord == 0 ? p.x : coord == 1 ? p.y : p.z; };
-    Interval h = get(c[0]);
-    for (const auto& p : c) h = num::hull(h, get(p));
+inline const Interval& coord(const Vec4<Interval>& p, int c) { return c == 0 ? p.x : c == 1 ? p.y : c == 2 ? p.z : p.w; }
+
+inline Interval hull_of(const Curve& c, int k) {
+    Interval h = coord(c[0], k);
+    for (const auto& p : c) h = num::hull(h, coord(p, k));
     return h;
+}
+
+/// Derivatives of the projected surface from those of its homogeneous form
+/// (Piegl & Tiller, eq. 4.20; geom::rational_jet), generic over the scalar.
+template <class T>
+std::array<Vec3<T>, kJetSize> project_jet(const std::array<Vec4<T>, kJetSize>& A) {
+    static constexpr double binom[4][4] = {{1, 0, 0, 0}, {1, 1, 0, 0}, {1, 2, 1, 0}, {1, 3, 3, 1}};
+    std::array<Vec3<T>, kJetSize> S{};
+    const T w = A[0].w;
+    for (int k = 0; k <= 3; ++k)
+        for (int l = 0; l <= 3 - k; ++l) {
+            Vec3<T> v = xyz(A[static_cast<std::size_t>(jet_index(k, l))]);
+            for (int j = 1; j <= l; ++j)
+                v -= S[static_cast<std::size_t>(jet_index(k, l - j))] * (T(binom[l][j]) * A[static_cast<std::size_t>(jet_index(0, j))].w);
+            for (int i = 1; i <= k; ++i) {
+                v -= S[static_cast<std::size_t>(jet_index(k - i, l))] * (T(binom[k][i]) * A[static_cast<std::size_t>(jet_index(i, 0))].w);
+                Vec3<T> v2{};
+                for (int j = 1; j <= l; ++j)
+                    v2 += S[static_cast<std::size_t>(jet_index(k - i, l - j))] *
+                          (T(binom[l][j]) * A[static_cast<std::size_t>(jet_index(i, j))].w);
+                v -= v2 * T(binom[k][i]);
+            }
+            S[static_cast<std::size_t>(jet_index(k, l))] = v / w;
+        }
+    return S;
 }
 
 /// Upper bound of the square root of a non-negative interval's upper end.
@@ -232,117 +265,216 @@ struct SeamCertificate {
     double normal_angle = 0.0; ///< radians
     double db_tt = 0.0, db_tn = 0.0, db_nn = 0.0;
     double dC_ttt = 0.0, dC_ttn = 0.0, dC_tnn = 0.0, dC_nnn = 0.0;
-    int pieces = 0;
+    int pieces = 0;            ///< parts of the seam certified (after any bisection)
 };
 
-/// Bounds for the seam `side` of A and B, which share the parameterisation.
-/// Both must be polynomial (every weight exactly 1).
-inline SeamCertificate certify_seam(const PolyPatchI& A, const PolyPatchI& B, int side, int pieces = 8) {
-    using namespace seam_detail;
-    constexpr int N = 3 * kJetSize;
+namespace seam_detail {
+
+/// The nine bounds of one part, from boxes of A's (homogeneous) jet, of the
+/// hull of both, and the residual bounds eps.
+struct PartBounds {
+    bool oriented = false; ///< the normals are proven to agree
+    bool finite = false;
+    std::array<double, 9> b{}; ///< gap, angle, db_tt, db_tn, db_nn, dC_ttt, dC_ttn, dC_tnn, dC_nnn
+};
+
+template <bool kRational, int N>
+PartBounds part_bounds(const std::array<Vec4<Interval>, kJetSize>& HA, const std::array<Vec4<Interval>, kJetSize>& HH,
+                       const std::array<double, N>& eps, std::size_t tangent_entry) {
+    constexpr int C = kRational ? 4 : 3;
+    PartBounds r;
+    // A's jet and frame over the part, and the seam frame (tau, nu).
+    std::array<Vec3<Interval>, kJetSize> JA;
+    if constexpr (kRational) JA = project_jet(HA);
+    else
+        for (int e = 0; e < kJetSize; ++e) JA[static_cast<std::size_t>(e)] = xyz(HA[static_cast<std::size_t>(e)]);
+    const Frame<Interval> fa = frame(JA);
+    const Vec3<Interval> T = JA[tangent_entry];
+    Vec3<Interval> tau = T - fa.n * dot(fa.n, T);
+    tau = tau / sqrt(dot(tau, tau));
+    const Vec3<Interval> nu = cross(fa.n, tau);
+    // B's (homogeneous) jet as the variables, over the hull of both.
+    std::array<Vec4<Dual<N>>, kJetSize> HB;
+    for (int e = 0; e < kJetSize; ++e) {
+        const auto ue = static_cast<std::size_t>(e);
+        Vec4<Dual<N>>& v = HB[ue];
+        v = {Dual<N>(HH[ue].x), Dual<N>(HH[ue].y), Dual<N>(HH[ue].z), Dual<N>(HH[ue].w)};
+        v.x.d[static_cast<std::size_t>(C * e)] = Interval(1.0);
+        v.y.d[static_cast<std::size_t>(C * e + 1)] = Interval(1.0);
+        v.z.d[static_cast<std::size_t>(C * e + 2)] = Interval(1.0);
+        if constexpr (kRational) v.w.d[static_cast<std::size_t>(C * e + 3)] = Interval(1.0);
+    }
+    std::array<Vec3<Dual<N>>, kJetSize> JB;
+    if constexpr (kRational) JB = project_jet(HB);
+    else
+        for (int e = 0; e < kJetSize; ++e) JB[static_cast<std::size_t>(e)] = xyz(HB[static_cast<std::size_t>(e)]);
+    const Frame<Dual<N>> fb = frame(JB);
+    // Orientation: the normals must agree (no flipped parameterisation).
+    const Interval c_nn = dot(fa.n, Vec3<Interval>{fb.n.x.v, fb.n.y.v, fb.n.z.v});
+    r.oriented = c_nn.lo > 0.0;
+    if (!r.oriented) return r;
+    const auto tB = to_param<Dual<N>>(fb, tau), nB = to_param<Dual<N>>(fb, nu);
+    // Each jump is (B's value as a Dual) - (A's value, a constant here), and
+    // vanishes when B's jet is A's: it is bounded by |gradient| . eps.
+    auto bound = [&](const Dual<N>& hb) {
+        Interval s(0.0);
+        for (int i = 0; i < N; ++i)
+            s = s + Interval(num::mag(hb.d[static_cast<std::size_t>(i)])) * Interval(eps[static_cast<std::size_t>(i)]);
+        return std::isfinite(s.hi) ? s.hi : std::numeric_limits<double>::infinity();
+    };
+    auto length = [](double x, double y, double z) {
+        return sqrt_up(Interval(x) * Interval(x) + Interval(y) * Interval(y) + Interval(z) * Interval(z));
+    };
+    // Normal: |n_B - n_A| per coordinate, then the angle.
+    const double dn = length(bound(fb.n.x), bound(fb.n.y), bound(fb.n.z));
+    double angle = 3.14159265358979324; // the bound when nothing better is proven
+    if (dn < 2.0) {
+        const Interval q = Interval(1.0) - Interval(dn) * Interval(dn) / Interval(4.0);
+        if (q.lo > 0.0) angle = std::min(angle, (Interval(dn) / num::sqrt(q)).hi);
+    }
+    r.b = {length(bound(JB[0].x), bound(JB[0].y), bound(JB[0].z)),
+           angle,
+           bound(form2(fb, tB, tB)),
+           bound(form2(fb, tB, nB)),
+           bound(form2(fb, nB, nB)),
+           bound(form3(fb, tB, tB, tB)),
+           bound(form3(fb, tB, tB, nB)),
+           bound(form3(fb, tB, nB, nB)),
+           bound(form3(fb, nB, nB, nB))};
+    r.finite = std::isfinite(dn);
+    for (double x : r.b) r.finite = r.finite && std::isfinite(x);
+    return r;
+}
+
+/// The certificate, with the residuals taken in homogeneous coordinates
+/// (kRational: 4 coordinates per jet entry, and the projection to the
+/// surface is part of the differentiated function) or, for polynomial
+/// patches, in the surface's own coordinates (3 per entry, weights exactly 1).
+template <bool kRational>
+SeamCertificate certify_core(const PolyPatchI& A, const PolyPatchI& B, int side, int pieces) {
+    constexpr int C = kRational ? 4 : 3;
+    constexpr int N = C * kJetSize;
     SeamCertificate out;
-    for (const PolyPatchI* P : {&A, &B})
-        for (const auto& cp : P->c)
-            if (!(cp.w.lo == 1.0 && cp.w.hi == 1.0)) {
-                out.why = "a patch is rational";
-                return out;
-            }
     // Jet entries along the seam, raised to a common degree per entry.
     std::array<Curve, kJetSize> ca, cb;
     for (int k = 0; k <= 3; ++k)
         for (int l = 0; l <= 3 - k; ++l) {
-            const int e = jet_index(k, l);
-            ca[static_cast<std::size_t>(e)] = jet_curve(A, k, l, side);
-            cb[static_cast<std::size_t>(e)] = jet_curve(B, k, l, side);
-            const int n = static_cast<int>(std::max(ca[static_cast<std::size_t>(e)].size(), cb[static_cast<std::size_t>(e)].size())) - 1;
-            ca[static_cast<std::size_t>(e)] = elevate(ca[static_cast<std::size_t>(e)], n);
-            cb[static_cast<std::size_t>(e)] = elevate(cb[static_cast<std::size_t>(e)], n);
+            const auto e = static_cast<std::size_t>(jet_index(k, l));
+            ca[e] = jet_curve(A, k, l, side);
+            cb[e] = jet_curve(B, k, l, side);
+            const int n = static_cast<int>(std::max(ca[e].size(), cb[e].size())) - 1;
+            ca[e] = elevate(ca[e], n);
+            cb[e] = elevate(cb[e], n);
         }
+    // The residual curves themselves, restricted to each part below. (Taking
+    // the difference before restricting keeps rows the two patches share at
+    // exactly zero, instead of the sum of two restriction roundings.)
+    // For patches of equal degrees the difference is taken on the control
+    // points, before any derivative, so that it is exactly zero where they
+    // agree.
+    std::array<Curve, kJetSize> cd;
+    if (A.p == B.p && A.q == B.q) {
+        PolyPatchI D(A.p, A.q);
+        for (std::size_t i = 0; i < D.c.size(); ++i) D.c[i] = B.c[i] - A.c[i];
+        for (int k = 0; k <= 3; ++k)
+            for (int l = 0; l <= 3 - k; ++l) cd[static_cast<std::size_t>(jet_index(k, l))] = jet_curve(D, k, l, side);
+    } else {
+        for (int e = 0; e < kJetSize; ++e) {
+            const auto ue = static_cast<std::size_t>(e);
+            cd[ue].resize(ca[ue].size());
+            for (std::size_t i = 0; i < ca[ue].size(); ++i) cd[ue][i] = cb[ue][i] - ca[ue][i];
+        }
+    }
     const bool along_u = side == kSeamV0 || side == kSeamV1;
-    const int tangent_entry = along_u ? jet_index(1, 0) : jet_index(0, 1);
-    for (int m = 0; m < pieces; ++m) {
-        const double t0 = static_cast<double>(m) / pieces, t1 = static_cast<double>(m + 1) / pieces;
-        std::array<Vec3<Interval>, kJetSize> JA, HB;
+    const auto tangent_entry = static_cast<std::size_t>(along_u ? jet_index(1, 0) : jet_index(0, 1));
+    // Parts of the seam still to do, with their bisection depth. A part is
+    // halved where something is not proven on it (the orientation, a weight
+    // or the metric away from zero: its enclosures are too wide).
+    constexpr int kMaxDepth = 10, kMaxParts = 4096;
+    std::vector<std::array<double, 3>> work;
+    for (int m = pieces - 1; m >= 0; --m)
+        work.push_back({static_cast<double>(m) / pieces, static_cast<double>(m + 1) / pieces, 0.0});
+    int done = 0, started = pieces;
+    while (!work.empty()) {
+        const double t0 = work.back()[0], t1 = work.back()[1];
+        const int depth = static_cast<int>(work.back()[2]);
+        work.pop_back();
+        const bool may_split = depth < kMaxDepth && started < kMaxParts;
+        auto split = [&]() {
+            const double tm = 0.5 * (t0 + t1);
+            work.push_back({tm, t1, depth + 1.0});
+            work.push_back({t0, tm, depth + 1.0});
+            ++started;
+        };
+        std::array<Vec4<Interval>, kJetSize> HA, HH; // A's box over the part, and the hull of both
         std::array<double, N> eps{};
         for (int e = 0; e < kJetSize; ++e) {
-            const Curve a = restrict_curve(ca[static_cast<std::size_t>(e)], t0, t1);
-            const Curve b = restrict_curve(cb[static_cast<std::size_t>(e)], t0, t1);
-            Interval box_a[3], box_b[3];
-            for (int c = 0; c < 3; ++c) {
-                box_a[c] = hull_of(a, c);
-                box_b[c] = hull_of(b, c);
-                double r = 0.0;
-                for (std::size_t i = 0; i < a.size(); ++i) {
-                    const Vec3<Interval> d = b[i] - a[i];
-                    r = std::max(r, num::mag(c == 0 ? d.x : c == 1 ? d.y : d.z));
+            const auto ue = static_cast<std::size_t>(e);
+            const Curve a = restrict_curve(ca[ue], t0, t1);
+            const Curve b = restrict_curve(cb[ue], t0, t1);
+            const Curve d = restrict_curve(cd[ue], t0, t1);
+            Interval box_a[4], box_h[4];
+            for (int c = 0; c < 4; ++c) {
+                // Polynomial: the weight is 1 and its derivatives 0, exactly.
+                if (!kRational && c == 3) {
+                    box_a[c] = box_h[c] = Interval(e == 0 ? 1.0 : 0.0);
+                    continue;
                 }
-                eps[static_cast<std::size_t>(3 * e + c)] = r;
+                box_a[c] = hull_of(a, c);
+                box_h[c] = num::hull(box_a[c], hull_of(b, c));
+                if (c >= C) continue;
+                double r = 0.0;
+                for (std::size_t i = 0; i < d.size(); ++i) r = std::max(r, num::mag(coord(d[i], c)));
+                eps[static_cast<std::size_t>(C * e + c)] = r;
             }
-            JA[static_cast<std::size_t>(e)] = {box_a[0], box_a[1], box_a[2]};
-            HB[static_cast<std::size_t>(e)] = {num::hull(box_a[0], box_b[0]), num::hull(box_a[1], box_b[1]),
-                                               num::hull(box_a[2], box_b[2])};
+            HA[ue] = {box_a[0], box_a[1], box_a[2], box_a[3]};
+            HH[ue] = {box_h[0], box_h[1], box_h[2], box_h[3]};
         }
-        // A's frame over the part, and the seam frame (tau, nu) from it.
-        const Frame<Interval> fa = frame(JA);
-        const Vec3<Interval> T = JA[static_cast<std::size_t>(tangent_entry)];
-        Vec3<Interval> tau = T - fa.n * dot(fa.n, T);
-        tau = tau / sqrt(dot(tau, tau));
-        const Vec3<Interval> nu = cross(fa.n, tau);
-        // B's jet as the variables, over the hull of both.
-        std::array<Vec3<Dual<N>>, kJetSize> JB;
-        for (int e = 0; e < kJetSize; ++e) {
-            Vec3<Dual<N>>& v = JB[static_cast<std::size_t>(e)];
-            v = {Dual<N>(HB[static_cast<std::size_t>(e)].x), Dual<N>(HB[static_cast<std::size_t>(e)].y),
-                 Dual<N>(HB[static_cast<std::size_t>(e)].z)};
-            v.x.d[static_cast<std::size_t>(3 * e)] = Interval(1.0);
-            v.y.d[static_cast<std::size_t>(3 * e + 1)] = Interval(1.0);
-            v.z.d[static_cast<std::size_t>(3 * e + 2)] = Interval(1.0);
+        const PartBounds r = part_bounds<kRational, N>(HA, HH, eps, tangent_entry);
+        if (!r.oriented || !r.finite) {
+            if (!may_split) {
+                out.why = std::string(!r.oriented ? "the normals are not proven to agree in orientation"
+                                                  : "a bound is not finite (a weight or the metric is not proven away from zero)") +
+                          " on the part [" + std::to_string(t0) + ", " + std::to_string(t1) + "] of the seam";
+                return out;
+            }
+            split();
+            continue;
         }
-        const Frame<Dual<N>> fb = frame(JB);
-        // Orientation: the normals must agree (no flipped parameterisation).
-        const Interval c_nn = dot(fa.n, Vec3<Interval>{fb.n.x.v, fb.n.y.v, fb.n.z.v});
-        if (!(c_nn.lo > 0.0)) {
-            out.why = "the normals are not proven to agree in orientation on part " + std::to_string(m);
-            return out;
-        }
-        const auto tB = to_param<Dual<N>>(fb, tau), nB = to_param<Dual<N>>(fb, nu);
-        // Each jump is (B's value as a Dual) - (A's value, a constant here).
-        auto bound = [&](const Dual<N>& hb) {
-            Interval s(0.0);
-            for (int i = 0; i < N; ++i) s = s + Interval(num::mag(hb.d[static_cast<std::size_t>(i)])) * Interval(eps[static_cast<std::size_t>(i)]);
-            return std::isfinite(s.hi) ? s.hi : std::numeric_limits<double>::infinity();
-        };
-        // Normal: |n_B - n_A| per coordinate, then the angle.
-        const double dnx = bound(fb.n.x), dny = bound(fb.n.y), dnz = bound(fb.n.z);
-        const Interval d2 = Interval(dnx) * Interval(dnx) + Interval(dny) * Interval(dny) + Interval(dnz) * Interval(dnz);
-        const double dn = sqrt_up(d2);
-        double angle = 3.14159265358979324; // the bound when nothing better is proven
-        if (dn < 2.0) {
-            const Interval q = Interval(1.0) - Interval(dn) * Interval(dn) / Interval(4.0);
-            if (q.lo > 0.0) angle = std::min(angle, (Interval(dn) / num::sqrt(q)).hi);
-        }
-        double pos = 0.0;
-        {
-            const Interval p2 = Interval(eps[0]) * Interval(eps[0]) + Interval(eps[1]) * Interval(eps[1]) +
-                                Interval(eps[2]) * Interval(eps[2]);
-            pos = sqrt_up(p2);
-        }
-        out.gap = std::max(out.gap, pos);
-        out.normal_angle = std::max(out.normal_angle, angle);
-        out.db_tt = std::max(out.db_tt, bound(form2(fb, tB, tB)));
-        out.db_tn = std::max(out.db_tn, bound(form2(fb, tB, nB)));
-        out.db_nn = std::max(out.db_nn, bound(form2(fb, nB, nB)));
-        out.dC_ttt = std::max(out.dC_ttt, bound(form3(fb, tB, tB, tB)));
-        out.dC_ttn = std::max(out.dC_ttn, bound(form3(fb, tB, tB, nB)));
-        out.dC_tnn = std::max(out.dC_tnn, bound(form3(fb, tB, nB, nB)));
-        out.dC_nnn = std::max(out.dC_nnn, bound(form3(fb, nB, nB, nB)));
+        out.gap = std::max(out.gap, r.b[0]);
+        out.normal_angle = std::max(out.normal_angle, r.b[1]);
+        out.db_tt = std::max(out.db_tt, r.b[2]);
+        out.db_tn = std::max(out.db_tn, r.b[3]);
+        out.db_nn = std::max(out.db_nn, r.b[4]);
+        out.dC_ttt = std::max(out.dC_ttt, r.b[5]);
+        out.dC_ttn = std::max(out.dC_ttn, r.b[6]);
+        out.dC_tnn = std::max(out.dC_tnn, r.b[7]);
+        out.dC_nnn = std::max(out.dC_nnn, r.b[8]);
+        ++done;
     }
-    out.pieces = pieces;
+    out.pieces = done;
     out.ok = true;
     return out;
 }
 
-inline SeamCertificate certify_seam(const PolyPatchD& A, const PolyPatchD& B, int side, int pieces = 8) {
+} // namespace seam_detail
+
+/// Bounds for the seam `side` of A and B, which share the parameterisation.
+/// Polynomial patches (every weight exactly 1) are compared in their own
+/// coordinates; rational ones in homogeneous coordinates, which must then
+/// agree along the seam up to the residual (as for pieces of one rational
+/// parameterisation).
+/// `pieces` equal parts: more parts give tighter bounds (the enclosure of
+/// the gradient over a part shrinks with it), at proportional cost.
+inline SeamCertificate certify_seam(const PolyPatchI& A, const PolyPatchI& B, int side, int pieces = 32) {
+    bool polynomial = true;
+    for (const PolyPatchI* P : {&A, &B})
+        for (const auto& cp : P->c) polynomial = polynomial && cp.w.lo == 1.0 && cp.w.hi == 1.0;
+    return polynomial ? seam_detail::certify_core<false>(A, B, side, pieces)
+                      : seam_detail::certify_core<true>(A, B, side, pieces);
+}
+
+inline SeamCertificate certify_seam(const PolyPatchD& A, const PolyPatchD& B, int side, int pieces = 32) {
     return certify_seam(to_interval(A), to_interval(B), side, pieces);
 }
 

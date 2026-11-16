@@ -890,9 +890,10 @@ A square hole in the surface z = 0.2 sin(2.5x + 0.3) cos(2y) + 0.1xy is filled b
 
 ### Certified seam bounds
 
-`geom/seam_certificate.hpp` (new) bounds the jumps over a whole seam, rigorously, for two polynomial patches in one common parameterisation (the setting of the fill). It is the first step of the roadmap in [SURVEY.md](SURVEY.md), and it turns this section's sampled check into a certificate. On each part of the seam:
-- **Residuals in Bernstein form.** Every jet entry D^(k,l), k + l ≤ 3, is a polynomial along the seam. Its Bernstein coefficients for both patches are computed by de Casteljau steps in interval arithmetic, raised to a common degree and subtracted; the largest coefficient bounds the residual Δ = J_B − J_A.
-- **Mean value.** Each jump is H(J_A, J_B) with H(J_A, J_A) = 0, so it equals ∂H/∂J_B · Δ at an intermediate point. The gradient is enclosed by forward differentiation in interval arithmetic, with A's jet over the hull of its coefficients and B's over the hull of both, and the jump is bounded by Σ |∂H/∂J_i| ε_i, rounded upward.
+`geom/seam_certificate.hpp` (new) bounds the jumps over a whole seam, rigorously, for two patches in one common parameterisation (the setting of the fill), polynomial or rational. It is the first step of the roadmap in [SURVEY.md](SURVEY.md), and it turns this section's sampled check into a certificate. On each part of the seam:
+- **Residuals in Bernstein form.** Every jet entry D^(k,l), k + l ≤ 3, is a polynomial along the seam: of the surface for polynomial patches, of its homogeneous form for rational ones. The residual Δ = J_B − J_A is formed on the control points (exactly zero where the patches agree), differentiated and restricted by de Casteljau steps in interval arithmetic; its largest Bernstein coefficient bounds it on the part.
+- **Mean value.** Each jump is H(J_A, J_B) with H(J_A, J_A) = 0, so it equals ∂H/∂J_B · Δ at an intermediate point. The gradient is enclosed by forward differentiation in interval arithmetic, with A's jet over the hull of its coefficients and B's over the hull of both, and the jump is bounded by Σ |∂H/∂J_i| ε_i, rounded upward. For a rational patch the projection from homogeneous coordinates is part of H (40 variables instead of 30).
+- **Parts.** The seam is cut into equal parts; the enclosure of the gradient shrinks with the part, so more parts give tighter bounds. A part on which the orientation, a weight or the metric is not proven is halved, up to ten times.
 
 A bound computed this way shrinks with the residual, however small it is. Enclosing each surface's invariants separately could not resolve a jump smaller than the variation of the invariants along a part (here 1e-9 against variations of order 1).
 
@@ -900,12 +901,24 @@ A bound computed this way shrinks with the residual, however small it is. Enclos
 
 | Case | Certified | Sampled maximum (401 points) |
 |---|---|---|
-| Patches equal to third order (rows 0 to 3 shared) | every jump ≤ 2.6e-11 | 0 |
+| Patches equal to third order (rows 0 to 3 shared) | every jump ≤ 5e-162 | 0 |
 | Row 1 moved by about 1e-4: G1 jump | normal angle 8.629e-04 rad | 8.616e-04 |
 | Row 2 moved: G2 jump | b(ν,ν) 4.357e-03, normal angle 1.5e-14 | 4.224e-03, 0 |
 | Row 3 moved: G3 jump | C(ν,ν,ν) 1.736e-02, b(ν,ν) 6.1e-14 | 1.657e-02, 0 |
 
-(64 parts per seam.) On 24 seams between random patches with differences of 1e-6 to 1e-2, on all four sides, every certified bound covers every sampled jump. A rational patch, and a neighbour whose normal points the other way, are refused with a reason.
+(64 parts per seam.) On 24 seams between random patches with differences of 1e-6 to 1e-2, on all four sides, every certified bound covers every sampled jump. A neighbour whose normal points the other way is refused with a reason.
+
+Rational patches (weights 0.7 to 1.5, degree 5), with the residual in homogeneous form:
+
+| Case | Certified | Sampled maximum |
+|---|---|---|
+| Equal to third order | every jump ≤ 5e-162 | 0 |
+| G1 jump | normal angle 7.342e-04 rad | 7.180e-04 |
+| G2 jump | b(ν,ν) 4.749e-03 | 2.480e-03 |
+| G3 jump | C(ν,ν,ν) 3.586e-02 | 1.414e-02 |
+| Two adjacent sectors of one cylinder (exact rational carriers, the second continued backwards over the first's parameter) | gap 1.7e-14, angle 9.4e-14, b(ν,ν) 4.0e-13, C(ν,ν,ν) 5.1e-13 | — |
+
+(256 parts for the jumps.) The rational bounds are looser: the projection to the surface combines terms that cancel, which interval enclosures over a part do not see, so the gradient is overestimated; G1 stays within 2 %, G2 and G3 within a factor 2.5, and secondary components can be far looser. On 16 random rational seams (differences in the weights too, all four sides) every bound covers its samples.
 
 The G3 fill of a hole in a polynomial surface of degree 9 (which the fill, reproducing cubics, does not reproduce), certified on every boundary piece of the fill against that surface, 32 parts per seam:
 
@@ -915,9 +928,11 @@ The G3 fill of a hole in a polynomial surface of degree 9 (which the fill, repro
 | 16 × 16 | 36 | 1.21e-07 (1.20e-07) | 5.15e-06 (3.72e-06) | 6.55e-04 (3.52e-04) | 9.50e-09 |
 | 24 × 24 | 68 | 1.08e-09 (1.05e-09) | 9.39e-08 (8.04e-08) | 1.97e-05 (1.50e-05) | 6.11e-11 |
 
-The certified G1 bound is within 6 % of the sampled maximum at every resolution; G2 and G3 come within 17 % and 31 % at 24 × 24. They are looser on the coarse fill, where the positional gap is largest and the bound adds the contributions of all 30 jet coordinates without cancellation. With the derivative residuals left out of the bound (a red check), 999 of the test's 1,407 checks fail.
+The certified G1 bound is within 6 % of the sampled maximum at every resolution; G2 and G3 come within 17 % and 31 % at 24 × 24. They are looser on the coarse fill, where the positional gap is largest and the bound adds the contributions of all 30 jet coordinates without cancellation. Red checks: with the derivative residuals left out of the bound, 999 of the test's checks fail; with the weight residual left out of the rational bound, 10 fail. The test (1,603 checks) takes 17.6 s in Release and 43 s in Debug.
 
-Limits: polynomial patches only (all weights 1), a common parameterisation (no gauge functions), and the fill's Bezier pieces are taken as polynomial (knot insertion in doubles leaves their weights within rounding of 1, and the pieces are defined with weight 1).
+An adaptive refinement was tried and dropped: halving the parts whose bound exceeded what the gradient at their midpoint gave spent its budget on parts that never set the maximum (348 s for the test, some bounds looser than with equal parts).
+
+Limits: a common parameterisation (no gauge functions); rational patches must agree in homogeneous form up to the residual (pieces of one rational parameterisation do), and their bounds are looser; the fill's Bezier pieces are taken as polynomial (knot insertion in doubles leaves their weights within rounding of 1, and the pieces are defined with weight 1).
 
 ## 5. Energy-order rule
 
@@ -1047,7 +1062,7 @@ Tangency along a ruling (§3): with exact points on, only the curved-chain hash 
 
 Hill-top crossings (§3): with exact points on, only the curved-chain hash changes. With them off, every hash is the same as before, the curved chains' included (`076cc79a80b0285b`): no step that the new rules decide is reached without exact points. The tessellation hash is unchanged in both runs, so the new splitting of chords shared by two faces changed no earlier mesh. All 20 test programs pass in Release (151 s) and in Debug (916 s).
 
-Phase 1 of the survey's roadmap (v0.17) changes no result. The outward rounding step of the interval arithmetic (`num/interval.hpp`) is now a step of the bit pattern instead of a call to `std::nextafter`. It returns the same double for every input; `interval_test` compares the two on 100,015 values, including both zeros, subnormals, the largest finite values, both infinities and NaN, with no mismatch. Both benchmark runs, with exact points on and off, reproduce every hash of the hill-top crossing run bit for bit. The certified seam bounds (§4) are new code that no benchmark section calls. Speed, measured on an otherwise idle machine, best of three runs each:
+Phase 1 of the survey's roadmap (v0.17) changes no result. The outward rounding step of the interval arithmetic (`num/interval.hpp`) is now a step of the bit pattern instead of a call to `std::nextafter`. It returns the same double for every input; `interval_test` compares the two on 100,015 values, including both zeros, subnormals, the largest finite values, both infinities and NaN, with no mismatch. Both benchmark runs, with exact points on and off, reproduce every hash of the hill-top crossing run bit for bit. The certified seam bounds (§4) are new code that no benchmark section calls (and their rational extension, added afterwards, changes no other file). Speed, measured on an otherwise idle machine, best of three runs each:
 
 | Program | Before, ms | After, ms | Change |
 |---|---|---|---|
@@ -1074,7 +1089,7 @@ So the Boolean results are bitwise identical between Debug and Release; the rewr
 | Tolerance growth over chained Booleans | Met on 40 random chains of up to 6 operations: the certified edge gap stays at or below 7.7e-13 and vertex enclosures below 7.2e-13, with no growth from step 2 to step 6 (§3) |
 | Bitwise reproducibility | See §8; one compiler and one machine only |
 | Speed and memory relative to a legacy kernel | Not measured |
-| Certified G1/G2/G3 bounds | Met for seams between polynomial patches in a common parameterisation (§4, certified seam bounds): the bounds are within 6 % (G1) and 31 % (G3) of the sampled maxima on the finest fill. Rational patches and reparameterised joins are not covered |
+| Certified G1/G2/G3 bounds | Met for seams between patches in a common parameterisation (§4, certified seam bounds): on the finest fill the bounds are within 6 % (G1) and 31 % (G3) of the sampled maxima; rational patches are covered with looser bounds (G2, G3 within a factor 2.5). Reparameterised joins are not covered |
 | Healing success rate | Not built |
 
 ## 10. What these results do not show
