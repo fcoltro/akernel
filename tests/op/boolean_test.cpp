@@ -486,14 +486,44 @@ int main() {
     // --- 7. not in general position: reported, never answered wrongly ------------
     {
         // An imprint that is not solved gives no result. Here the box's bottom
-        // touches the hill's apex (0.5, 0.5, 1.3) exactly on an edge of that
-        // face: a point contact on a face's boundary, still refused.
-        const Brep B = op::to_brep(op::make_box({0.5, -0.5, 1.3}, {1.5, 1.5, 2.0}));
+        // touches the hill's apex (0.5, 0.5, 1.3) exactly at a corner of that
+        // face: a point contact at a vertex, still refused.
+        const Brep B = op::to_brep(op::make_box({0.5, 0.5, 1.3}, {1.5, 1.5, 2.0}));
         const Imprint im = op::imprint(op::to_brep(op::make_bump_box({0, 0, 0}, 1, 1, 1, 0.3)), B);
         AK_CHECK(!im.ok);
         const BooleanResult r = op::select(im, Op::Union);
         AK_CHECK(!r.ok && r.solid.faces.empty());
-        std::printf("box touching a hill on an edge of its bottom: %s\n", im.error.c_str());
+        std::printf("box touching a hill at a corner of its bottom: %s\n", im.error.c_str());
+    }
+    {
+        // The box's bottom touches the apex exactly on an edge of that face
+        // (x = 0.5). The bottom plane touches the hill's top only there
+        // (proven), so the edge, which lies in that plane, meets the top only
+        // there: a vertex on the edge where it touches (exact), and the point
+        // lies on the bottom face's boundary. The solids touch at that point:
+        // intersection empty, union the two (not manifold), difference the
+        // hill. The box is 1 x 2 x 0.7.
+        const Brep B = op::to_brep(op::make_box({0.5, -0.5, 1.3}, {1.5, 1.5, 2.0}));
+        const Imprint im = op::imprint(hill, B);
+        AK_CHECK(im.ok);
+        AK_CHECK(im.stats.edge_touches == 1 && im.stats.point_contacts == 1);
+        const double vh = 1.0 + 4.0 * bump / 9.0, vb = 1.0 * 2.0 * 0.7;
+        if (im.ok) {
+            const BooleanResult i = op::select(im, Op::Intersection), u = op::select(im, Op::Union), d = op::select(im, Op::Difference);
+            AK_CHECK(i.ok && i.empty);
+            AK_CHECK(u.ok && !u.empty && u.audit.closed() && !u.manifold && u.point_contacts == 1);
+            AK_CHECK(d.ok && !d.empty && d.manifold);
+            if (u.ok && d.ok && !u.empty && !d.empty) {
+                AK_CHECK_NEAR(op::volume(u.solid), vh + vb, 1e-12);
+                AK_CHECK_NEAR(op::volume(d.solid), vh, 1e-12);
+                const op::TessResult t = op::tessellate(u.solid);
+                AK_CHECK(t.ok && op::audit(t.mesh).watertight());
+            }
+            std::printf("box touching a hill on an edge of its bottom: solved; union %.12f (%.12f), point contacts %d\n",
+                        u.ok && !u.empty ? op::volume(u.solid) : 0.0, vh + vb, u.point_contacts);
+        } else {
+            std::printf("box touching a hill on an edge of its bottom: %s\n", im.error.c_str());
+        }
     }
     {
         // A box whose bottom touches the top of a hill in one point, inside

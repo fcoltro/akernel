@@ -881,7 +881,9 @@ The case of `tests/op/boolean_test.cpp`: a hill whose top rises to 1.25 at (0.5,
 
 Red checks: without the exact plane proof the 2^-50 case is refused (2 failures); without the sign test the loop is wrongly called separated (1 failure).
 
-Not covered yet: a contact on a face's boundary (it would need a vertex there), near misses of two curved faces below interval resolution (they need exact algebra for curved pairs), and tiny loops (a crossing too small for the search to trace).
+**A touch on an edge.** The box moved so that the hill's apex lies on an edge of its bottom face (x = 0.5) was refused at the search for where that edge meets the hill's top: the edge is tangent to the surface there. The bottom plane touches the top only at the apex and meets it nowhere else (both proven by the point-contact rule), and the edge lies in that plane, so it meets the top at most at the apex. That is decided exactly (the apex is an exact point, and `exact_on_edge` tests it against the edge): the apex becomes a vertex on the edge where it touches the surface (not a pierce, so no new curves end there). In the classification the apex lies on the bottom face's boundary, which interval point location cannot decide for a point exactly on it; the imprint vertex with parameters on that plane decides it. The side plane x = 0.5 still meets the top along an ordinary curve through the apex, outside the box's side face. Intersection empty, union 2.533333333333 = 1.133333333333 + 1.4 with one point contact (not manifold, closed mesh), difference the hill, all to 1e-12. Without the edge rule the case is refused as before (2 failures). The apex at a corner of the bottom face is still refused, and is now `boolean_test`'s example of an unsolved imprint.
+
+Not covered yet: a touch at a vertex, near misses of two curved faces below interval resolution (they need exact algebra for curved pairs), and tiny loops (a crossing too small for the search to trace).
 
 ### A compiler fault
 
@@ -912,7 +914,8 @@ Each of these stops with a message naming the two faces involved. None returns a
 | Configuration | Outcome |
 |---|---|
 | A box whose bottom touches the top of the hill in one point | Solved since tangent points (§3): the apex is proven the only contact; union with one point contact, not manifold |
-| The same, with the apex on an edge of the box's bottom face | Not solved: the edge touches the surface |
+| The same, with the apex on an edge of the box's bottom face | Solved since a touch on an edge (§3): the apex is a vertex on that edge, union with one point contact |
+| The same, with the apex at a corner of the box's bottom face | Not solved: a touch at a vertex |
 | A tilted box whose edge leaves the unit box exactly through one of its edges | Solved since the classification clash (§3): intersection 1/8 |
 | An edge crossing an edge at one point, all faces otherwise transversal | Solved since edges through edges (§3): the crossing point (1, 1, 0.5) is exact; intersection 1/48 |
 | Two curved faces meeting tangentially along a shared edge | Refused by the fan check around the edge |

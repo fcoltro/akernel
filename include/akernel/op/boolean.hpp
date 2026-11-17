@@ -170,6 +170,7 @@ struct ImprintStats {
     int graph_crossings = 0;         ///< pairs of graphs crossing where they share boundary lines, desingularised exactly
     int point_contacts = 0;          ///< pairs of surfaces touching at one point (a curved one against a plane or a curved one), proven exactly
     int near_misses = 0;             ///< pairs whose facing points are proven apart, with nothing between them in the region the search left
+    int edge_touches = 0;            ///< edges in a plane touching a curved surface at one point, meeting it there
     int ssi_pairs_empty = 0;          ///< intersected surface pairs that gave no curve
     double ssi_ms_empty = 0.0, ssi_ms_curves = 0.0; ///< time in surface pairs without and with curves
     std::size_t ssi_nodes_empty = 0, ssi_nodes_curves = 0; ///< completeness-pass nodes, likewise
@@ -588,6 +589,9 @@ class Builder {
         geom::Vec3<Interval> P;
         bool b_curved = false;
         double s = 0.0, t = 0.0;
+        bool alone = false;  ///< the surfaces meet nowhere else (no curve between them)
+        bool has_xp = false; ///< xp is the point, exactly
+        Vec4d xp{};
     };
     std::vector<PointTouch> point_touches;
     std::vector<Touch> touches;
@@ -2507,7 +2511,10 @@ private:
             return true;
         }
         const auto h = icarrier[static_cast<std::size_t>(c)].eval(Interval(us), Interval(vs));
-        point_touches.push_back({c, pl, us, vs, {h.x / h.w, h.y / h.w, h.z / h.w}});
+        PointTouch pt{c, pl, us, vs, {h.x / h.w, h.y / h.w, h.z / h.w}};
+        pt.alone = res.curves.empty();
+        pt.has_xp = exact_point_at(X, us, vs, pt.xp);
+        point_touches.push_back(pt);
         ++im.stats.point_contacts;
         note(where + ": surface " + str(c) + " touches the plane " + str(pl) + " at one point, at parameters (" + std::to_string(us) +
              ", " + std::to_string(vs) + "), proven exactly, and nowhere else in the region left");
@@ -3099,6 +3106,50 @@ private:
                             if (equiv(t.b, g) && (t.a == g0 || t.a == g1)) in_touch_plane = true;
                         }
                         if (in_touch_plane) continue;
+                    }
+                    // The edge lies in a plane that the curved surface g touches at
+                    // one point p and meets nowhere else (proven exactly): every
+                    // point the edge shares with g is p. It is a root exactly when
+                    // p lies on the edge (decided exactly), and then a vertex where
+                    // the edge touches g; otherwise there is none.
+                    if (!edge.arc) {
+                        const PointTouch* pt = nullptr;
+                        for (const PointTouch& t : point_touches)
+                            if (t.a == g && !t.b_curved && t.alone && (equiv(t.b, g0) || equiv(t.b, g1))) pt = &t;
+                        if (pt) {
+                            const std::string where = name + " and surface " + str(g);
+                            if (!pt->has_xp) return fail(where + ": the edge lies in a plane touching the surface at a point that is not representable");
+                            Chart ce[2];
+                            if (exact_on_edge(pt->xp, k, e, ce)) {
+                                std::vector<Chart> charts = {ce[0], ce[1], Chart{g, Interval(pt->u), Interval(pt->v)}};
+                                const Vec4d& X = pt->xp;
+                                if (!identify_point3(g0, g1, g, charts)) {
+                                    const std::size_t before = im.vertices.size();
+                                    if (!add_root(k, g, g0, g1, std::move(charts), {X.x / X.w, X.y / X.w, X.z / X.w}, false, where,
+                                                  edge_faces[k][static_cast<std::size_t>(e)], edge.on[0].side, &X))
+                                        return false;
+                                    // Not a pierce: the edge touches g, so no new curve
+                                    // has to end here (the pierce count does not apply).
+                                    if (im.vertices.size() > before) {
+                                        const int nv = static_cast<int>(im.vertices.size()) - 1;
+                                        vkind[static_cast<std::size_t>(nv)] = kCross;
+                                        expected_ends.erase(nv);
+                                    }
+                                    ++im.stats.edge_touches;
+                                    note(where + ": the edge touches the surface at the point where its plane does (exact)");
+                                }
+                            } else {
+                                for (int ev : {edge.v0, edge.v1}) {
+                                    const auto& V = im.vertices[static_cast<std::size_t>(vmap[k][static_cast<std::size_t>(ev)])];
+                                    using E = num::Expansion;
+                                    auto same = [&](double a, double aw, double b, double bw) { return (E(a) * E(bw) - E(b) * E(aw)).sign() == 0; };
+                                    if (V.exact && same(V.xp.x, V.xp.w, pt->xp.x, pt->xp.w) && same(V.xp.y, V.xp.w, pt->xp.y, pt->xp.w) &&
+                                        same(V.xp.z, V.xp.w, pt->xp.z, pt->xp.w))
+                                        return fail(where + ": the surface touches a plane exactly at a vertex of the edge (not in general position)");
+                                }
+                            }
+                            continue;
+                        }
                     }
                     ++im.stats.edge_carrier_pairs_solved;
                     const std::string where = name + " and surface " + str(g);
@@ -5062,7 +5113,9 @@ private:
                 if (gid(R1.solid, S(R1.solid).faces[static_cast<std::size_t>(R1.face)].carrier) != t.a) continue;
                 const Where w1 = locate(R1.geom, Interval(t.u), Interval(t.v), opt.refine_depth);
                 if (w1 == Where::Outside) continue;
-                if (w1 != Where::Inside) return fail("a curved face touches a plane at one point on the boundary of the face");
+                if (w1 != Where::Inside)
+                    return fail(std::string("a curved face touches a surface at one point ") +
+                                (w1 == Where::Boundary ? "on the boundary of the face" : "not located in the face"));
                 for (int r2 = 0; r2 < nR; ++r2) {
                     Region& R2 = im.regions[static_cast<std::size_t>(r2)];
                     if (R2.solid == R1.solid) continue;
@@ -5071,9 +5124,33 @@ private:
                     Interval pu(t.s), pv(t.t);
                     if (!t.b_curved && !plane_params(im.carriers[static_cast<std::size_t>(gb)], t.P, pu, pv))
                         return fail("a point where a curved face touches a plane could not be placed in the plane's face");
-                    const Where w2 = locate(R2.geom, pu, pv, opt.refine_depth);
+                    Where w2 = locate(R2.geom, pu, pv, opt.refine_depth);
+                    // Exactly on the face's boundary: interval point location cannot
+                    // say so, but the structure does when the point is a vertex of
+                    // the imprint with parameters on the plane (made where an edge
+                    // of the plane's solid touches the curved surface).
+                    if (w2 == Where::Undecided && t.has_xp && !t.b_curved) {
+                        using E = num::Expansion;
+                        auto same = [&](double a, double aw, double b, double bw) { return (E(a) * E(bw) - E(b) * E(aw)).sign() == 0; };
+                        for (int vi = 0; vi < static_cast<int>(im.vertices.size()); ++vi) {
+                            const auto& V = im.vertices[static_cast<std::size_t>(vi)];
+                            if (!V.exact || !chart(vi, gb)) continue;
+                            if (same(V.xp.x, V.xp.w, t.xp.x, t.xp.w) && same(V.xp.y, V.xp.w, t.xp.y, t.xp.w) &&
+                                same(V.xp.z, V.xp.w, t.xp.z, t.xp.w))
+                                w2 = Where::Boundary;
+                        }
+                    }
                     if (w2 == Where::Outside) continue;
-                    if (w2 != Where::Inside) return fail("two faces touch at one point on the boundary of one of them");
+                    // On the boundary of a flat face: the point lies on an edge of
+                    // the plane's solid (that edge has a vertex there, where it
+                    // touches the curved face); the regions still touch there.
+                    if (w2 == Where::Boundary && !t.b_curved && t.alone) {
+                        im.point_touching_regions.push_back({r1, r2});
+                        continue;
+                    }
+                    if (w2 != Where::Inside)
+                        return fail(std::string("two faces touch at one point ") +
+                                    (w2 == Where::Boundary ? "on the boundary of the second" : "not located in the second"));
                     im.point_touching_regions.push_back({r1, r2});
                 }
             }
