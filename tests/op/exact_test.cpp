@@ -245,9 +245,18 @@ int main() {
             {{0, {0.75, 1.25, 0.5, 0.75, 0.25, 0.75}, {}, Op::Union},
              {0, {0.75, 1.75, 0.25, 0.75, 0.0, 0.25}, {}, Op::Intersection},
              {1, {}, {{0.0, 0.75, -0.25}, 0.5, 0.75, 0.5, 0.3}, Op::Difference}},
+            // chain 23, steps 1 to 4: in the last, the sector's inner bottom
+            // circle (r = 0.75, z = 0.5) starts tangent to the wall x = 0.75
+            // left by the hill box, and passes over that hill's top, which
+            // meets the plane z = 0.5 only along its sides: both arcs are
+            // decided by sides-only contacts (no singular root is searched)
+            {{0, {1.25, 1.5, -0.25, 0.0, -0.25, 0.0}, {}, Op::Difference},
+             {0, {1.5, 1.75, 0.25, 0.5, 0.0, 0.25}, {}, Op::Difference},
+             {1, {}, {{0.25, -0.25, -0.25}, 0.5, 1.0, 0.75, 0.1}, Op::Difference},
+             {0, {0.75, 1.0, 0.0, 0.5, 0.5, 0.75}, {}, Op::Difference}},
         };
         const char* names[] = {"chain 30, step 3 (sector)", "chain 28, step 5 (sector)", "chain 19, step 6 (hill box)",
-                               "chain 38, step 3 (hill box)"};
+                               "chain 38, step 3 (hill box)", "chain 23, step 4 (sector)"};
         for (std::size_t ci = 0; ci < chains.size(); ++ci) {
             Brep current = op::to_brep(op::make_cylinder_sector(shell.r0, shell.r1, shell.t0, shell.t1, shell.z0, shell.z1));
             std::vector<Step> done;

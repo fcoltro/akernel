@@ -853,6 +853,64 @@ class Builder {
             exact_charts(v);
         }
     }
+    /// A vertex exactly on a straight side of some surface (an exact coordinate
+    /// across it) lies on a straight side of g that is on the same line
+    /// (decided exactly) wherever its position along the line falls inside
+    /// that side: then it gets parameters on g, the coordinate across the side
+    /// exact. (Two hill tops with one base height whose sides lie on one line
+    /// over different stretches, say.)
+    void chart_on_collinear_side(int v, int g) {
+        if (chart(v, g)) return;
+        const PolyPatchD& G = im.carriers[static_cast<std::size_t>(g)];
+        const std::vector<Chart> charts = im.vertices[static_cast<std::size_t>(v)].charts;
+        auto ipt = [](const Vec4d& c) { return Vec3<Interval>{Interval(c.x), Interval(c.y), Interval(c.z)}; };
+        for (const Chart& c : charts) {
+            if (c.carrier == g) continue;
+            for (int s = 0; s < 4; ++s) {
+                Interval tau;
+                if (on_side(c, s, tau) != Tri::Yes) continue;
+                const auto ca = side_control(im.carriers[static_cast<std::size_t>(c.carrier)], s);
+                if (!linear_side(ca)) continue;
+                for (int s2 = 0; s2 < 4; ++s2) {
+                    const auto cg = side_control(G, s2);
+                    if (!linear_side(cg)) continue;
+                    if (!collinear(cg.front(), cg.back(), ca.front()) || !collinear(cg.front(), cg.back(), ca.back())) continue;
+                    const Vec3<Interval> A0 = ipt(ca.front()), A1 = ipt(ca.back()), G0 = ipt(cg.front()), G1 = ipt(cg.back());
+                    const Vec3<Interval> P = A0 + (A1 - A0) * tau;
+                    const Vec3<Interval> d = G1 - G0;
+                    const Interval t2 = geom::dot(P - G0, d) / geom::dot(d, d);
+                    if (!(t2.lo >= 0.0 && t2.hi <= 1.0)) continue;
+                    Chart m;
+                    m.carrier = g;
+                    side_uv(s2, t2, m.u, m.v);
+                    im.vertices[static_cast<std::size_t>(v)].charts.push_back(m);
+                    return;
+                }
+            }
+        }
+    }
+    /// The converse of touch_charts: a vertex on surface a and on the plane of
+    /// b, where a meets that plane only along its sides (a proven contact),
+    /// lies on one of those sides. Where exactly one of them is consistent
+    /// with its parameters on a, the coordinate across that side is set to
+    /// its exact value (0 or 1).
+    void side_from_touch(int v) {
+        for (Chart& c : im.vertices[static_cast<std::size_t>(v)].charts) {
+            int found = -1, count = 0;
+            for (const Touch& t : touches) {
+                if (t.a != c.carrier || !chart(v, t.b)) continue;
+                const bool across_v = t.side == 0 || t.side == 2;
+                const double val = (t.side == 0 || t.side == 3) ? 0.0 : 1.0;
+                if (!num::contains(across_v ? c.v : c.u, val)) continue;
+                if (found != t.side) ++count;
+                found = t.side;
+            }
+            if (count != 1) continue;
+            const bool across_v = found == 0 || found == 2;
+            const double val = (found == 0 || found == 3) ? 0.0 : 1.0;
+            (across_v ? c.v : c.u) = Interval(val);
+        }
+    }
     /// For every proven contact (a along its side s with b's plane): a vertex
     /// with an exact coordinate on that side of a lies in the plane; give it
     /// parameters on b (enclosures of the exact ones) and on b's class.
@@ -3166,6 +3224,44 @@ private:
                             if (t.a == g && (equiv(t.b, g0) || equiv(t.b, g1))) in_touch_plane = true;
                             if (equiv(t.b, g) && (t.a == g0 || t.a == g1)) in_touch_plane = true;
                         }
+                        // The same for an arc lying in a plane of its own, against a
+                        // curved surface that meets that plane only along its sides,
+                        // proven here (the pair may have had no search of its own: a
+                        // circle of a sector's bottom tangent to a side of a hill's
+                        // top, which lies in that bottom's plane).
+                        if (!in_touch_plane && edge.arc && !is_planar[static_cast<std::size_t>(g)])
+                            for (int gp : {g0, g1}) {
+                                if (!is_flat(gp) || in_touch_plane) continue;
+                                const SidesContact sc =
+                                    sides_contact_flat(im.carriers[static_cast<std::size_t>(g)], im.carriers[static_cast<std::size_t>(gp)]);
+                                if (opt.trace && !sc.only_sides)
+                                    note(name + " and surface " + str(g) + ": the arc lies in the flat surface " + sk(gp) + ", which the surface meets " +
+                                         (sc.mask ? "along sides of mask " + str(sc.mask) + " but not only there" : "not along any side"));
+                                if (sc.only_sides) {
+                                    in_touch_plane = true;
+                                    note(name + " and surface " + str(g) + ": the arc lies in the plane of " + str(gp) +
+                                         ", which the surface meets only along its sides (exact)");
+                                }
+                            }
+                        // And the converse: an arc on a curved surface a that meets the
+                        // flat surface g only along sides of a (proven here, the pair
+                        // may have had no search of its own) meets g only where it
+                        // reaches those sides, at its own vertices; they get
+                        // parameters on g as for a proven contact (on_plane_side).
+                        // A circle of a sector's cylinder tangent to a wall along the
+                        // cylinder's first ruling, say.
+                        if (!in_touch_plane && edge.arc && is_flat(g))
+                            for (int ga : {g0, g1}) {
+                                if (is_flat(ga) || in_touch_plane) continue;
+                                const SidesContact sc =
+                                    sides_contact_flat(im.carriers[static_cast<std::size_t>(ga)], im.carriers[static_cast<std::size_t>(g)]);
+                                if (!sc.only_sides) continue;
+                                for (int t = 0; t < 4; ++t)
+                                    if (sc.mask >> t & 1) on_plane_side(ga, t, g);
+                                in_touch_plane = true;
+                                note(name + " and surface " + str(g) + ": the arc lies on " + str(ga) + ", which meets the flat surface only along "
+                                     "its sides of mask " + str(sc.mask) + " (exact)");
+                            }
                         if (in_touch_plane) continue;
                     }
                     // The edge lies in a plane that the curved surface g touches at
@@ -3311,7 +3407,17 @@ private:
                     } else {
                         const CurveBase& base = *edge.geom->base;
                         const auto t0 = std::chrono::steady_clock::now();
-                        const TsiResult res = intersect_arc_surface(*edge.geom, im.carriers[static_cast<std::size_t>(g)], opt.csi, enclosures);
+                        TsiResult res = intersect_arc_surface(*edge.geom, im.carriers[static_cast<std::size_t>(g)], opt.csi, enclosures);
+                        if (!res.complete) {
+                            // A deeper search: near a root where the arc leaves the
+                            // surface at a small angle the boxes must get very small
+                            // before they are settled. Only where the first failed.
+                            solve::CsiOptions deep = opt.csi;
+                            deep.node_limit *= 10;
+                            deep.max_depth = std::max(deep.max_depth, 64);
+                            res = intersect_arc_surface(*edge.geom, im.carriers[static_cast<std::size_t>(g)], deep, enclosures);
+                            note(where + ": a deeper search " + (res.complete ? "is complete" : "did not finish") + " (" + str(static_cast<int>(res.nodes)) + " nodes)");
+                        }
                         im.stats.edge_ms_arc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                         ++im.stats.edge_searches_arc;
                         im.stats.tsi_nodes += res.nodes;
@@ -3321,7 +3427,16 @@ private:
                             char buf[200];
                             std::snprintf(buf, sizeof buf, ": the arc of surfaces %d and %d from (%.6g %.6g %.6g) to (%.6g %.6g %.6g)", g0, g1,
                                           V0.x, V0.y, V0.z, V1.x, V1.y, V1.z);
-                            note(where + buf);
+                            note(where + buf + " (kinds " + sk(g0) + ", " + sk(g1) + "; degrees " + str(im.carriers[static_cast<std::size_t>(g0)].p) + "x" +
+                                 str(im.carriers[static_cast<std::size_t>(g0)].q) + ", " + str(im.carriers[static_cast<std::size_t>(g1)].p) + "x" +
+                                 str(im.carriers[static_cast<std::size_t>(g1)].q) + ")");
+                            const Box6& Hh = res.unverified_hull;
+                            std::string hs = where + ": boxes left in";
+                            for (int i = 0; i < 6; ++i)
+                                hs += " [" + std::to_string(Hh[static_cast<std::size_t>(i)].lo) + ", " + std::to_string(Hh[static_cast<std::size_t>(i)].hi) + "]";
+                            const auto pa = base.sys->point_a(Box4{Hh[0], Hh[1], Hh[2], Hh[3]});
+                            hs += " near (" + std::to_string(num::mid(pa.x)) + ", " + std::to_string(num::mid(pa.y)) + ", " + std::to_string(num::mid(pa.z)) + ")";
+                            note(hs);
                         }
                         if (!res.complete)
                             return fail(where + ": the three-surface search could not be resolved (" +
@@ -3352,6 +3467,29 @@ private:
                                     ++im.stats.exact_ends;
                                     is_end = true;
                                     break;
+                                }
+                                // Or the end vertex is proven on all three surfaces
+                                // (here, on g through a side g shares with one of the
+                                // arc's surfaces: share_side_charts), with parameters
+                                // inside the root's uniqueness box: it is the root.
+                                for (int ev : {edge.v0, edge.v1}) {
+                                    if (is_end) break;
+                                    const int v = vmap[k][static_cast<std::size_t>(ev)];
+                                    side_from_touch(v);
+                                    share_side_charts(v);
+                                    chart_on_collinear_side(v, g);
+                                    const Chart* c0 = chart(v, g0);
+                                    const Chart* c1 = chart(v, g1);
+                                    const Chart* cg = chart(v, g);
+                                    if (!c0 || !c1 || !cg) continue;
+                                    const Interval cc[6] = {c0->u, c0->v, c1->u, c1->v, cg->u, cg->v};
+                                    bool inside = true;
+                                    for (int i = 0; i < 6; ++i) inside = inside && num::subset(cc[i], root.unique[static_cast<std::size_t>(i)]);
+                                    if (!inside) continue;
+                                    note(name + " ends on surface " + str(g) + " at vertex " + str(v) + " (its parameters on all three surfaces, "
+                                         "inside the root's uniqueness box)");
+                                    ++im.stats.exact_ends;
+                                    is_end = true;
                                 }
                                 if (is_end) continue;
                                 if (opt.trace) {

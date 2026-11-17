@@ -250,6 +250,35 @@ inline SidesContact sides_contact(const PolyPatchD& X, const PolyPatchD& Y, int 
     return r;
 }
 
+/// sides_contact for a flat Y that need not be an affine parallelogram (a
+/// sector's cap on its rational carrier): the caller has proven every control
+/// point of Y in one plane. det(c00, c10, c01, X) in homogeneous coordinates
+/// is that plane's function whatever the weights; if the three corners do not
+/// span the plane it vanishes identically, no strict sign is found, and
+/// nothing is claimed.
+inline SidesContact sides_contact_flat(const PolyPatchD& X, const PolyPatchD& Y, int depth = 12) {
+    SidesContact r;
+    for (const Vec4d& c : X.c)
+        if (!(c.w > 0.0)) return r;
+    for (const Vec4d& c : Y.c)
+        if (!(c.w > 0.0)) return r;
+    ExactBernstein g = plane_function(X, Y);
+    for (bool again = true; again;) {
+        again = false;
+        for (int s = 0; s < 4; ++s) {
+            const bool across_v = s == 0 || s == 2;
+            if ((across_v ? g.q : g.p) == 0 || !contact_detail::side_zero(g, s)) continue;
+            g = contact_detail::divide_side(g, s);
+            r.mask |= 1 << s;
+            again = true;
+        }
+    }
+    if (r.mask == 0) return r;
+    r.sign = contact_detail::strict_sign(g, depth);
+    r.only_sides = r.sign != 0;
+    return r;
+}
+
 /// Contact along a line inside the patch. For a patch X of degree 2 in one
 /// parameter (a cylinder or cone sector in the angle), the plane function on
 /// each control row in that parameter, c0 (1 - u)^2 + 2 c1 u (1 - u) +

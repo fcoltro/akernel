@@ -898,6 +898,23 @@ The cap above z = 1.25 − ε has volume πε²/2 + O(ε³) (the top is 1.25 −
 
 Not covered yet: near misses of two curved faces below interval resolution, and tiny loops below about 2^-40 (both need exact algebra or more precision).
 
+### Arcs at tangent contacts, and three benchmark refusals
+
+Three of the five refusals left in the curved chains (chains 23, 31 and 33) were arc/surface searches that did not finish. A diagnostic hull of the boxes those searches leave (`TsiResult::unverified_hull`) showed what they were:
+- **Chain 23:** the new sector's inner bottom circle (r = 0.75, z = 0.5) starts tangent to the wall x = 0.75 that an earlier hill box left. The circle runs along the wall's top edge there.
+- **Chain 33:** an arc of the earlier result ends exactly on the line two hill tops share, and the search could not settle the boxes at that end.
+- **Chain 31:** the sector's top circle (r = 1.25, z = 0.75) passes over a hill top 1e-5 above the top's contour z = 0.75, crossing it twice about 1e-3 apart. This is a regular but shallow pair of roots that the search could not separate even with ten times the budget.
+
+Four rules, each exact or a proof, resolve the first two:
+- **Sides-only contacts for arcs.** An arc lying in a flat surface P, against a curved surface that meets P only along its sides (proven exactly by the plane function, now also for flat carriers that are not parallelograms: `sides_contact_flat`), meets that surface only on those sides. Those sides are covered by edges of the other solid that are searched instead, the established rule for straight edges. The converse is the same: an arc on a curved surface that meets a flat surface only along its own sides meets it only at its end vertices, which get parameters there (`on_plane_side`). Both rules were applied before only where the surface pair had its own search; they are now proven on the spot.
+- **A deeper retry.** When an arc search does not finish, it runs once more with ten times the nodes and depth 64. That only happens where the first search failed.
+- **End vertices proven on all three surfaces.** A root that cannot be separated from an end of the arc is that end vertex if the vertex has parameters on the arc's two surfaces and on the third, all inside the root's uniqueness box.
+- **Two supporting inferences.** A vertex on a surface and on a plane that the surface meets only along one side lies exactly on that side (`side_from_touch`). A vertex exactly on a straight side lies on a straight side of another surface on the same line (exact collinearity) at its projected position (`chart_on_collinear_side`); two hill tops share a line over different stretches.
+
+Chain 23 now runs all six steps. Chain 33 passes steps 4 and 5 and stops at step 6, with a pierce vertex at which one new curve ends instead of two. `tests/op/exact_test.cpp` replays chain 23 to step 4, checking inclusion-exclusion and Monte Carlo (0.37 sigma); without the converse rule it is refused (1 failure).
+
+**On the curved chains (§3):** with exact points, 214 of 218 steps are committed (209 of 214 before); without them, 186 of 201 (181 before), where chain 19 now runs to the end and chain 18 gets one step further. No result is beyond 3 sigma, and all 207 (181 without exact points) non-empty results tessellate closed. Four refusals are left: the blurred touch of chain 7, the shallow double crossing of chain 31, chain 33 at step 6, and the two curves tangent at a vertex of chain 35.
+
 ### A compiler fault
 
 While building the quadric tests, `on_quadric` reported that an exact quarter cylinder was not on its cylinder, but only in the `/O2 /fp:strict` build of the test program. With `/Od`, `/O1`, `/Og`, `/fp:precise`, or with inlining off (`/Ob0`), the result was right, and so it was in smaller programs with the same headers and flags. The investigation:
@@ -1092,6 +1109,8 @@ The two Boolean sections have their own hashes. The first covers the three volum
 | Chains with curved operands (§3) | Release, classification clash (197 committed) | `004720a80878c448` |
 | Chains with curved operands (§3) | Release, tangency along a ruling (200 committed) | `099834461ccbd100` |
 | Chains with curved operands (§3) | Release, hill-top crossings (209 committed) | `be8b56d82aa17b20` |
+| Chains with curved operands (§3) | Release, arcs at tangent contacts (214 committed) | `e3577408773a43d7` |
+| Chains with curved operands (§3) | Release, arcs at tangent contacts, exact points off (186 committed) | `231e90f2b84c3d7b` |
 
 After the coplanar work, again after the tessellation work and the vertex-manifoldness check, and again after the identity work (grown uniqueness regions in the edge/surface and three-surface searches, closed-edge unification, empty operands), the core, single-operation, chain and reuse hashes were re-run in Release and are unchanged, and so are the grid-chain and tessellation hashes of the previous milestone. The grid-chain hash changed first because the newly refused pinched result ended its chain, and then again when non-manifold results became valid and the grid chains ran on. With non-manifold results the core, single-operation, chain and reuse hashes are again unchanged: none of those sections produces a contact of that kind. After the exact-quadric work every hash in this table is unchanged from the non-manifold milestone (core, Boolean pairs, chains, reuse, grid chains `cfafddb9df9fd21f`, tessellation `4be3b23e245a7be2`, identities `896b9c04bb9ba003`).
 
@@ -1142,6 +1161,8 @@ The Release suite takes 110 s (151 s before; `identity_test` 64 s against 98 s),
 
 Point contacts in the Booleans (§3, "Tangent points, certified"), a curved face against a plane, then two curved faces, then near misses: both benchmark runs, after each step,, with exact points on and off, reproduce every hash above bit for bit. The new proofs run only where the surface/surface search has already failed, and no Boolean of the benchmark has a point contact; the five refusals left in the curved chains are the same. All 22 test programs pass in Release and in Debug (that run's timings, 189 s and 1,123 s, came from a busier machine: `identity_test` took 114 s in Release against 64 s before on unchanged code).
 
+Arcs at tangent contacts (§3): the curved-chain hash changes, with exact points on (`e3577408773a43d7`) and off (`231e90f2b84c3d7b`), because more steps commit; every other hash of both runs is unchanged. The new rules act in the general edge search, so this was the run that could have moved other sections; none moved. All 22 test programs pass in Release and in Debug.
+
 Timings of the tangency-along-a-ruling round are not comparable with the earlier ones. The full benchmark took 503 s in one run and 679 s in another (925 s before), both with the Debug test suite running beside it; sections whose code and results are unchanged ran in about half their earlier time in the first of those runs (a random-box chain step at depth 6: 204 ms against 362 ms), so the difference is the state of the machine, not the code.
 
 So the Boolean results are bitwise identical between Debug and Release; the rewrite for trimmed operands, and the later rewrite for shared geometry, did not change any earlier result. The reuse chains have been run in Release only. All of this covers one machine, one compiler and single-threaded execution; other platforms and parallel execution are untested.
@@ -1164,7 +1185,7 @@ So the Boolean results are bitwise identical between Debug and Release; the rewr
 ## 10. What these results do not show
 
 - Behaviour on real CAD models. Every input solid here has six faces, each one Bezier patch, except the tiled boxes of the scaling test (up to 1,536 flat faces); chained results grow to about 37 trimmed faces.
-- Curved chains at scale. §3 has 40 chains with cylinder sectors and hill boxes (214 steps, 209 committed). A crossing curve that touches the line two hill tops share, blurred by rounding (1), two curves tangent at a vertex (1) and three-surface searches that do not finish (3, one of them an arc ending on such a shared line) stop the rest; all are reported, never answered.
+- Curved chains at scale. §3 has 40 chains with cylinder sectors and hill boxes (218 steps, 214 committed). A crossing curve that touches the line two hill tops share, blurred by rounding (1), two curves tangent at a vertex (1), an arc crossing a surface twice at a shallow angle 1e-3 apart (1) and a pierce vertex with one curve ending at it (1) stop the rest; all are reported, never answered.
 - Exact points beyond round numbers. A vertex is known exactly only if its homogeneous coordinates are doubles and it has parameters that are dyadic, or fractions with denominators up to 4096, on the surfaces it must be proven on. Vertices with irrational coordinates (most intersections of curved surfaces) stay enclosures, and their coincidences stay unprovable. Exact membership in a curved surface was exercised by one benchmark step (chain 18) and by the evaluator's unit tests, not by a Boolean test with a closed-form volume.
 - An edge lying in a curved surface other than along a line of constant parameter (a circle of a sphere, an edge along a cylinder that is not straight in its parameterisation), and an edge through an edge in space at a point whose coordinates are not round: reported. Line contacts are counted and reported; the fan check, which orders faces around shared edges, does not examine them.
 - Flat rational faces in planes that are not axis-aligned. A sector's cap is moved onto a parallelogram of its plane only when that plane is x, y or z = constant (exact points on it are then easy to choose); other flat rational faces in one plane with an unrelated flat face are still reported.

@@ -167,6 +167,7 @@ struct TsiResult {
     std::vector<TsiRoot> roots; ///< roots whose (s, t) is not proven outside [0,1]^2
     bool complete = false;      ///< proven: no other root on the searched part of the edge
     std::size_t unverified_boxes = 0;
+    Box6 unverified_hull{};     ///< hull of the boxes left (curve 4, then surface 2), when there are any
     std::size_t nodes = 0;
 };
 
@@ -232,6 +233,7 @@ struct TsiSolver {
     std::vector<TsiRoot> found;
     std::vector<Box6> covers; ///< boxes proven to hold exactly one root, already in `found`
     std::size_t unverified = 0, nodes = 0;
+    Box6 hull{};
 
     /// Enlarge the region around a proven root in which it is the only root:
     /// boxes of doubling size around y, each proven by the Krawczyk test, are
@@ -325,7 +327,11 @@ struct TsiSolver {
             }
         }
 
-        if (depth >= opt.max_depth || nodes >= opt.node_limit) { ++unverified; return; }
+        if (depth >= opt.max_depth || nodes >= opt.node_limit) {
+            for (int i = 0; i < 6; ++i) hull[static_cast<std::size_t>(i)] = unverified == 0 ? cur[i] : num::hull(hull[static_cast<std::size_t>(i)], cur[i]);
+            ++unverified;
+            return;
+        }
 
         // Split whichever is larger in space: the piece of the edge or the
         // piece of the surface. Splitting the surface cannot separate it
@@ -396,6 +402,7 @@ inline TsiResult intersect_arc_surface(const ArcGeom& arc, const PolyPatchD& thi
         res.roots.push_back(r);
     }
     res.unverified_boxes = solver.unverified;
+    res.unverified_hull = solver.hull;
     res.complete = solver.unverified == 0;
     return res;
 }
