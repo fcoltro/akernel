@@ -853,6 +853,56 @@ class Builder {
             exact_charts(v);
         }
     }
+    /// Pairs of curved surfaces with straight sides on one line (exact), found
+    /// once per operation; flat surfaces are left to the plane machinery.
+    std::vector<std::pair<int, int>> collinear_pairs;
+    bool collinear_known = false;
+    void find_collinear_pairs() {
+        collinear_known = true;
+        std::vector<std::vector<std::vector<Vec4d>>> sides(im.carriers.size());
+        for (std::size_t g = 0; g < im.carriers.size(); ++g) {
+            if (is_flat(static_cast<int>(g))) continue;
+            for (int s = 0; s < 4; ++s) {
+                auto cp = side_control(im.carriers[g], s);
+                if (linear_side(cp)) sides[g].push_back(std::move(cp));
+            }
+        }
+        for (std::size_t a = 0; a < sides.size(); ++a)
+            for (std::size_t b = a + 1; b < sides.size(); ++b) {
+                bool found = false;
+                for (const auto& sa : sides[a])
+                    for (const auto& sb : sides[b])
+                        found = found || (collinear(sb.front(), sb.back(), sa.front()) && collinear(sb.front(), sb.back(), sa.back()));
+                if (found) collinear_pairs.push_back({static_cast<int>(a), static_cast<int>(b)});
+            }
+    }
+    void collinear_charts(int v) {
+        if (!collinear_known) find_collinear_pairs();
+        for (const auto& [a, b] : collinear_pairs) {
+            if (chart(v, a) && !chart(v, b)) chart_on_collinear_side(v, b);
+            if (chart(v, b) && !chart(v, a)) chart_on_collinear_side(v, a);
+        }
+    }
+    /// Does vertex v lie exactly on a straight side of g0 that is on the same
+    /// line as a straight side of g1 (exact coordinate across the side, exact
+    /// collinearity)?
+    bool on_common_line(int v, int g0, int g1) const {
+        const Chart* c = chart(v, g0);
+        if (!c) return false;
+        const PolyPatchD& B = im.carriers[static_cast<std::size_t>(g1)];
+        for (int s = 0; s < 4; ++s) {
+            Interval tau;
+            if (on_side(*c, s, tau) != Tri::Yes) continue;
+            const auto ca = side_control(im.carriers[static_cast<std::size_t>(g0)], s);
+            if (!linear_side(ca)) continue;
+            for (int s2 = 0; s2 < 4; ++s2) {
+                const auto cb = side_control(B, s2);
+                if (!linear_side(cb)) continue;
+                if (collinear(cb.front(), cb.back(), ca.front()) && collinear(cb.front(), cb.back(), ca.back())) return true;
+            }
+        }
+        return false;
+    }
     /// A vertex exactly on a straight side of some surface (an exact coordinate
     /// across it) lies on a straight side of g that is on the same line
     /// (decided exactly) wherever its position along the line falls inside
@@ -3109,6 +3159,10 @@ private:
         touch_charts(static_cast<int>(im.vertices.size()) - 1);
         exact_charts(static_cast<int>(im.vertices.size()) - 1);
         if (!line_touches.empty() || graph_crossing_seen) share_side_charts(static_cast<int>(im.vertices.size()) - 1);
+        // Curved surfaces whose straight sides lie on one line over different
+        // stretches (hill tops of one base height that cross): a vertex on such
+        // a side of one lies on the other's side as well.
+        collinear_charts(static_cast<int>(im.vertices.size()) - 1);
         ++im.stats.new_vertices;
         if (triple) ++im.stats.triple_vertices;
         return true;
@@ -3736,7 +3790,12 @@ private:
             const int m = static_cast<int>(hits.size());
             if (opt.trace) {
                 std::string s = "  " + name + (cu.base->closed ? " (closed)" : "") + ": vertices on it:";
-                for (const OnCurve& h : hits) s += " " + str(h.vertex);
+                for (const OnCurve& h : hits) {
+                    const Vec3d& P = im.vertices[static_cast<std::size_t>(h.vertex)].point;
+                    char buf[96];
+                    std::snprintf(buf, sizeof buf, " %d (%.6f %.6f %.6f)", h.vertex, P.x, P.y, P.z);
+                    s += buf;
+                }
                 note(s);
             }
             struct Part {
@@ -3926,6 +3985,12 @@ private:
                         if (!(edge.t0.hi < sp.t.lo && sp.t.hi < edge.t1.lo))
                             return fail(name + ": a vertex on it could not be separated from its ends");
                     } else {
+                        // Two surfaces with straight sides on one line meet in that
+                        // line and in curves that reach it only at vertices (where
+                        // graph_crossing found them), which split those curves: a
+                        // vertex exactly on the line, other than this piece's ends,
+                        // is not inside the piece.
+                        if (on_common_line(v, g0, g1)) continue;
                         bool on = false;
                         if (!locate_on_curve(*edge.geom->base, {a->u, a->v, b->u, b->v}, on, sp.pos))
                             return fail(name + ": could not decide whether a vertex lies on it");

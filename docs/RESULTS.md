@@ -928,6 +928,16 @@ Chain 35 now runs all six steps, every result tessellating closed (one not manif
 
 **On the curved chains (§3):** with exact points, 216 of 219 steps are committed (214 of 218 before); without, 188 of 202 (186). No result is beyond 3 sigma, and all 209 (183) non-empty results tessellate closed. Three refusals are left: the blurred touch of chain 7, the shallow double crossing of chain 31, and the pierce count at step 6 of chain 33.
 
+### A pierce next to a shared line (chain 33, step 6)
+
+At step 6 of chain 33, a rotated box's face (plane 15) cuts the curve along which two hill tops of the earlier result cross (built at step 4 by `graph_crossing`). The pierce vertex there should have one new curve on each of the two tops. The plane's curve with the second top found only that vertex on it, because its other end lies on the line y = 1.25 that the two tops share. That end was found from the first top, as a vertex with parameters on the first top only. The two tops' sides lie on the same line but over different stretches, so the shared-side rules, which need identical sides, did not apply.
+- **Charts from collinear sides.** Once per operation, pairs of curved surfaces with straight sides on one line are found (exact collinearity; flat surfaces are left to the plane machinery). A new vertex exactly on such a side of one surface gets parameters on the other's side at its projected position, when that lies within the side (`collinear_charts`, `chart_on_collinear_side`).
+- **Shared lines are not inside crossing curves.** Two surfaces with sides on one line meet in that line and in curves that reach it only at vertices, where `graph_crossing` found the roots. So a vertex exactly on that line, other than an arc piece's own ends, is not inside the piece (`on_common_line`). Without this, the vertex now charted on both tops, 0.012 from the crossing curve's end, could not be separated from that end.
+
+Chain 33 now runs all six steps (step 6 within 0.11 sigma of Monte Carlo). Without the collinear charts, step 6 is refused as before.
+
+**On the curved chains (§3):** with exact points, 217 of 219 steps are committed (216 before); without them nothing changes (the step is not reached). No result is beyond 3 sigma, and all 210 non-empty results tessellate closed. Two refusals are left: the touch of chain 7, blurred by the data's rounding, and the arc of chain 31, which crosses a hill top twice at a shallow angle 1e-3 apart.
+
 ### A compiler fault
 
 While building the quadric tests, `on_quadric` reported that an exact quarter cylinder was not on its cylinder, but only in the `/O2 /fp:strict` build of the test program. With `/Od`, `/O1`, `/Og`, `/fp:precise`, or with inlining off (`/Ob0`), the result was right, and so it was in smaller programs with the same headers and flags. The investigation:
@@ -1126,6 +1136,7 @@ The two Boolean sections have their own hashes. The first covers the three volum
 | Chains with curved operands (§3) | Release, arcs at tangent contacts, exact points off (186 committed) | `231e90f2b84c3d7b` |
 | Chains with curved operands (§3) | Release, two curves tangent at a vertex (216 committed) | `5aefb053ba711e7a` |
 | Chains with curved operands (§3) | Release, two curves tangent at a vertex, exact points off (188 committed) | `56bc312c090f5ab3` |
+| Chains with curved operands (§3) | Release, a pierce next to a shared line (217 committed) | `873d2f1a99831e6e` |
 
 After the coplanar work, again after the tessellation work and the vertex-manifoldness check, and again after the identity work (grown uniqueness regions in the edge/surface and three-surface searches, closed-edge unification, empty operands), the core, single-operation, chain and reuse hashes were re-run in Release and are unchanged, and so are the grid-chain and tessellation hashes of the previous milestone. The grid-chain hash changed first because the newly refused pinched result ended its chain, and then again when non-manifold results became valid and the grid chains ran on. With non-manifold results the core, single-operation, chain and reuse hashes are again unchanged: none of those sections produces a contact of that kind. After the exact-quadric work every hash in this table is unchanged from the non-manifold milestone (core, Boolean pairs, chains, reuse, grid chains `cfafddb9df9fd21f`, tessellation `4be3b23e245a7be2`, identities `896b9c04bb9ba003`).
 
@@ -1180,6 +1191,8 @@ Arcs at tangent contacts (§3): the curved-chain hash changes, with exact points
 
 Two curves tangent at a vertex (§3): the curved-chain hash changes again with exact points on (`5aefb053ba711e7a`) and off (`56bc312c090f5ab3`); every other hash is unchanged (the rule runs only where an ordering had failed). All 22 test programs pass in Release and in Debug.
 
+A pierce next to a shared line (§3): with exact points the curved-chain hash changes (`873d2f1a99831e6e`); every other hash, and every hash without exact points, is unchanged. The new rules act in vertex creation and edge splitting, which every operation goes through; no other result moved. All 22 test programs pass in Release and in Debug.
+
 Timings of the tangency-along-a-ruling round are not comparable with the earlier ones. The full benchmark took 503 s in one run and 679 s in another (925 s before), both with the Debug test suite running beside it; sections whose code and results are unchanged ran in about half their earlier time in the first of those runs (a random-box chain step at depth 6: 204 ms against 362 ms), so the difference is the state of the machine, not the code.
 
 So the Boolean results are bitwise identical between Debug and Release; the rewrite for trimmed operands, and the later rewrite for shared geometry, did not change any earlier result. The reuse chains have been run in Release only. All of this covers one machine, one compiler and single-threaded execution; other platforms and parallel execution are untested.
@@ -1202,7 +1215,7 @@ So the Boolean results are bitwise identical between Debug and Release; the rewr
 ## 10. What these results do not show
 
 - Behaviour on real CAD models. Every input solid here has six faces, each one Bezier patch, except the tiled boxes of the scaling test (up to 1,536 flat faces); chained results grow to about 37 trimmed faces.
-- Curved chains at scale. §3 has 40 chains with cylinder sectors and hill boxes (219 steps, 216 committed). A crossing curve that touches the line two hill tops share, blurred by rounding (1), an arc crossing a surface twice at a shallow angle 1e-3 apart (1) and a pierce vertex with one curve ending at it (1) stop the rest; all are reported, never answered. The tessellator can fail on a sliver whose two boundary edges leave a vertex tangentially (their polylines cross); no committed benchmark result has hit this.
+- Curved chains at scale. §3 has 40 chains with cylinder sectors and hill boxes (219 steps, 217 committed). A crossing curve that touches the line two hill tops share, blurred by rounding (1), and an arc crossing a surface twice at a shallow angle 1e-3 apart (1) stop the rest; both are reported, never answered. The tessellator can fail on a sliver whose two boundary edges leave a vertex tangentially (their polylines cross); no committed benchmark result has hit this.
 - Exact points beyond round numbers. A vertex is known exactly only if its homogeneous coordinates are doubles and it has parameters that are dyadic, or fractions with denominators up to 4096, on the surfaces it must be proven on. Vertices with irrational coordinates (most intersections of curved surfaces) stay enclosures, and their coincidences stay unprovable. Exact membership in a curved surface was exercised by one benchmark step (chain 18) and by the evaluator's unit tests, not by a Boolean test with a closed-form volume.
 - An edge lying in a curved surface other than along a line of constant parameter (a circle of a sphere, an edge along a cylinder that is not straight in its parameterisation), and an edge through an edge in space at a point whose coordinates are not round: reported. Line contacts are counted and reported; the fan check, which orders faces around shared edges, does not examine them.
 - Flat rational faces in planes that are not axis-aligned. A sector's cap is moved onto a parallelogram of its plane only when that plane is x, y or z = constant (exact points on it are then easy to choose); other flat rational faces in one plane with an unrelated flat face are still reported.
