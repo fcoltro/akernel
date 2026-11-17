@@ -4609,6 +4609,107 @@ private:
         return ok;
     }
 
+    /// A curve tangent at a vertex to another piece of this face (on its
+    /// surface g) that lies in a flat surface P, where the curve lies on a curved
+    /// surface c that meets P only along its own sides (proven exactly, with a
+    /// strict sign s elsewhere: sides_contact_flat; or only along one line
+    /// inside it: line_contact). Then the curve stays on
+    /// side s of P near the vertex, and on g's parameter plane that side is
+    /// where s psi > 0, psi = det(P's corners, g(u, v)) (the same function
+    /// whose sign sides_contact_flat proves): the curve lies to the side of
+    /// the tangent piece that s grad psi points to. Its direction is replaced
+    /// by itself plus a small multiple of s grad psi, and accepted only if
+    /// that small turn crosses no other direction at the vertex (each one's
+    /// side decided the same before and after). Unlike line_tangent_proxies,
+    /// the tangent piece may be curved and its direction an enclosure (a
+    /// circle of a cylinder, along which a hill's top leaves it tangentially).
+    bool plane_side_proxies(int g, int vid, Dir& d0, std::vector<Dir>& cd, const HalfEdge& back, const std::vector<int>& cand,
+                            const std::vector<HalfEdge>& he) {
+        const Chart* vc = chart(vid, g);
+        if (!vc) return false;
+        std::vector<Dir*> all = {&d0};
+        std::vector<const HalfEdge*> hs = {&back};
+        for (std::size_t c = 0; c < cd.size(); ++c) {
+            all.push_back(&cd[c]);
+            hs.push_back(&he[static_cast<std::size_t>(cand[c])]);
+        }
+        auto on_g = [&](int x) { return x == g || equiv(x, g); };
+        bool changed = false;
+        for (std::size_t i = 0; i < all.size(); ++i) {
+            int a0 = -1, a1 = -1;
+            const ArcGeom* gi = nullptr;
+            piece_surfaces(*hs[i], a0, a1, gi);
+            const int c = on_g(a0) ? a1 : (on_g(a1) ? a0 : -1);
+            if (c < 0 || is_flat(c)) continue;
+            for (std::size_t j = 0; j < all.size(); ++j) {
+                if (j == i) continue;
+                int b0 = -1, b1 = -1;
+                const ArcGeom* gj = nullptr;
+                piece_surfaces(*hs[j], b0, b1, gj);
+                const Interval cr = cross2(*all[j], *all[i]), dt = dot2(*all[j], *all[i]);
+                if (!(num::contains_zero(cr) && dt.lo > 0.0)) continue; // not tangent, the same way
+                // A flat surface the tangent piece lies on (its trace on g's
+                // parameter plane is then that piece); not g's own plane.
+                // c meets P only along its own sides (sides_contact_flat) or
+                // only along one line inside it (line_contact): either way with
+                // a strict sign of the same plane function elsewhere.
+                int P = -1;
+                SidesContact sc;
+                for (int b : {b0, b1}) {
+                    if (P >= 0 || b < 0 || !is_flat(b) || on_g(b)) continue;
+                    sc = sides_contact_flat(im.carriers[static_cast<std::size_t>(c)], im.carriers[static_cast<std::size_t>(b)]);
+                    if (sc.only_sides) { P = b; continue; }
+                    const PlaneLineContact lc = line_contact(im.carriers[static_cast<std::size_t>(c)], im.carriers[static_cast<std::size_t>(b)]);
+                    if (lc.found && lc.sign != 0) {
+                        sc.only_sides = true;
+                        sc.sign = lc.sign;
+                        P = b;
+                    }
+                }
+                if (P < 0) continue;
+                // grad psi on g at the vertex: psi is linear in g's homogeneous point.
+                using planar_detail::corner;
+                const PolyPatchD& Pp = im.carriers[static_cast<std::size_t>(P)];
+                const Vec4d ca = corner(Pp, 0, 0), cb = corner(Pp, 1, 0), cc = corner(Pp, 0, 1);
+                auto d3 = [](double a1, double a2, double a3, double b1, double b2, double b3, double c1, double c2, double c3) {
+                    const Interval A1(a1), A2(a2), A3(a3), B1(b1), B2(b2), B3(b3), C1(c1), C2(c2), C3(c3);
+                    return A1 * (B2 * C3 - B3 * C2) - A2 * (B1 * C3 - B3 * C1) + A3 * (B1 * C2 - B2 * C1);
+                };
+                // det(a, b, c, x) = sum_k x_k cof_k, expanded along the last row.
+                const Interval cof[4] = {-d3(ca.y, ca.z, ca.w, cb.y, cb.z, cb.w, cc.y, cc.z, cc.w),
+                                         d3(ca.x, ca.z, ca.w, cb.x, cb.z, cb.w, cc.x, cc.z, cc.w),
+                                         -d3(ca.x, ca.y, ca.w, cb.x, cb.y, cb.w, cc.x, cc.y, cc.w),
+                                         d3(ca.x, ca.y, ca.z, cb.x, cb.y, cb.z, cc.x, cc.y, cc.z)};
+                const PolyPatchI& G = icarrier[static_cast<std::size_t>(g)];
+                const auto gu = G.deriv_u().eval(vc->u, vc->v), gv = G.deriv_v().eval(vc->u, vc->v);
+                auto lin = [&](const geom::Vec4<Interval>& x) { return cof[0] * x.x + cof[1] * x.y + cof[2] * x.z + cof[3] * x.w; };
+                const Interval s_sign(static_cast<double>(sc.sign));
+                const Dir n{s_sign * lin(gu), s_sign * lin(gv)};
+                const double me = std::max(num::mag(all[i]->x), num::mag(all[i]->y)), mn = std::max(num::mag(n.x), num::mag(n.y));
+                if (!(mn > 0.0) || !std::isfinite(mn)) continue;
+                const Interval delta(1e-6 * me / mn);
+                const Dir proxy{all[i]->x + delta * n.x, all[i]->y + delta * n.y};
+                if (num::contains_zero(cross2(*all[j], proxy))) continue;
+                bool clear = true;
+                for (std::size_t k = 0; k < all.size() && clear; ++k) {
+                    if (k == i || k == j) continue;
+                    const Interval c1 = cross2(*all[i], *all[k]), c2 = cross2(proxy, *all[k]);
+                    // Decided on the same side before and after the turn, or pointing
+                    // backwards from both (a small turn cannot reach it).
+                    clear = (c1.lo > 0.0 && c2.lo > 0.0) || (c1.hi < 0.0 && c2.hi < 0.0) ||
+                            (dot2(*all[i], *all[k]).hi < 0.0 && dot2(proxy, *all[k]).hi < 0.0);
+                }
+                if (!clear) continue;
+                note("  plane side: the curve on " + str(a0) + "," + str(a1) + " stays on one side of the plane of " + str(P) +
+                     " (only its sides meet it), so it runs off the tangent piece on " + str(b0) + "," + str(b1) + " to that side");
+                *all[i] = proxy;
+                changed = true;
+                break;
+            }
+        }
+        return changed;
+    }
+
     bool build_regions() {
         // Edge pieces by the boxes of their edges, per solid: a face looks up
         // the other solid's pieces near it.
@@ -5035,15 +5136,25 @@ private:
                     ordered = line_tangent_proxies(g, h.to, d0, cd, back, cand, he) && order(best);
                 }
                 if (!ordered) {
+                    d0 = d0_kept;
+                    cd = cd_kept;
+                    ordered = plane_side_proxies(g, h.to, d0, cd, back, cand, he) && order(best);
+                }
+                if (!ordered) {
                     if (opt.trace) {
                         const Chart* c = chart(h.to, g);
                         auto iv = [](const Interval& x) { return "[" + std::to_string(x.lo) + ", " + std::to_string(x.hi) + "]"; };
                         std::string s = name + " (surface " + str(g) + "): vertex " + str(h.to);
                         if (c) s += " at " + iv(c->u) + " x " + iv(c->v);
-                        s += "; back " + iv(d0.x) + "," + iv(d0.y) + "; out:";
+                        s += "; back " + iv(d0.x) + "," + iv(d0.y) + " (" + std::string(h.piece.fresh ? "new" : (h.own ? "own" : "other")) +
+                             (on_curve.first >= 0 ? ", curve of " + str(on_curve.first) + "," + str(on_curve.second) : std::string()) + "); out:";
                         for (std::size_t q = 0; q < cand.size(); ++q) {
                             const HalfEdge& o = he[static_cast<std::size_t>(cand[q])];
                             s += " {" + std::string(o.piece.fresh ? "new" : (o.own ? "own" : "other")) + " " + iv(cd[q].x) + "," + iv(cd[q].y);
+                            {
+                                const auto oc = curve_of(o);
+                                if (oc.first >= 0) s += " curve of " + str(oc.first) + "," + str(oc.second);
+                            }
                             if (!o.piece.fresh) {
                                 const Imprint::OldPiece& op_ = im.pieces[static_cast<std::size_t>(o.piece.src)];
                                 const BEdge& oe = S(op_.solid).edges[static_cast<std::size_t>(op_.edge)];

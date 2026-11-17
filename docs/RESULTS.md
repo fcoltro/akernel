@@ -915,6 +915,19 @@ Chain 23 now runs all six steps. Chain 33 passes steps 4 and 5 and stops at step
 
 **On the curved chains (§3):** with exact points, 214 of 218 steps are committed (209 of 214 before); without them, 186 of 201 (181 before), where chain 19 now runs to the end and chain 18 gets one step further. No result is beyond 3 sigma, and all 207 (181 without exact points) non-empty results tessellate closed. Four refusals are left: the blurred touch of chain 7, the shallow double crossing of chain 31, chain 33 at step 6, and the two curves tangent at a vertex of chain 35.
 
+### Two curves tangent at a vertex (chain 35)
+
+Chain 35 stopped at step 5, where a hill box's side x = 1 touches the cylinder r = 1 at (1, 0, 0.5) and the hill's top (base height 0.5) leaves the cylinder's circle there tangentially. At that vertex, in three faces, two pieces leave in the same direction, and the angular order of the pieces around the vertex, which the planar map of each face needs, cannot be read from their directions:
+- on the cylinder, its circle at z = 0.5 and the curve where it meets the hill's top;
+- on the flat face z = 0.5, that circle and the hill's edge on the line x = 1;
+- on the hill's top, its side x = 1 and both branches of the curve with the cylinder.
+
+**Ordering by a proven side** (`plane_side_proxies`). A curve tangent to another piece of the face, where that piece lies in a flat surface P, is ordered by which side of P the curve runs on. The curve lies on a curved surface c. If c meets P only along its own sides (`sides_contact_flat`), or only along one line inside it (`line_contact`: the cylinder touches the plane x = 1 along an interior ruling), then c, and so the curve, lies strictly on one side s of P away from that contact. On the face's parameter plane that side is where s·ψ > 0, with ψ = det(P's corners, g(u, v)), the plane function whose sign those proofs establish. So the curve runs off the tangent piece towards s·∇ψ, and its direction is replaced by itself plus a small multiple of s·∇ψ. The replacement is accepted only if every other direction at the vertex keeps its decided side, or points backwards from both. Unlike the earlier line-tangent rule, the tangent piece may be curved and its direction an enclosure.
+
+Chain 35 now runs all six steps, every result tessellating closed (one not manifold). With the rule disabled, it stops at step 5 again. The tangency is reproduced on its own by the first sector of chain 35 and the hill box; there the pieces happen to be ordered without the rule, and the Boolean solves (inclusion-exclusion to 2e-16), but the sliver of their intersection does not tessellate: the polylines of its two tangent boundary edges cross in its parameters, a limit of the tessellator.
+
+**On the curved chains (§3):** with exact points, 216 of 219 steps are committed (214 of 218 before); without, 188 of 202 (186). No result is beyond 3 sigma, and all 209 (183) non-empty results tessellate closed. Three refusals are left: the blurred touch of chain 7, the shallow double crossing of chain 31, and the pierce count at step 6 of chain 33.
+
 ### A compiler fault
 
 While building the quadric tests, `on_quadric` reported that an exact quarter cylinder was not on its cylinder, but only in the `/O2 /fp:strict` build of the test program. With `/Od`, `/O1`, `/Og`, `/fp:precise`, or with inlining off (`/Ob0`), the result was right, and so it was in smaller programs with the same headers and flags. The investigation:
@@ -1111,6 +1124,8 @@ The two Boolean sections have their own hashes. The first covers the three volum
 | Chains with curved operands (§3) | Release, hill-top crossings (209 committed) | `be8b56d82aa17b20` |
 | Chains with curved operands (§3) | Release, arcs at tangent contacts (214 committed) | `e3577408773a43d7` |
 | Chains with curved operands (§3) | Release, arcs at tangent contacts, exact points off (186 committed) | `231e90f2b84c3d7b` |
+| Chains with curved operands (§3) | Release, two curves tangent at a vertex (216 committed) | `5aefb053ba711e7a` |
+| Chains with curved operands (§3) | Release, two curves tangent at a vertex, exact points off (188 committed) | `56bc312c090f5ab3` |
 
 After the coplanar work, again after the tessellation work and the vertex-manifoldness check, and again after the identity work (grown uniqueness regions in the edge/surface and three-surface searches, closed-edge unification, empty operands), the core, single-operation, chain and reuse hashes were re-run in Release and are unchanged, and so are the grid-chain and tessellation hashes of the previous milestone. The grid-chain hash changed first because the newly refused pinched result ended its chain, and then again when non-manifold results became valid and the grid chains ran on. With non-manifold results the core, single-operation, chain and reuse hashes are again unchanged: none of those sections produces a contact of that kind. After the exact-quadric work every hash in this table is unchanged from the non-manifold milestone (core, Boolean pairs, chains, reuse, grid chains `cfafddb9df9fd21f`, tessellation `4be3b23e245a7be2`, identities `896b9c04bb9ba003`).
 
@@ -1163,6 +1178,8 @@ Point contacts in the Booleans (§3, "Tangent points, certified"), a curved face
 
 Arcs at tangent contacts (§3): the curved-chain hash changes, with exact points on (`e3577408773a43d7`) and off (`231e90f2b84c3d7b`), because more steps commit; every other hash of both runs is unchanged. The new rules act in the general edge search, so this was the run that could have moved other sections; none moved. All 22 test programs pass in Release and in Debug.
 
+Two curves tangent at a vertex (§3): the curved-chain hash changes again with exact points on (`5aefb053ba711e7a`) and off (`56bc312c090f5ab3`); every other hash is unchanged (the rule runs only where an ordering had failed). All 22 test programs pass in Release and in Debug.
+
 Timings of the tangency-along-a-ruling round are not comparable with the earlier ones. The full benchmark took 503 s in one run and 679 s in another (925 s before), both with the Debug test suite running beside it; sections whose code and results are unchanged ran in about half their earlier time in the first of those runs (a random-box chain step at depth 6: 204 ms against 362 ms), so the difference is the state of the machine, not the code.
 
 So the Boolean results are bitwise identical between Debug and Release; the rewrite for trimmed operands, and the later rewrite for shared geometry, did not change any earlier result. The reuse chains have been run in Release only. All of this covers one machine, one compiler and single-threaded execution; other platforms and parallel execution are untested.
@@ -1185,7 +1202,7 @@ So the Boolean results are bitwise identical between Debug and Release; the rewr
 ## 10. What these results do not show
 
 - Behaviour on real CAD models. Every input solid here has six faces, each one Bezier patch, except the tiled boxes of the scaling test (up to 1,536 flat faces); chained results grow to about 37 trimmed faces.
-- Curved chains at scale. §3 has 40 chains with cylinder sectors and hill boxes (218 steps, 214 committed). A crossing curve that touches the line two hill tops share, blurred by rounding (1), two curves tangent at a vertex (1), an arc crossing a surface twice at a shallow angle 1e-3 apart (1) and a pierce vertex with one curve ending at it (1) stop the rest; all are reported, never answered.
+- Curved chains at scale. §3 has 40 chains with cylinder sectors and hill boxes (219 steps, 216 committed). A crossing curve that touches the line two hill tops share, blurred by rounding (1), an arc crossing a surface twice at a shallow angle 1e-3 apart (1) and a pierce vertex with one curve ending at it (1) stop the rest; all are reported, never answered. The tessellator can fail on a sliver whose two boundary edges leave a vertex tangentially (their polylines cross); no committed benchmark result has hit this.
 - Exact points beyond round numbers. A vertex is known exactly only if its homogeneous coordinates are doubles and it has parameters that are dyadic, or fractions with denominators up to 4096, on the surfaces it must be proven on. Vertices with irrational coordinates (most intersections of curved surfaces) stay enclosures, and their coincidences stay unprovable. Exact membership in a curved surface was exercised by one benchmark step (chain 18) and by the evaluator's unit tests, not by a Boolean test with a closed-form volume.
 - An edge lying in a curved surface other than along a line of constant parameter (a circle of a sphere, an edge along a cylinder that is not straight in its parameterisation), and an edge through an edge in space at a point whose coordinates are not round: reported. Line contacts are counted and reported; the fan check, which orders faces around shared edges, does not examine them.
 - Flat rational faces in planes that are not axis-aligned. A sector's cap is moved onto a parallelogram of its plane only when that plane is x, y or z = constant (exact points on it are then easy to choose); other flat rational faces in one plane with an unrelated flat face are still reported.
