@@ -171,6 +171,7 @@ struct ImprintStats {
     int point_contacts = 0;          ///< pairs of surfaces touching at one point (a curved one against a plane or a curved one), proven exactly
     int near_misses = 0;             ///< pairs whose facing points are proven apart, with nothing between them in the region the search left
     int edge_touches = 0;            ///< edges in a plane touching a curved surface at one point, meeting it there
+    int tiny_loops = 0;              ///< pairs whose small closed loops were found by a search over the region left
     int ssi_pairs_empty = 0;          ///< intersected surface pairs that gave no curve
     double ssi_ms_empty = 0.0, ssi_ms_curves = 0.0; ///< time in surface pairs without and with curves
     std::size_t ssi_nodes_empty = 0, ssi_nodes_curves = 0; ///< completeness-pass nodes, likewise
@@ -1726,6 +1727,11 @@ private:
                         swap_xy = true;
                     if (!res.complete && !graph_crossing_refusal.empty()) return fail(where + ": " + graph_crossing_refusal);
                 }
+                // A small closed loop the search could not seed or certify at its
+                // own scale (two surfaces crossing near a tangency): searched
+                // again over the small region it left, where seeding and steps
+                // are scaled to that region, and proven complete there.
+                if (!res.complete && known.empty() && tiny_loops(*sys, sopt, res, where)) ++im.stats.tiny_loops;
                 // A curved surface touching a plane at one point, inside the
                 // region the search could not finish: proven exactly.
                 if (!res.complete && known.empty() &&
@@ -2403,6 +2409,61 @@ private:
         res = std::move(out);
         ++im.stats.graph_crossings;
         graph_crossing_seen = true;
+        return true;
+    }
+
+    /// Closed loops too small for the search over the whole box (see the call).
+    bool tiny_loops(const SsiSystem& sys, const solve::SsiOptions& sopt, solve::SsiResult& res, const std::string& where) {
+        const Box4& H = res.unverified_hull;
+        double w = 0.0;
+        for (const Interval& h : H) w = std::max(w, h.hi - h.lo);
+        if (!(w < 0.05) || !(w > 0.0)) return false;
+        solve::SsiOptions z = sopt;
+        for (std::size_t i = 0; i < 4; ++i) {
+            const double m = std::max(H[i].hi - H[i].lo, 1e-9);
+            z.dom_lo[i] = std::max(sopt.dom_lo[i] - 0.0, H[i].lo - m);
+            z.dom_hi[i] = std::min(sopt.dom_hi[i], H[i].hi + m);
+        }
+        const double span = z.dom_hi[0] - z.dom_lo[0];
+        z.h0 = sopt.h0 * span;
+        z.h_max = sopt.h_max * span;
+        z.h_min = sopt.h_min * span;
+        const solve::SsiResult rz = solve::intersect(sys, z);
+        im.stats.ssi_verify_nodes += rz.stats.verify_nodes;
+        if (!rz.complete || rz.curves.empty()) return false;
+        for (const SsiCurve& c : rz.curves)
+            if (!c.closed) return false; // only loops strictly inside the region
+        // The first search proved everything outside the boxes it left, the
+        // search over the region everything inside it, and the region covers
+        // those boxes: together the intersection is the region's loops and the
+        // first search's curves outside the region. A first-search curve inside
+        // the region is covered by its loops and dropped; one that crosses the
+        // region's boundary would be found twice in part, and is refused.
+        Box4 Z;
+        for (std::size_t i = 0; i < 4; ++i) Z[i] = Interval(z.dom_lo[i], z.dom_hi[i]);
+        std::vector<SsiCurve> kept;
+        for (const SsiCurve& c : res.curves) {
+            bool all_in = true, all_out = true;
+            for (const auto& sg : c.segs) {
+                bool in = true, out = false;
+                for (std::size_t i = 0; i < 4; ++i) {
+                    in = in && num::subset(sg.X[i], Z[i]);
+                    out = out || num::disjoint(sg.X[i], Z[i]);
+                }
+                all_in = all_in && in;
+                all_out = all_out && out;
+            }
+            if (c.known || all_out) kept.push_back(c);
+            else if (!all_in) {
+                note(where + ": a curve of the first search crosses the boundary of the region searched again");
+                return false;
+            }
+        }
+        for (const SsiCurve& c : rz.curves) kept.push_back(c);
+        note(where + ": " + str(static_cast<int>(rz.curves.size())) + " closed loops found by a search over the region left (" +
+             std::to_string(w) + " wide), complete there");
+        res.curves = std::move(kept);
+        res.complete = true;
         return true;
     }
 
@@ -5128,15 +5189,15 @@ private:
                     // Exactly on the face's boundary: interval point location cannot
                     // say so, but the structure does when the point is a vertex of
                     // the imprint with parameters on the plane (made where an edge
-                    // of the plane's solid touches the curved surface).
+                    // of the plane's solid touches the curved surface, or a corner
+                    // of the face that lies on it), its exact point the touch point.
                     if (w2 == Where::Undecided && t.has_xp && !t.b_curved) {
                         using E = num::Expansion;
                         auto same = [&](double a, double aw, double b, double bw) { return (E(a) * E(bw) - E(b) * E(aw)).sign() == 0; };
                         for (int vi = 0; vi < static_cast<int>(im.vertices.size()); ++vi) {
-                            const auto& V = im.vertices[static_cast<std::size_t>(vi)];
-                            if (!V.exact || !chart(vi, gb)) continue;
-                            if (same(V.xp.x, V.xp.w, t.xp.x, t.xp.w) && same(V.xp.y, V.xp.w, t.xp.y, t.xp.w) &&
-                                same(V.xp.z, V.xp.w, t.xp.z, t.xp.w))
+                            Vec4d X{};
+                            if (!chart(vi, gb) || !exact_point(vi, X)) continue;
+                            if (same(X.x, X.w, t.xp.x, t.xp.w) && same(X.y, X.w, t.xp.y, t.xp.w) && same(X.z, X.w, t.xp.z, t.xp.w))
                                 w2 = Where::Boundary;
                         }
                     }

@@ -65,6 +65,7 @@ struct TessStats {
     long long flips = 0;
     long long constraint_flips = 0;
     int lens_splits = 0;      ///< chords two faces had in common, split (see tessellate)
+    int axis_points = 0;      ///< edge samples taken on a tube segment's axis where Newton failed (see tessellate)
     double ms = 0.0;
 };
 
@@ -660,8 +661,14 @@ inline TessResult tessellate(const Brep& b, const TessOptions& opt = {}) {
                     if (last) break;
                     Pt4 xj;
                     for (int i = 0; i < 4; ++i) xj[i] = seg.a[i] + (sp.cb / seg.len) * (seg.b[i] - seg.a[i]);
-                    if (!solve::newton_slice(sys, seg.m, seg.a, sp.cb, xj))
-                        return fail("could not evaluate an intersection edge");
+                    const Pt4 axis = xj;
+                    if (!solve::newton_slice(sys, seg.m, seg.a, sp.cb, xj)) {
+                        bool in = true; // as in point_at below: the axis point, in the certified box
+                        for (int i = 0; i < 4; ++i) in = in && num::contains(seg.X[static_cast<std::size_t>(i)], axis[static_cast<std::size_t>(i)]);
+                        if (!in) return fail("could not evaluate an intersection edge");
+                        xj = axis;
+                        ++res.stats.axis_points;
+                    }
                     prev = (C0.point(xj[0], xj[1]) + C1.point(xj[2], xj[3])) * 0.5;
                     S.x.push_back(xj);
                     S.gid.push_back(static_cast<int>(M.points.size()));
@@ -670,9 +677,19 @@ inline TessResult tessellate(const Brep& b, const TessOptions& opt = {}) {
                 }
                 auto point_at = [&](double c, Pt4& x) {
                     for (int i = 0; i < 4; ++i) x[i] = seg.a[i] + (c / seg.len) * (seg.b[i] - seg.a[i]);
-                    if (!solve::newton_slice(sys, seg.m, seg.a, c, x)) return false;
+                    const Pt4 axis = x;
+                    bool ok = solve::newton_slice(sys, seg.m, seg.a, c, x);
+                    for (int i = 0; i < 4 && ok; ++i) ok = std::isfinite(x[i]);
+                    if (ok) return true;
+                    // Newton can fail where the surfaces meet at a very small angle
+                    // (a tiny loop near a tangency): the sliced system is then too
+                    // badly conditioned for its tolerance. The point on the
+                    // segment's axis lies in its certified box, so it is within the
+                    // box's size of the curve; the mesh is measured, not certified.
                     for (int i = 0; i < 4; ++i)
-                        if (!std::isfinite(x[i])) return false;
+                        if (!num::contains(seg.X[static_cast<std::size_t>(i)], axis[static_cast<std::size_t>(i)])) return false;
+                    x = axis;
+                    ++res.stats.axis_points;
                     return true;
                 };
                 auto f = [&](double c, Vec3d& p) {

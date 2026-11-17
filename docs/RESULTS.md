@@ -883,7 +883,20 @@ Red checks: without the exact plane proof the 2^-50 case is refused (2 failures)
 
 **A touch on an edge.** The box moved so that the hill's apex lies on an edge of its bottom face (x = 0.5) was refused at the search for where that edge meets the hill's top: the edge is tangent to the surface there. The bottom plane touches the top only at the apex and meets it nowhere else (both proven by the point-contact rule), and the edge lies in that plane, so it meets the top at most at the apex. That is decided exactly (the apex is an exact point, and `exact_on_edge` tests it against the edge): the apex becomes a vertex on the edge where it touches the surface (not a pierce, so no new curves end there). In the classification the apex lies on the bottom face's boundary, which interval point location cannot decide for a point exactly on it; the imprint vertex with parameters on that plane decides it. The side plane x = 0.5 still meets the top along an ordinary curve through the apex, outside the box's side face. Intersection empty, union 2.533333333333 = 1.133333333333 + 1.4 with one point contact (not manifold, closed mesh), difference the hill, all to 1e-12. Without the edge rule the case is refused as before (2 failures). The apex at a corner of the bottom face is still refused, and is now `boolean_test`'s example of an unsolved imprint.
 
-Not covered yet: a touch at a vertex, near misses of two curved faces below interval resolution (they need exact algebra for curved pairs), and tiny loops (a crossing too small for the search to trace).
+**A touch at a vertex.** With the apex at a corner of the box's bottom face, the corner is an operand vertex that the edge searches already prove to lie exactly on the hill's top (its exact point, at the end of the box's vertical edge there). The touch point is placed on the bottom face's boundary by matching it to the exact point of a vertex with parameters on that plane (`exact_point`, which also derives the exact point of an operand vertex from its exact parameters). Intersection empty, union 1.833333333333 = 1.133333333333 + 0.7 with one point contact (closed mesh), difference the hill, to 1e-12. With the placement disabled, both the corner and the edge touch are refused (2 failures).
+
+**Tiny loops.** A box whose bottom lies 2^-k below the hill's apex cuts a closed curve of radius about 2^(-k/2) out of the top. The search over the whole patches seeds closed curves on a grid of 8 cells per parameter and certifies with steps scaled to the unit square: it traces the loop for k ≤ 18 and gives up from k = 20 (a loop of radius 1e-3, far above rounding). The imprint now searches again over the small region the first search left (`tiny_loops`), with seeding and steps scaled to that region. If that search is complete and finds only closed loops, the two proofs combine: the first search proved everything outside the boxes it left, the second everything inside a region covering them; curves of the first search inside the region are covered by its loops and dropped, and one that crosses the region's boundary would be found twice in part, so it is refused.
+
+| Gap 2^-k | Before | Now |
+|---|---|---|
+| k ≤ 18 | solved | solved |
+| 20 to 26, 30 to 40 | refused | solved |
+| 28 | refused | refused (no certified point on the loop could be placed) |
+| ≥ 42 | refused | refused |
+
+The cap above z = 1.25 − ε has volume πε²/2 + O(ε³) (the top is 1.25 − a² − b² + 4a²b² around the apex). At k = 20 the intersection is 1.4172e-12 against 1.4286e-12, within the volume integration's noise of about 1e-14; at k = 22 the cap (9e-14) is near that noise, and below it the computed volumes are noise. At k = 30 the union is 4.111111114836, the hill plus the box minus the cap. The tessellator could not place samples on such small loops: Newton on the sliced system is too badly conditioned there (the surfaces meet at a very small angle). Where it fails, the sample is now the point on the tube segment's axis, which lies in the segment's certified box, so within that box's size of the curve (`TessStats::axis_points`); every result from k = 20 to 40 tessellates closed with the Brep's Euler characteristic. Red checks: without the second search both cases are refused (2 failures); without the axis points the k = 30 meshes fail (1 failure).
+
+Not covered yet: near misses of two curved faces below interval resolution, and tiny loops below about 2^-40 (both need exact algebra or more precision).
 
 ### A compiler fault
 
@@ -915,7 +928,7 @@ Each of these stops with a message naming the two faces involved. None returns a
 |---|---|
 | A box whose bottom touches the top of the hill in one point | Solved since tangent points (§3): the apex is proven the only contact; union with one point contact, not manifold |
 | The same, with the apex on an edge of the box's bottom face | Solved since a touch on an edge (§3): the apex is a vertex on that edge, union with one point contact |
-| The same, with the apex at a corner of the box's bottom face | Not solved: a touch at a vertex |
+| The same, with the apex at a corner of the box's bottom face | Solved since a touch at a vertex (§3) |
 | A tilted box whose edge leaves the unit box exactly through one of its edges | Solved since the classification clash (§3): intersection 1/8 |
 | An edge crossing an edge at one point, all faces otherwise transversal | Solved since edges through edges (§3): the crossing point (1, 1, 0.5) is exact; intersection 1/48 |
 | Two curved faces meeting tangentially along a shared edge | Refused by the fan check around the edge |

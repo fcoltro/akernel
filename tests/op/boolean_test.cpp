@@ -485,15 +485,52 @@ int main() {
 
     // --- 7. not in general position: reported, never answered wrongly ------------
     {
-        // An imprint that is not solved gives no result. Here the box's bottom
-        // touches the hill's apex (0.5, 0.5, 1.3) exactly at a corner of that
-        // face: a point contact at a vertex, still refused.
-        const Brep B = op::to_brep(op::make_box({0.5, 0.5, 1.3}, {1.5, 1.5, 2.0}));
-        const Imprint im = op::imprint(op::to_brep(op::make_bump_box({0, 0, 0}, 1, 1, 1, 0.3)), B);
+        // An imprint that is not solved gives no result. Here a hill (apex
+        // 1.25) and a block whose curved bottom dips to 1.25 + 2^-50 above
+        // it: two curved faces closer than interval resolution, which would
+        // need exact algebra for curved pairs. Refused.
+        const double eps = std::ldexp(1.0, -50);
+        op::Lattice L(2, 2, 1);
+        for (int i = 0; i <= 2; ++i)
+            for (int j = 0; j <= 2; ++j) {
+                const double x = -0.5 + 1.0 * i, y = -0.5 + 1.0 * j;
+                L.at(i, j, 0) = {x, y, (i == 1 && j == 1) ? 0.5 + 4.0 * eps : 1.5, 1.0};
+                L.at(i, j, 1) = {x, y, 2.0, 1.0};
+            }
+        const Imprint im = op::imprint(op::to_brep(op::make_bump_box({0, 0, 0}, 1, 1, 1, 0.25)), op::to_brep(op::make_hex(L)));
         AK_CHECK(!im.ok);
         const BooleanResult r = op::select(im, Op::Union);
         AK_CHECK(!r.ok && r.solid.faces.empty());
-        std::printf("box touching a hill at a corner of its bottom: %s\n", im.error.c_str());
+        std::printf("an imprint that is not solved: %s\n", im.error.c_str());
+    }
+    {
+        // The box's bottom touches the apex (0.5, 0.5, 1.3) exactly at a corner
+        // of that face. The corner is proven to lie on the hill's top (its
+        // exact point, at the end of the box's vertical edge there), and the
+        // touch point is placed on the bottom face's boundary by that vertex.
+        // Intersection empty, union the two (not manifold), difference the
+        // hill. The box is 1 x 1 x 0.7.
+        const Brep B = op::to_brep(op::make_box({0.5, 0.5, 1.3}, {1.5, 1.5, 2.0}));
+        const Imprint im = op::imprint(hill, B);
+        AK_CHECK(im.ok);
+        AK_CHECK(im.stats.point_contacts == 1);
+        const double vh = 1.0 + 4.0 * bump / 9.0, vb = 0.7;
+        if (im.ok) {
+            const BooleanResult i = op::select(im, Op::Intersection), u = op::select(im, Op::Union), d = op::select(im, Op::Difference);
+            AK_CHECK(i.ok && i.empty);
+            AK_CHECK(u.ok && !u.empty && u.audit.closed() && !u.manifold && u.point_contacts == 1);
+            AK_CHECK(d.ok && !d.empty && d.manifold);
+            if (u.ok && d.ok && !u.empty && !d.empty) {
+                AK_CHECK_NEAR(op::volume(u.solid), vh + vb, 1e-12);
+                AK_CHECK_NEAR(op::volume(d.solid), vh, 1e-12);
+                const op::TessResult t = op::tessellate(u.solid);
+                AK_CHECK(t.ok && op::audit(t.mesh).watertight());
+            }
+            std::printf("box touching a hill at a corner of its bottom: solved; union %.12f (%.12f), point contacts %d\n",
+                        u.ok && !u.empty ? op::volume(u.solid) : 0.0, vh + vb, u.point_contacts);
+        } else {
+            std::printf("box touching a hill at a corner of its bottom: %s\n", im.error.c_str());
+        }
     }
     {
         // The box's bottom touches the apex exactly on an edge of that face
@@ -649,6 +686,35 @@ int main() {
             const Imprint im = op::imprint(H, B);
             AK_CHECK(!im.ok);
             std::printf("box 2^-50 below the hill's apex (a tiny loop): %s\n", im.ok ? "solved" : im.error.c_str());
+        }
+        // Tiny loops: the box's bottom 2^-k below the apex cuts a closed curve
+        // of radius about 2^(-k/2) out of the top. The search over the whole
+        // patches cannot seed or certify it below k = 18; a second search over
+        // the small region it left, with seeding and steps scaled to it, finds
+        // and proves it there. The cap above z = 1.25 - e has volume
+        // pi e^2 / 2 + O(e^3) (the top is 1.25 - a^2 - b^2 + 4 a^2 b^2 around
+        // the apex), checked at k = 20 against the volume integration's noise
+        // of about 1e-14; at k = 30 the cap (1.8e-18) is far below that noise,
+        // and only the union and the meshes are checked.
+        for (int k : {20, 30}) {
+            const double e = std::ldexp(1.0, -k);
+            const Brep B = op::to_brep(op::make_box({-0.5, -0.5, 1.25 - e}, {1.5, 1.5, 2.0}));
+            const Imprint im = op::imprint(H, B);
+            AK_CHECK(im.ok && im.stats.tiny_loops == 1);
+            if (!im.ok) {
+                std::printf("box 2^-%d below the hill's apex: %s\n", k, im.error.c_str());
+                continue;
+            }
+            const BooleanResult i = op::select(im, Op::Intersection), u = op::select(im, Op::Union);
+            AK_CHECK(i.ok && !i.empty && i.audit.closed() && u.ok && !u.empty && u.audit.closed());
+            if (!(i.ok && u.ok && !i.empty && !u.empty)) continue;
+            const double cap = 3.14159265358979323846 * e * e / 2.0, vi = op::volume(i.solid), vb = 4.0 * (0.75 + e);
+            if (k == 20) { AK_CHECK_NEAR(vi, cap, 3e-14); }
+            AK_CHECK_NEAR(op::volume(u.solid), vh + vb - cap, 1e-12);
+            const op::TessResult ti = op::tessellate(i.solid), tu = op::tessellate(u.solid);
+            AK_CHECK(ti.ok && op::audit(ti.mesh).watertight() && tu.ok && op::audit(tu.mesh).watertight());
+            std::printf("box 2^-%d below the hill's apex (a tiny loop): solved; intersection %.4e (closed form %.4e), union %.12f\n", k, vi, cap,
+                        op::volume(u.solid));
         }
     }
     {
