@@ -126,5 +126,38 @@ int main() {
         report("cap with its apex at x = 1/3", r);
         AK_CHECK(r.kind == ContactKind::Undecided);
     }
+    // 8. Separation over a region (solve::separated_in): the normal offset
+    //    from the cap keeps the facing gap's sign over a box of parameters.
+    {
+        using num::Interval;
+        // A box 0.002 wide around the apex (the Krawczyk test over a box of
+        // A's parameters needs it small against a curved B: at 0.02 it does
+        // not pass for the two caps; the Boolean's boxes are about 1e-5);
+        // B's parameters where the normals from it meet B (s = (x + 0.75) / 2
+        // on the plane, near 1/2 on the upside-down cap).
+        const Interval U(0.499, 0.501), V(0.499, 0.501);
+        auto run = [&](const char* name, const PolyPatchD& A, const PolyPatchD& B, const Interval& S, const Interval& T) {
+            const auto r = solve::classify_contact(A, B, kSeed);
+            std::array<double, 5> c;
+            for (int i = 0; i < 5; ++i) c[static_cast<std::size_t>(i)] = num::mid(r.enc[static_cast<std::size_t>(i)]);
+            std::string why;
+            const int side = solve::separated_in(A, B, c, U, V, S, T, why);
+            std::printf("  %s: %s; separated over the box: %d%s%s\n", name, solve::to_string(r.kind), side, why.empty() ? "" : " - ", why.c_str());
+            return side;
+        };
+        // The plane 2^-20 above: apart, on the side of the cap's normal.
+        const Interval Sp(0.37, 0.38);
+        AK_CHECK(run("plane 2^-20 above the cap", quadric_cap(false), plane(1.0 + std::ldexp(1.0, -20)), Sp, Sp) == 1);
+        // 2^-20 below: they cross in a small loop, so never "separated".
+        AK_CHECK(run("plane 2^-20 below the cap", quadric_cap(false), plane(1.0 - std::ldexp(1.0, -20)), Sp, Sp) == 0);
+        // Two curved patches: the cap and a cap turned upside down above it.
+        PolyPatchD D = quadric_cap(false);
+        for (auto& cp : D.c) cp.z = 2.0 + std::ldexp(1.0, -20) - cp.z; // dips to 1 + 2^-20 at the middle
+        // (mirroring z reverses the orientation; restore it by swapping u)
+        PolyPatchD Dm(2, 2);
+        for (int i = 0; i <= 2; ++i)
+            for (int j = 0; j <= 2; ++j) Dm.at(i, j) = D.at(2 - i, j);
+        AK_CHECK(run("two caps 2^-20 apart", quadric_cap(false), Dm, Interval(0.497, 0.503), Interval(0.497, 0.503)) == 1);
+    }
     return akt::finish("contact_point_test");
 }

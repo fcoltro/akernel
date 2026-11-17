@@ -168,7 +168,8 @@ struct ImprintStats {
     int edge_crossings = 0;          ///< edges proven to cross an edge of the other solid in space, at an exact point
     int line_tangencies = 0;         ///< curved surfaces proven to touch a plane along a line inside the patch
     int graph_crossings = 0;         ///< pairs of graphs crossing where they share boundary lines, desingularised exactly
-    int point_contacts = 0;          ///< pairs of a curved surface and a plane touching at one point, proven exactly
+    int point_contacts = 0;          ///< pairs of surfaces touching at one point (a curved one against a plane or a curved one), proven exactly
+    int near_misses = 0;             ///< pairs whose facing points are proven apart, with nothing between them in the region the search left
     int ssi_pairs_empty = 0;          ///< intersected surface pairs that gave no curve
     double ssi_ms_empty = 0.0, ssi_ms_curves = 0.0; ///< time in surface pairs without and with curves
     std::size_t ssi_nodes_empty = 0, ssi_nodes_curves = 0; ///< completeness-pass nodes, likewise
@@ -1723,7 +1724,8 @@ private:
                 }
                 // A curved surface touching a plane at one point, inside the
                 // region the search could not finish: proven exactly.
-                if (!res.complete && known.empty() && (point_touch(x, y, res, where) || curved_touch(x, y, res, where)))
+                if (!res.complete && known.empty() &&
+                    (point_touch(x, y, res, where) || curved_touch(x, y, res, where) || near_miss(x, y, res, where)))
                     res.complete = true;
                 if (!res.complete && iso_side_tangent)
                     return fail(where + ": a side of one lies in the other along one of its lines but they do not "
@@ -2452,20 +2454,57 @@ private:
             if (!(us >= u0 && us <= u1 && vs >= v0 && vs <= v1)) continue;
             found = value(g, us, vs).sign() == 0 && value(gu, us, vs).sign() == 0 && value(gv, us, vs).sign() == 0;
         }
-        if (!found) return false;
-        // Definite Hessian over U, from the coefficient hulls.
+        // Definite Hessian over U, from the coefficient hulls, with a lower
+        // bound m on its eigenvalues' magnitude.
         auto hull_over = [&](const ExactBernstein& f) {
             const ExactBernstein r = restrict_dir(restrict_dir(f, true, u0, u1), false, v0, v1);
             Interval h = enclose(r.c[0]);
             for (const E& e : r.c) h = num::hull(h, enclose(e));
             return h;
         };
-        const Interval huu = hull_over(deriv(gu, true)), huv = hull_over(deriv(gu, false)), hvv = hull_over(deriv(gv, false));
-        const Interval det = huu * hvv - huv * huv;
-        if (!(det.lo > 0.0 && (huu.lo > 0.0 || huu.hi < 0.0))) {
-            note(where + ": a point where the surface touches the plane exactly, but its curvature against the plane is not "
-                         "proven definite there (not an isolated contact)");
+        const ExactBernstein guu = deriv(gu, true), guv = deriv(gu, false), gvv = deriv(gv, false);
+        const Interval huu = hull_over(guu), huv = hull_over(guv), hvv = hull_over(gvv);
+        const Interval Hs[2][2] = {{huu, huv}, {huv, hvv}};
+        double m = 0.0;
+        const int sg = solve::contact_detail::definite(Hs, m);
+        if (sg == 0) {
+            note(where + ": the surface's curvature against the plane is not proven definite over the region left (not an isolated "
+                         "contact or near miss)");
             return false;
+        }
+        if (!found) {
+            // A near miss: Newton in doubles towards g's critical point p (a
+            // double, hence dyadic); g and its gradient there exactly; and by
+            // Taylor's theorem with the eigenvalue bound, g(p + d) >= g(p) +
+            // grad g(p).d + m |d|^2 / 2 >= g(p) - |grad g(p)|^2 / (2 m) on U
+            // (mirrored for a concave g). If that keeps g(p)'s sign, g has no
+            // zero on U: the surface does not reach the plane there.
+            auto dval = [&](const ExactBernstein& f, double u, double v) { return num::mid(enclose(value(f, u, v))); };
+            double pu = num::mid(hu), pv = num::mid(hv);
+            for (int it = 0; it < 8; ++it) {
+                const double a = dval(guu, pu, pv), b = dval(guv, pu, pv), cc = dval(gvv, pu, pv);
+                const double fu = dval(gu, pu, pv), fv = dval(gv, pu, pv), d = a * cc - b * b;
+                if (!(std::fabs(d) > 0.0)) break;
+                const double du = (cc * fu - b * fv) / d, dv = (a * fv - b * fu) / d;
+                pu -= du;
+                pv -= dv;
+                if (std::fabs(du) + std::fabs(dv) < 1e-17) break;
+            }
+            if (!(pu >= u0 && pu <= u1 && pv >= v0 && pv <= v1)) return false;
+            const Interval g0 = enclose(value(g, pu, pv)), g1 = enclose(value(gu, pu, pv)), g2 = enclose(value(gv, pu, pv));
+            const Interval drop = (num::sqr(g1) + num::sqr(g2)) / (Interval(2.0) * Interval(m));
+            const bool apart = sg > 0 ? (g0 - drop).lo > 0.0 : (g0 + drop).hi < 0.0;
+            if (!apart) {
+                note(where + ": the surface comes close to the plane, but is not proven to stay off it over the region left");
+                return false;
+            }
+            ++im.stats.near_misses;
+            char buf[200];
+            std::snprintf(buf, sizeof buf, ": a near miss, proven exactly: surface %d stays off the plane %d over the region left "
+                                           "(plane function %.3e at its closest point, against at most %.3e of drop)",
+                          c, pl, num::mid(g0), drop.hi);
+            note(where + buf);
+            return true;
         }
         const auto h = icarrier[static_cast<std::size_t>(c)].eval(Interval(us), Interval(vs));
         point_touches.push_back({c, pl, us, vs, {h.x / h.w, h.y / h.w, h.z / h.w}});
@@ -2509,6 +2548,45 @@ private:
         note(where + ": surfaces " + str(x) + " and " + str(y) + " touch at one point, at parameters (" + std::to_string(r.point[0]) + ", " +
              std::to_string(r.point[1]) + ") and (" + std::to_string(r.point[2]) + ", " + std::to_string(r.point[3]) +
              "), proven exactly, and nowhere else in the region left");
+        return true;
+    }
+
+    /// A near miss: a curved patch and another patch (curved, or a plane)
+    /// that come close without meeting, inside the region the search could
+    /// not finish. solve::classify_contact proves a facing pair with a nonzero
+    /// gap there, and solve::separated_in proves that the normal offset from
+    /// the curved patch keeps that gap's sign over boxes around every box the
+    /// search left: the pair has no intersection there.
+    bool near_miss(int x, int y, const solve::SsiResult& res, const std::string& where) {
+        const bool px = is_planar[static_cast<std::size_t>(x)], py = is_planar[static_cast<std::size_t>(y)];
+        if (px && py) return false;
+        const Box4& H = res.unverified_hull;
+        for (const Interval& h : H)
+            if (!(h.hi - h.lo < 1e-3)) return false; // a small region only
+        // A is the curved one (the offset is taken along its normal).
+        const int ia = px ? y : x, ib = px ? x : y;
+        const Interval hu = H[px ? 2u : 0u], hv = H[px ? 3u : 1u], hs = H[px ? 0u : 2u], ht = H[px ? 1u : 3u];
+        const PolyPatchD& A = im.carriers[static_cast<std::size_t>(ia)];
+        const PolyPatchD& B = im.carriers[static_cast<std::size_t>(ib)];
+        const solve::ContactResult r = solve::classify_contact(A, B, {num::mid(hu), num::mid(hv), num::mid(hs), num::mid(ht), 0.0});
+        if (r.kind != solve::ContactKind::Separated) return false;
+        auto widen = [](const Interval& h) {
+            const double m = std::max(h.hi - h.lo, std::ldexp(1.0, -20));
+            return Interval(h.lo - m, h.hi + m);
+        };
+        std::array<double, 5> c;
+        for (int i = 0; i < 5; ++i) c[static_cast<std::size_t>(i)] = num::mid(r.enc[static_cast<std::size_t>(i)]);
+        std::string why;
+        const int side = solve::separated_in(A, B, c, widen(hu), widen(hv), widen(hs), widen(ht), why);
+        if (side == 0) {
+            note(where + ": a facing pair with a gap, but not proven apart over the region left: " + why);
+            return false;
+        }
+        ++im.stats.near_misses;
+        char buf[160];
+        std::snprintf(buf, sizeof buf, ": a near miss, gap in [%.3e, %.3e] along the normal of surface %d, proven not to close over the region left",
+                      r.enc[4].lo, r.enc[4].hi, ia);
+        note(where + buf);
         return true;
     }
 

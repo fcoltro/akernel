@@ -566,6 +566,62 @@ int main() {
         }
     }
     {
+        // Near misses: the hill and a box above it with a gap. With 2^-40
+        // (about 9e-13) the surface/surface search proves the gap empty by
+        // itself. With 2^-50 (about 9e-16) it cannot, and the near miss is
+        // proven exactly from the plane function: at its closest point
+        // (Newton in doubles, an exact point) its value and gradient are
+        // computed exactly, and with a lower bound on its Hessian Taylor's
+        // theorem keeps it positive over the region the search left. The
+        // dipping block 2^-50 above the apex (two curved faces) and the box
+        // 2^-50 below it (a tiny loop) are still refused.
+        const Brep H = op::to_brep(op::make_bump_box({0, 0, 0}, 1, 1, 1, 0.25)); // apex at 1.25
+        const double vh = 1.0 + 0.25 * 4.0 / 9.0;
+        auto disjoint = [&](const char* name, const Brep& other, double vo, int misses) {
+            const Imprint im = op::imprint(H, other);
+            AK_CHECK(im.ok);
+            AK_CHECK(im.stats.near_misses == misses && im.stats.point_contacts == 0);
+            if (!im.ok) {
+                std::printf("%s: %s\n", name, im.error.c_str());
+                return;
+            }
+            const BooleanResult i = op::select(im, Op::Intersection), u = op::select(im, Op::Union), d = op::select(im, Op::Difference);
+            AK_CHECK(i.ok && i.empty);
+            AK_CHECK(u.ok && !u.empty && u.manifold && u.point_contacts == 0);
+            AK_CHECK(d.ok && !d.empty);
+            if (u.ok && d.ok && !u.empty && !d.empty) {
+                AK_CHECK_NEAR(op::volume(u.solid), vh + vo, 1e-12);
+                AK_CHECK_NEAR(op::volume(d.solid), vh, 1e-12);
+            }
+            std::printf("%s: solved, disjoint; union %.12f (%.12f), near misses %d\n", name, u.ok && !u.empty ? op::volume(u.solid) : 0.0,
+                        vh + vo, im.stats.near_misses);
+        };
+        for (int k : {40, 50}) {
+            const double eps = std::ldexp(1.0, -k);
+            const Brep B = op::to_brep(op::make_box({-0.5, -0.5, 1.25 + eps}, {1.5, 1.5, 2.0}));
+            disjoint(k == 40 ? "box 2^-40 above the hill's apex" : "box 2^-50 above the hill's apex", B, 4.0 * (0.75 - eps), k == 40 ? 0 : 1);
+        }
+        const double eps = std::ldexp(1.0, -50);
+        {
+            op::Lattice L(2, 2, 1);
+            for (int i = 0; i <= 2; ++i)
+                for (int j = 0; j <= 2; ++j) {
+                    const double x = -0.5 + 1.0 * i, y = -0.5 + 1.0 * j;
+                    L.at(i, j, 0) = {x, y, (i == 1 && j == 1) ? 0.5 + 4.0 * eps : 1.5, 1.0}; // dips to 1.25 + eps
+                    L.at(i, j, 1) = {x, y, 2.0, 1.0};
+                }
+            const Imprint im = op::imprint(H, op::to_brep(op::make_hex(L)));
+            AK_CHECK(!im.ok);
+            std::printf("dipping block 2^-50 above the hill's apex: %s\n", im.ok ? "solved" : im.error.c_str());
+        }
+        {
+            const Brep B = op::to_brep(op::make_box({-0.5, -0.5, 1.25 - eps}, {1.5, 1.5, 2.0}));
+            const Imprint im = op::imprint(H, B);
+            AK_CHECK(!im.ok);
+            std::printf("box 2^-50 below the hill's apex (a tiny loop): %s\n", im.ok ? "solved" : im.error.c_str());
+        }
+    }
+    {
         // A tilted box whose edge from (0.5, 0.5, 0.5) to (0.5, 1.5, 1.5)
         // leaves the unit box exactly through its edge y = 1, z = 1. That edge
         // lies in the plane y = z of one of B's faces, and the unit box's two
