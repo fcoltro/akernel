@@ -5,6 +5,7 @@
 // only the analytic definition of the solids.
 #include <akernel/geom/primitives.hpp>
 #include <akernel/op/boolean.hpp>
+#include <akernel/op/tessellate.hpp>
 
 #include <functional>
 #include <memory>
@@ -522,6 +523,46 @@ int main() {
                         u.point_contacts);
         } else {
             std::printf("box touching a hill at one point: %s\n", im.error.c_str());
+        }
+    }
+    {
+        // Two curved faces touching at one point: a hill whose top rises to
+        // 1.25 at (0.5, 0.5) (bump 1/4), and a block over [-0.5, 1.5]^2 up to
+        // z = 2 whose bottom dips from 1.5 down to 1.25 there (16 d u(1-u)
+        // v(1-v), d = 1/4). The contact is proven exact (deflated system,
+        // dyadic parameters (1/2, 1/2) on both) and the only intersection
+        // around it (the normal offset strictly convex). Volumes: the hill
+        // 1 + (1/4)(4/9), the block 4 (1/2) + 4 (1/4)(4/9).
+        const Brep H = op::to_brep(op::make_bump_box({0, 0, 0}, 1, 1, 1, 0.25));
+        op::Lattice L(2, 2, 1);
+        for (int i = 0; i <= 2; ++i)
+            for (int j = 0; j <= 2; ++j) {
+                const double x = -0.5 + 1.0 * i, y = -0.5 + 1.0 * j;
+                L.at(i, j, 0) = {x, y, (i == 1 && j == 1) ? 0.5 : 1.5, 1.0};
+                L.at(i, j, 1) = {x, y, 2.0, 1.0};
+            }
+        const Brep U = op::to_brep(op::make_hex(L));
+        const double vh = 1.0 + 0.25 * 4.0 / 9.0, vu = 2.0 + 4.0 * 0.25 * 4.0 / 9.0;
+        AK_CHECK_NEAR(op::volume(H), vh, 1e-12);
+        AK_CHECK_NEAR(op::volume(U), vu, 1e-12);
+        const Imprint im = op::imprint(H, U);
+        AK_CHECK(im.ok);
+        AK_CHECK(im.stats.point_contacts == 1);
+        if (im.ok) {
+            const BooleanResult i = op::select(im, Op::Intersection), u = op::select(im, Op::Union), d = op::select(im, Op::Difference);
+            AK_CHECK(i.ok && i.empty);
+            AK_CHECK(u.ok && !u.empty && u.audit.closed() && !u.manifold && u.point_contacts == 1);
+            AK_CHECK(d.ok && !d.empty && d.manifold);
+            if (u.ok && d.ok && !u.empty && !d.empty) {
+                AK_CHECK_NEAR(op::volume(u.solid), vh + vu, 1e-12);
+                AK_CHECK_NEAR(op::volume(d.solid), vh, 1e-12);
+                const op::TessResult t = op::tessellate(u.solid);
+                AK_CHECK(t.ok && op::audit(t.mesh).watertight());
+            }
+            std::printf("two curved faces touching at one point: solved; union %.12f (%.12f), point contacts %d\n",
+                        u.ok && !u.empty ? op::volume(u.solid) : 0.0, vh + vu, u.point_contacts);
+        } else {
+            std::printf("two curved faces touching at one point: %s\n", im.error.c_str());
         }
     }
     {

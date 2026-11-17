@@ -76,6 +76,7 @@
 #include <akernel/op/brep.hpp>
 #include <akernel/op/contact.hpp>
 #include <akernel/op/tsi.hpp>
+#include <akernel/solve/contact_point.hpp>
 #include <akernel/solve/csi.hpp>
 #include <akernel/solve/ssi.hpp>
 
@@ -577,12 +578,15 @@ class Builder {
         Interval r;
     };
     std::vector<LineTouch> line_touches;
-    /// A curved surface `a` touching the plane `b` at one point: its exact
-    /// parameters on `a`, and the point.
+    /// A curved surface `a` touching the surface `b` at one point: its exact
+    /// parameters on `a`, the point, and, where `b` is curved too, its exact
+    /// parameters on `b` (on a plane they follow from the point).
     struct PointTouch {
         int a = -1, b = -1;
         double u = 0.0, v = 0.0;
         geom::Vec3<Interval> P;
+        bool b_curved = false;
+        double s = 0.0, t = 0.0;
     };
     std::vector<PointTouch> point_touches;
     std::vector<Touch> touches;
@@ -1719,7 +1723,8 @@ private:
                 }
                 // A curved surface touching a plane at one point, inside the
                 // region the search could not finish: proven exactly.
-                if (!res.complete && known.empty() && point_touch(x, y, res, where)) res.complete = true;
+                if (!res.complete && known.empty() && (point_touch(x, y, res, where) || curved_touch(x, y, res, where)))
+                    res.complete = true;
                 if (!res.complete && iso_side_tangent)
                     return fail(where + ": a side of one lies in the other along one of its lines but they do not "
                                         "meet transversally along it (tangent along it; not in general position)");
@@ -2467,6 +2472,43 @@ private:
         ++im.stats.point_contacts;
         note(where + ": surface " + str(c) + " touches the plane " + str(pl) + " at one point, at parameters (" + std::to_string(us) +
              ", " + std::to_string(vs) + "), proven exactly, and nowhere else in the region left");
+        return true;
+    }
+
+    /// Two curved patches touching at one point, inside the region the search
+    /// could not finish: the contact is proven exact by solve::classify_contact
+    /// (a regular root of the deflated system, checked at dyadic parameters in
+    /// homogeneous expansion arithmetic) and the only intersection in boxes
+    /// around every box the search left by solve::unique_touch_in (the normal
+    /// offset from one to the other strictly convex there).
+    bool curved_touch(int x, int y, const solve::SsiResult& res, const std::string& where) {
+        if (is_planar[static_cast<std::size_t>(x)] || is_planar[static_cast<std::size_t>(y)]) return false;
+        const Box4& H = res.unverified_hull;
+        for (const Interval& h : H)
+            if (!(h.hi - h.lo < 1e-3)) return false; // a small region only
+        const PolyPatchD& A = im.carriers[static_cast<std::size_t>(x)];
+        const PolyPatchD& B = im.carriers[static_cast<std::size_t>(y)];
+        const solve::ContactResult r = solve::classify_contact(A, B, {num::mid(H[0]), num::mid(H[1]), num::mid(H[2]), num::mid(H[3]), 0.0});
+        if (r.kind != solve::ContactKind::Touch) {
+            note(where + ": the contact of the two surfaces there is classified as " + solve::to_string(r.kind) +
+                 (r.why.empty() ? std::string() : " (" + r.why + ")"));
+            return false;
+        }
+        auto widen = [](const Interval& h) {
+            const double m = std::max(h.hi - h.lo, std::ldexp(1.0, -20));
+            return Interval(h.lo - m, h.hi + m);
+        };
+        std::string why;
+        if (!solve::unique_touch_in(A, B, r.point, widen(H[0]), widen(H[1]), widen(H[2]), widen(H[3]), why)) {
+            note(where + ": an exact contact of the two surfaces, but not proven the only intersection there: " + why);
+            return false;
+        }
+        const auto h = icarrier[static_cast<std::size_t>(x)].eval(Interval(r.point[0]), Interval(r.point[1]));
+        point_touches.push_back({x, y, r.point[0], r.point[1], {h.x / h.w, h.y / h.w, h.z / h.w}, true, r.point[2], r.point[3]});
+        ++im.stats.point_contacts;
+        note(where + ": surfaces " + str(x) + " and " + str(y) + " touch at one point, at parameters (" + std::to_string(r.point[0]) + ", " +
+             std::to_string(r.point[1]) + ") and (" + std::to_string(r.point[2]) + ", " + std::to_string(r.point[3]) +
+             "), proven exactly, and nowhere else in the region left");
         return true;
     }
 
@@ -4948,12 +4990,12 @@ private:
                     if (R2.solid == R1.solid) continue;
                     const int gb = gid(R2.solid, S(R2.solid).faces[static_cast<std::size_t>(R2.face)].carrier);
                     if (!equiv(gb, t.b)) continue;
-                    Interval pu, pv;
-                    if (!plane_params(im.carriers[static_cast<std::size_t>(gb)], t.P, pu, pv))
+                    Interval pu(t.s), pv(t.t);
+                    if (!t.b_curved && !plane_params(im.carriers[static_cast<std::size_t>(gb)], t.P, pu, pv))
                         return fail("a point where a curved face touches a plane could not be placed in the plane's face");
                     const Where w2 = locate(R2.geom, pu, pv, opt.refine_depth);
                     if (w2 == Where::Outside) continue;
-                    if (w2 != Where::Inside) return fail("a curved face touches a plane at one point on the boundary of a flat face");
+                    if (w2 != Where::Inside) return fail("two faces touch at one point on the boundary of one of them");
                     im.point_touching_regions.push_back({r1, r2});
                 }
             }

@@ -80,13 +80,13 @@ namespace contact_detail {
 using Box5 = std::array<Interval, 5>;
 using Mat5 = std::array<std::array<double, 5>, 5>;
 
-/// Homogeneous derivative patches up to order 2, in intervals and doubles.
+/// Homogeneous derivative patches up to order 3, in intervals and doubles.
 struct Derivs {
     std::array<PolyPatchI, geom::kJetSize> hi;
     geom::BezierSurface d; // double evaluation
     explicit Derivs(const PolyPatchD& P) : d(P) {
         hi[0] = geom::to_interval(P);
-        for (int n = 1; n <= 2; ++n)
+        for (int n = 1; n <= 3; ++n)
             for (int l = 0; l <= n; ++l) {
                 const int k = n - l;
                 hi[static_cast<std::size_t>(geom::jet_index(k, l))] =
@@ -94,10 +94,10 @@ struct Derivs {
                           : hi[static_cast<std::size_t>(geom::jet_index(k, l - 1))].deriv_v();
             }
     }
-    /// Projected jet up to order 2 over the parameter box (order-3 entries unused).
+    /// Projected jet up to order 3 over the parameter box.
     std::array<Vec3<Interval>, geom::kJetSize> jet(const Interval& u, const Interval& v) const {
         std::array<Vec4<Interval>, geom::kJetSize> H{};
-        for (int e = 0; e < 6; ++e) H[static_cast<std::size_t>(e)] = hi[static_cast<std::size_t>(e)].eval(u, v);
+        for (int e = 0; e < geom::kJetSize; ++e) H[static_cast<std::size_t>(e)] = hi[static_cast<std::size_t>(e)].eval(u, v);
         return geom::seam_detail::project_jet(H);
     }
 };
@@ -397,6 +397,135 @@ inline ContactResult classify_contact(const PolyPatchD& A, const PolyPatchD& B, 
     out.kind = ContactKind::Undecided;
     out.why = "the gap between the facing points is not proven nonzero, and no exact contact was found";
     return out;
+}
+
+/// The pair touches only at `p` (exact parameters (u, v, s, t) of a contact,
+/// e.g. from classify_contact) within the parameter boxes U x V of A and
+/// S x T of B? Proven by the normal offset function. For (u, v) in U x V
+/// the equation A(u,v) + lambda N_A(u,v) = B(s,t) has exactly one solution
+/// (s, t, lambda) in a box Y containing S x T (a Krawczyk test with (u, v)
+/// as interval parameters), so every intersection point in the boxes has
+/// lambda(u, v) = 0. lambda vanishes at p with zero gradient (the tangent
+/// planes are parallel there), and its Hessian, by implicit differentiation
+/// enclosed over U x V x Y, is definite: lambda is strictly convex or concave
+/// on the convex box U x V, and p is its only zero. False, with the reason,
+/// if a step is not proven.
+inline bool unique_touch_in(const PolyPatchD& A, const PolyPatchD& B, const std::array<double, 4>& p, const Interval& U,
+                            const Interval& V, const Interval& S, const Interval& T, std::string& why) {
+    using namespace contact_detail;
+    if (!(num::contains(U, p[0]) && num::contains(V, p[1]) && num::contains(S, p[2]) && num::contains(T, p[3]))) {
+        why = "the contact is not inside the boxes";
+        return false;
+    }
+    const Derivs DA(A), DB(B);
+    const auto a = DA.jet(U, V); // A over the whole box
+    const Vec3<Interval> Au = J1(a, 1, 0), Av = J1(a, 0, 1), Auu = J1(a, 2, 0), Auv = J1(a, 1, 1), Avv = J1(a, 0, 2);
+    const Vec3<Interval> N = geom::cross(Au, Av);
+    const Vec3<Interval> Nu = geom::cross(Auu, Av) + geom::cross(Au, Auv);
+    const Vec3<Interval> Nv = geom::cross(Auv, Av) + geom::cross(Au, Avv);
+    // 3x3 interval inverse by the adjugate (columns c0, c1, c2).
+    auto inverse = [](const Vec3<Interval>& c0, const Vec3<Interval>& c1, const Vec3<Interval>& c2,
+                      std::array<std::array<Interval, 3>, 3>& inv) {
+        const Vec3<Interval> r0 = geom::cross(c1, c2), r1 = geom::cross(c2, c0), r2 = geom::cross(c0, c1);
+        const Interval det = geom::dot(c0, r0);
+        if (num::contains_zero(det)) return false;
+        const Vec3<Interval> rows[3] = {r0, r1, r2};
+        for (int i = 0; i < 3; ++i) inv[static_cast<std::size_t>(i)] = {rows[i].x / det, rows[i].y / det, rows[i].z / det};
+        return true;
+    };
+    auto apply = [](const std::array<std::array<Interval, 3>, 3>& M, const Vec3<Interval>& x) {
+        return std::array<Interval, 3>{M[0][0] * x.x + M[0][1] * x.y + M[0][2] * x.z, M[1][0] * x.x + M[1][1] * x.y + M[1][2] * x.z,
+                                       M[2][0] * x.x + M[2][1] * x.y + M[2][2] * x.z};
+    };
+    // 1. Parametric Krawczyk on G(y; u, v) = A(u,v) + lambda N_A(u,v) - B(s,t),
+    //    y = (s, t, lambda), centred at the contact (lambda = 0), over a box Y
+    //    that contains S x T, inflated until the test passes.
+    const double yc[3] = {p[2], p[3], 0.0};
+    double rad[3] = {std::max(p[2] - S.lo, S.hi - p[2]), std::max(p[3] - T.lo, T.hi - p[3]), std::max(U.hi - U.lo, V.hi - V.lo)};
+    // A midpoint-free inverse: the Jacobian at the contact, in doubles.
+    std::array<std::array<double, 3>, 3> Yd{};
+    {
+        const auto ad = jet_d(DA.d, p[0], p[1]), bd = jet_d(DB.d, p[2], p[3]);
+        const geom::Vec3d n = geom::cross(ad[1], ad[2]);
+        const geom::Vec3d c0 = -bd[1], c1 = -bd[2], c2 = n;
+        const geom::Vec3d r0 = geom::cross(c1, c2), r1 = geom::cross(c2, c0), r2 = geom::cross(c0, c1);
+        const double det = geom::dot(c0, r0);
+        if (!(std::fabs(det) > 0.0)) {
+            why = "the normal lines of A are tangent to B at the contact";
+            return false;
+        }
+        const geom::Vec3d rows[3] = {r0, r1, r2};
+        for (int i = 0; i < 3; ++i) Yd[static_cast<std::size_t>(i)] = {rows[i].x / det, rows[i].y / det, rows[i].z / det};
+    }
+    std::array<Interval, 3> Y{};
+    bool proven = false;
+    for (int it = 0; it < 12 && !proven; ++it) {
+        for (int i = 0; i < 3; ++i) Y[static_cast<std::size_t>(i)] = Interval(yc[i] - rad[i], yc[i] + rad[i]);
+        const auto b = DB.jet(Y[0], Y[1]);
+        // G at the centre y = yc, for all (u, v): A(U, V) - B(s*, t*).
+        const auto bc = DB.jet(Interval(p[2]), Interval(p[3]));
+        const Vec3<Interval> G0 = a[0] - bc[0];
+        // Jacobian in y over the box: [-B_s, -B_t, N].
+        const Vec3<Interval> c0 = -J1(b, 1, 0), c1 = -J1(b, 0, 1);
+        bool inside = true;
+        double grow[3] = {0, 0, 0};
+        for (int i = 0; i < 3; ++i) {
+            Interval k = Interval(yc[i]);
+            k = k - (Interval(Yd[static_cast<std::size_t>(i)][0]) * G0.x + Interval(Yd[static_cast<std::size_t>(i)][1]) * G0.y +
+                     Interval(Yd[static_cast<std::size_t>(i)][2]) * G0.z);
+            const Vec3<Interval> cols[3] = {c0, c1, N};
+            for (int j = 0; j < 3; ++j) {
+                Interval m = Interval(i == j ? 1.0 : 0.0);
+                m = m - (Interval(Yd[static_cast<std::size_t>(i)][0]) * cols[j].x + Interval(Yd[static_cast<std::size_t>(i)][1]) * cols[j].y +
+                         Interval(Yd[static_cast<std::size_t>(i)][2]) * cols[j].z);
+                k = k + m * (Y[static_cast<std::size_t>(j)] - Interval(yc[j]));
+            }
+            inside = inside && num::strictly_inside(k, Y[static_cast<std::size_t>(i)]);
+            grow[i] = std::max(yc[i] - k.lo, k.hi - yc[i]);
+        }
+        if (inside) proven = true;
+        else
+            for (int i = 0; i < 3; ++i) rad[i] = std::max(rad[i], 2.0 * grow[i]);
+    }
+    if (!proven) {
+        why = "the normal lines of A could not be proven to meet B once each in a box";
+        return false;
+    }
+    // 2. Derivatives of y = (s, t, lambda) in (u, v), over U x V x Y.
+    const auto b = DB.jet(Y[0], Y[1]);
+    const Interval lam = Y[2];
+    const Vec3<Interval> Bs = J1(b, 1, 0), Bt = J1(b, 0, 1), Bss = J1(b, 2, 0), Bst = J1(b, 1, 1), Btt = J1(b, 0, 2);
+    std::array<std::array<Interval, 3>, 3> Gi;
+    if (!inverse(-Bs, -Bt, N, Gi)) {
+        why = "the normal lines of A are not proven transversal to B over the box";
+        return false;
+    }
+    const Vec3<Interval> Gx[2] = {Au + Nu * lam, Av + Nv * lam};
+    std::array<Interval, 3> yx[2];
+    for (int i = 0; i < 2; ++i) {
+        const auto r = apply(Gi, Gx[i]);
+        yx[i] = {-r[0], -r[1], -r[2]};
+    }
+    const Vec3<Interval> Auuu = J1(a, 3, 0), Auuv = J1(a, 2, 1), Auvv = J1(a, 1, 2), Avvv = J1(a, 0, 3);
+    const Vec3<Interval> Nuu = geom::cross(Auuu, Av) + geom::cross(Auu, Auv) * Interval(2.0) + geom::cross(Au, Auuv);
+    const Vec3<Interval> Nuv = geom::cross(Auuv, Av) + geom::cross(Auu, Avv) + geom::cross(Au, Auvv);
+    const Vec3<Interval> Nvv = geom::cross(Auvv, Av) + geom::cross(Auv, Avv) * Interval(2.0) + geom::cross(Au, Avvv);
+    const Vec3<Interval> A2[2][2] = {{Auu, Auv}, {Auv, Avv}}, N1[2] = {Nu, Nv}, N2[2][2] = {{Nuu, Nuv}, {Nuv, Nvv}};
+    Interval H[2][2];
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 2; ++j) {
+            const Interval si = yx[i][0], ti = yx[i][1], li = yx[i][2], sj = yx[j][0], tj = yx[j][1], lj = yx[j][2];
+            const Vec3<Interval> r = A2[i][j] + N2[i][j] * lam + N1[i] * lj + N1[j] * li -
+                                     (Bss * (si * sj) + Bst * (si * tj + sj * ti) + Btt * (ti * tj));
+            const auto y2 = apply(Gi, r);
+            H[i][j] = -y2[2];
+        }
+    const Interval det = H[0][0] * H[1][1] - H[0][1] * H[1][0];
+    if (!(det.lo > 0.0 && (H[0][0].lo > 0.0 || H[0][0].hi < 0.0))) {
+        why = "the offset between the surfaces is not proven strictly convex over the box";
+        return false;
+    }
+    return true;
 }
 
 } // namespace ak::solve

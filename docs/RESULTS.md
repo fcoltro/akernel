@@ -868,6 +868,15 @@ Since the search proved everything outside those boxes, the pair meets in the cu
 
 The curated case of §3 ("not in general position") is now solved: a box whose bottom z = 1.3 touches the top of the hill z = 1 + 1.2·B₁(u)B₁(v) at its apex (u, v) = (1/2, 1/2), where the top's height 1 + (2.2 − 1)/4 is the double 1.3 exactly. The intersection is empty, the union is both solids touching at the apex (3.933333333333 = 2.8 + 1.133333333333, two components, one point contact, not manifold), and the difference is the hill (1.133333333333 = 1 + 1.2/9), all to 1e-12 (`tests/op/boolean_test.cpp`). The same box moved so that the apex lies on an edge of its bottom face is still refused. With the point-contact proof disabled, the case is refused as before and 2 checks fail.
 
+**Two curved faces touching at one point.** Two curved patches have no single polynomial whose zeros are their intersection, so the proof goes through the normal offset from one to the other (`curved_touch`, `op/boolean.hpp`; `unique_touch_in`, `solve/contact_point.hpp`):
+- the contact is proven exact by `classify_contact` (a regular root of the deflated system, an exact dyadic candidate in homogeneous expansion arithmetic);
+- for every (u, v) in a box U around the region the search left, the normal line A(u,v) + λ N_A(u,v) meets B exactly once in a box Y that contains the B-parameters of that region (a Krawczyk test with (u, v) as interval parameters), so every intersection point there has λ(u, v) = 0;
+- λ vanishes at the contact with zero gradient (the tangent planes are parallel), and its Hessian, by implicit differentiation with third derivatives of A and second derivatives of B enclosed over U × Y, is definite: λ is strictly convex or concave on U, and the contact is its only zero.
+
+The case of `tests/op/boolean_test.cpp`: a hill whose top rises to 1.25 at (0.5, 0.5) (bump 1/4) and a block over [−0.5, 1.5]² up to z = 2 whose bottom dips from 1.5 down to 1.25 there. The contact is proven at the parameters (1/2, 1/2) on both faces. The intersection is empty, the union 3.555555555556 = (1 + (1/4)(4/9)) + (2 + 4 (1/4)(4/9)), one point contact, not manifold, and its mesh is closed; the difference is the hill, all to 1e-12. With the convexity proof disabled, the case is refused and 2 checks fail.
+
+Not covered yet: a contact on a face's boundary (it would need a vertex there), and two surfaces that come within rounding of each other without touching (a near miss: the classifier calls it "separated", but the Boolean does not yet use that).
+
 ### A compiler fault
 
 While building the quadric tests, `on_quadric` reported that an exact quarter cylinder was not on its cylinder, but only in the `/O2 /fp:strict` build of the test program. With `/Od`, `/O1`, `/Og`, `/fp:precise`, or with inlining off (`/Ob0`), the result was right, and so it was in smaller programs with the same headers and flags. The investigation:
@@ -1109,7 +1118,7 @@ Phase 1 of the survey's roadmap (v0.17) changes no result. The outward rounding 
 
 The Release suite takes 110 s (151 s before; `identity_test` 64 s against 98 s), and the Debug suite 782 s (916 s). The full benchmark took 484 s with exact points and 465 s without; the earlier runs ran beside the Debug suite, so those totals are not compared. All 21 test programs pass in Release and in Debug.
 
-Point contacts in the Booleans (§3, "Tangent points, certified"): both benchmark runs, with exact points on and off, reproduce every hash above bit for bit. The new proof runs only where the surface/surface search has already failed, and no Boolean of the benchmark has a point contact. All 22 test programs pass in Release and in Debug (that run's timings, 189 s and 1,123 s, came from a busier machine: `identity_test` took 114 s in Release against 64 s before on unchanged code).
+Point contacts in the Booleans (§3, "Tangent points, certified"), a curved face against a plane and then two curved faces: both benchmark runs, after each step,, with exact points on and off, reproduce every hash above bit for bit. The new proofs run only where the surface/surface search has already failed, and no Boolean of the benchmark has a point contact; the five refusals left in the curved chains are the same. All 22 test programs pass in Release and in Debug (that run's timings, 189 s and 1,123 s, came from a busier machine: `identity_test` took 114 s in Release against 64 s before on unchanged code).
 
 Timings of the tangency-along-a-ruling round are not comparable with the earlier ones. The full benchmark took 503 s in one run and 679 s in another (925 s before), both with the Debug test suite running beside it; sections whose code and results are unchanged ran in about half their earlier time in the first of those runs (a random-box chain step at depth 6: 204 ms against 362 ms), so the difference is the state of the machine, not the code.
 
