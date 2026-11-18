@@ -173,6 +173,7 @@ struct ImprintStats {
     int edge_touches = 0;            ///< edges in a plane touching a curved surface at one point, meeting it there
     int tiny_loops = 0;              ///< pairs whose small closed loops were found by a search over the region left
     int graph_arcs = 0;              ///< arcs along a side in a plane, met with a graph surface by one exact polynomial
+    int graph_touches = 0;           ///< graph pairs whose crossing curve touches their shared line from outside, decided exactly
     int ssi_pairs_empty = 0;          ///< intersected surface pairs that gave no curve
     double ssi_ms_empty = 0.0, ssi_ms_curves = 0.0; ///< time in surface pairs without and with curves
     std::size_t ssi_nodes_empty = 0, ssi_nodes_curves = 0; ///< completeness-pass nodes, likewise
@@ -2483,6 +2484,123 @@ private:
         return false;
     }
 
+    /// A point where the crossing curve k = 0 touches a shared side from
+    /// outside A's square: side `side`, side parameter t (dyadic), and s the
+    /// sign of k at the points of the square near it.
+    struct SideTouch {
+        int side = 0;
+        double t = 0.0;
+        int s = 0;
+    };
+    /// k restricted to the box [u0, u1] x [v0, v1] (dyadic ends), exactly:
+    /// each coefficient is a blossom at the ends.
+    static ExactBernstein restrict_dyadic(const ExactBernstein& f, double u0, double u1, double v0, double v1) {
+        using E = num::Expansion;
+        auto line = [](const std::vector<E>& c, double a, double b) {
+            const int n = static_cast<int>(c.size()) - 1;
+            std::vector<E> out(c.size());
+            for (int r = 0; r <= n; ++r) {
+                std::vector<E> pts = c;
+                for (int step = 1; step <= n; ++step) {
+                    const double x = step <= r ? b : a;
+                    const E ex(x), ex1 = E(1.0) - E(x);
+                    for (int i = 0; i + step <= n; ++i)
+                        pts[static_cast<std::size_t>(i)] = ex1 * pts[static_cast<std::size_t>(i)] + ex * pts[static_cast<std::size_t>(i + 1)];
+                }
+                out[static_cast<std::size_t>(r)] = pts[0];
+            }
+            return out;
+        };
+        ExactBernstein r = f;
+        for (int j = 0; j <= f.q; ++j) {
+            std::vector<E> row;
+            for (int i = 0; i <= f.p; ++i) row.push_back(r.at(i, j));
+            row = line(row, u0, u1);
+            for (int i = 0; i <= f.p; ++i) r.at(i, j) = row[static_cast<std::size_t>(i)];
+        }
+        for (int i = 0; i <= f.p; ++i) {
+            std::vector<E> col;
+            for (int j = 0; j <= f.q; ++j) col.push_back(r.at(i, j));
+            col = line(col, v0, v1);
+            for (int j = 0; j <= f.q; ++j) r.at(i, j) = col[static_cast<std::size_t>(j)];
+        }
+        return r;
+    }
+    /// The quadratic c (k along shared side `sd`) has an exact double root:
+    /// does the curve k = 0 stay outside the square there? Near the root t0,
+    /// k = k_tt (t - t0)^2 / 2 + k_n n + ..., n the distance into the square,
+    /// so the curve n = -k_tt (t - t0)^2 / (2 k_n) is outside iff k_tt and
+    /// the inward derivative k_n have one sign (both exact; t0 must be dyadic
+    /// and inside the side).
+    static bool touch_from_outside(const ExactBernstein& k, int sd, const num::Expansion c[3], SideTouch& st) {
+        using E = num::Expansion;
+        const E num_ = c[0] - c[1], den = c[0] - E(2.0) * c[1] + c[2];
+        if (den.sign() == 0) return false;
+        const double t = num_.estimate() / den.estimate();
+        if (!(t > 0.0 && t < 1.0) || (E(t) * den - num_).sign() != 0) return false;
+        const bool along_u = sd == 0 || sd == 2;
+        if ((along_u ? k.q : k.p) < 1) return false;
+        // Inward differences across the side, along it.
+        const int n = along_u ? k.p : k.q;
+        std::vector<E> d(static_cast<std::size_t>(n + 1));
+        for (int i = 0; i <= n; ++i)
+            d[static_cast<std::size_t>(i)] = sd == 0 ? k.at(i, 1) - k.at(i, 0)
+                                             : sd == 2 ? k.at(i, k.q - 1) - k.at(i, k.q)
+                                             : sd == 3 ? k.at(1, i) - k.at(0, i)
+                                                       : k.at(k.p - 1, i) - k.at(k.p, i);
+        const E et(t), et1 = E(1.0) - E(t);
+        for (int r = 1; r <= n; ++r)
+            for (int i = 0; i + r <= n; ++i) d[static_cast<std::size_t>(i)] = et1 * d[static_cast<std::size_t>(i)] + et * d[static_cast<std::size_t>(i + 1)];
+        const int sn = d[0].sign();
+        if (sn == 0 || sn != den.sign()) return false;
+        st = {sd, t, sn};
+        return true;
+    }
+    /// Is k proven to have the touch's sign everywhere in a small box at the
+    /// touch point, except at the point, with the hull of the boxes the search
+    /// left (A's parameters 0 and 1) inside that box? The box reaches 2^-m
+    /// along the side each way and 2^-m into the square; on each half (split
+    /// at the point) the exact Bernstein coefficients, indexed from the point
+    /// (i along the side, j inward), must be: zero at the point, of the sign
+    /// s elsewhere or zero along the side, and nonzero at the half's far end
+    /// on the side and at every j >= 1. Every point of the half but the touch
+    /// point then has a basis function of nonzero coefficient that is positive.
+    static bool touch_region_free(const ExactBernstein& k, const SideTouch& st, const Box4& H) {
+        const bool along_u = st.side == 0 || st.side == 2;
+        const Interval& ht = along_u ? H[0] : H[1];
+        const Interval& hn = along_u ? H[1] : H[0];
+        const bool high = st.side == 1 || st.side == 2; // the side at parameter 1
+        for (int m = 50; m >= 1; --m) {
+            const double dl = std::ldexp(1.0, -m);
+            const double t0 = std::max(0.0, st.t - dl), t1 = std::min(1.0, st.t + dl);
+            const double n0 = high ? 1.0 - dl : 0.0, n1 = high ? 1.0 : dl;
+            if (!(t0 <= ht.lo && ht.hi <= t1 && n0 <= hn.lo && hn.hi <= n1)) continue;
+            for (int half = 0; half < 2; ++half) {
+                const double a = half == 0 ? t0 : st.t, b = half == 0 ? st.t : t1;
+                if (!(a < b)) continue;
+                const ExactBernstein R = along_u ? restrict_dyadic(k, a, b, n0, n1) : restrict_dyadic(k, n0, n1, a, b);
+                const int nt = along_u ? R.p : R.q, nn = along_u ? R.q : R.p;
+                auto at = [&](int i, int j) -> const num::Expansion& {
+                    const int ii = half == 1 ? i : nt - i; // from the point along the side
+                    const int jj = high ? nn - j : j;      // into the square
+                    return along_u ? R.at(ii, jj) : R.at(jj, ii);
+                };
+                for (int i = 0; i <= nt; ++i)
+                    for (int j = 0; j <= nn; ++j) {
+                        const int sg = at(i, j).sign() * st.s;
+                        if (i == 0 && j == 0) {
+                            if (sg != 0) return false;
+                            continue;
+                        }
+                        if (sg < 0) return false;
+                        if (sg == 0 && (j >= 1 || i == nt)) return false;
+                    }
+            }
+            return true;
+        }
+        return false;
+    }
+
     /// The pair (x, y) as two graphs crossing where they share boundary
     /// lines. On success `res` holds the crossing curves, proven complete,
     /// `sys` is their system (A against C), and vertices where the curves
@@ -2534,6 +2652,10 @@ private:
         // that is not zero but tiny against its terms (relative 2^-40) is the
         // same picture blurred by rounding of the data (two crossings, or none,
         // closer to each other than any enclosure can separate); both refused.
+        // An exact double root where the curve stays outside the square is
+        // decided (touch_from_outside); one where it touches from inside is
+        // refused.
+        std::vector<SideTouch> side_touches;
         for (int sd = 0; sd < 4; ++sd) {
             if (!(mask >> sd & 1)) continue;
             const bool along_u = sd == 0 || sd == 2;
@@ -2549,9 +2671,21 @@ private:
             const Interval dm = enclose(disc), sz = enclose(c[1] * c[1]) + num::abs(enclose(c[0] * c[2]));
             const int ds = disc.sign();
             if (ds != 0 && !(num::abs(dm).hi <= std::ldexp(sz.lo, -40))) continue;
+            // An exact double root where the curve stays outside the square:
+            // it touches the shared line at one point and never enters, so
+            // there is nothing to find there (proven below, with the search).
+            if (ds == 0) {
+                SideTouch st;
+                if (touch_from_outside(k, sd, c, st)) {
+                    side_touches.push_back(st);
+                    note(where + ": the crossing curve touches the shared line at side parameter " + std::to_string(st.t) + " of side " +
+                         str(sd) + " from outside the square (exact double root; it does not enter)");
+                    continue;
+                }
+            }
             graph_crossing_refusal =
-                ds == 0 ? "the two tops cross along a curve that touches the boundary line they share (tangent to it at a point where both "
-                          "have the same slope; not in general position)"
+                ds == 0 ? "the two tops cross along a curve that touches the boundary line they share from inside (tangent to it at a point "
+                          "where both have the same slope; not in general position)"
                 : ds > 0 ? "the two tops cross along a curve that meets the boundary line they share twice, closer together than the data's "
                            "rounding can separate (a touch blurred by rounding; not in general position)"
                          : "the two tops cross along a curve that passes the boundary line they share closer than the data's rounding can "
@@ -2591,12 +2725,29 @@ private:
                 }
                 note(s2);
             }
+            // The search cannot settle the boxes at a point where the curve
+            // touches a shared side from outside (A and C meet there, on the
+            // border). If those boxes lie in a small box at the point, on which
+            // k is proven nonzero except at the point itself, nothing is lost.
+            if (!out.complete)
+                for (const SideTouch& st : side_touches)
+                    if (touch_region_free(k, st, out.unverified_hull)) {
+                        note(where + ": the boxes the search left lie at the touch point, where k is proven nonzero except at the point (exact)");
+                        ++im.stats.graph_touches;
+                        out.complete = true;
+                        break;
+                    }
             if (!out.complete) return false;
             for (const SsiCurve& c : out.curves)
                 if (c.end_front == solve::EndKind::Singular || c.end_back == solve::EndKind::Singular) return false;
             // Where the curve meets a shared side: k restricted to that side.
             for (int sd = 0; sd < 4; ++sd) {
                 if (!(mask >> sd & 1)) continue;
+                // A side the curve only touches from outside: k there is a
+                // quadratic with that double root, and no other.
+                bool touched = false;
+                for (const SideTouch& st : side_touches) touched = touched || st.side == sd;
+                if (touched) continue;
                 std::vector<Interval> c;
                 const bool along_u = sd == 0 || sd == 2;
                 const int n = along_u ? k.p : k.q;

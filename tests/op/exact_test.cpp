@@ -474,13 +474,56 @@ int main() {
         // with slope 6.4 x'(1-x') / ... equal at x = 0.75 (the middle of both)
         // and nowhere else: their difference has a double root there, and the
         // crossing curve touches the shared line instead of leaving through
-        // it. Dyadic data, so decided exactly and refused with that reason.
+        // it. Dyadic data, so decided exactly. Near the line, with eta = y -
+        // 0.5, k = 8 (a(1-a) - c(1-c)) + 8 eta (1/0.75 - 1/0.5) / 4 at the
+        // middle: k_tt < 0 and k_eta < 0, so the curve eta = -k_tt (x -
+        // 0.75)^2 / (2 k_eta) < 0 lies outside the square, and A's top is
+        // below B's everywhere: A lies in B (touch_from_outside, with the
+        // boxes the search leaves at the point covered by an exact proof).
         const Brep A = op::to_brep(op::make_bump_box({0.5, 0.5, -0.25}, 0.5, 0.5, 0.75, 0.25));
         const Brep B = op::to_brep(op::make_bump_box({0.25, 0.5, -0.25}, 1.0, 0.75, 0.75, 0.375));
-        const op::Imprint im = op::imprint(A, B);
-        AK_CHECK(!im.ok);
-        AK_CHECK(im.error.find("touches the boundary line they share") != std::string::npos);
-        std::printf("crossing curve tangent to the shared line: %s\n", im.ok ? "solved (unexpected)" : im.error.c_str());
+        op::Imprint im;
+        double v[3];
+        if (consistent("crossing curve touching the shared line from outside", A, B, im, v)) {
+            AK_CHECK(im.stats.graph_touches > 0);
+            const double va = 0.5 * 0.5 * 0.75 + 0.25 * 16.0 / 36.0 * 0.25, vb = 1.0 * 0.75 * 0.75 + 0.375 * 16.0 / 36.0 * 0.75;
+            AK_CHECK_NEAR(v[0], va, 1e-12);
+            AK_CHECK_NEAR(v[1], vb, 1e-12);
+            AK_CHECK_NEAR(v[2], 0.0, 1e-12);
+            // B - A: A's top is the ceiling of a pocket, meeting B's top along
+            // the shared line, at a zero angle at (0.75, 0.5, 0.5); still two
+            // faces at every edge.
+            const op::Imprint im2 = op::imprint(B, A);
+            AK_CHECK(im2.ok);
+            const op::BooleanResult d = op::select(im2, Op::Difference);
+            AK_CHECK(d.ok && d.manifold);
+            if (d.ok) {
+                AK_CHECK_NEAR(op::volume(d.solid), vb - va, 1e-12);
+                const op::TessResult t = op::tessellate(d.solid);
+                AK_CHECK(t.ok && op::audit(t.mesh).watertight());
+            }
+        }
+        // The same tangency with A twice as long in y (bump 0.5 keeps the
+        // slopes equal): k_eta > 0, the curve enters the square and touches
+        // the line from inside. Refused with that reason.
+        {
+            const Brep A2 = op::to_brep(op::make_bump_box({0.5, 0.5, -0.25}, 0.5, 1.0, 0.75, 0.5));
+            const op::Imprint im2 = op::imprint(A2, B);
+            AK_CHECK(!im2.ok);
+            AK_CHECK(im2.error.find("touches the boundary line they share from inside") != std::string::npos);
+        }
+        // Bumps 0.2 and 0.3 (chain 7 of the benchmark): the same picture, but
+        // the data are rounded, and exactly the curve meets the line twice
+        // about 1e-8 apart and dips into the square by about 1e-16 between:
+        // a face no double geometry can carry. Refused with that reason.
+        {
+            const Brep A3 = op::to_brep(op::make_bump_box({0.5, 0.5, -0.25}, 0.5, 0.5, 0.75, 0.2));
+            const Brep B3 = op::to_brep(op::make_bump_box({0.25, 0.5, -0.25}, 1.0, 0.75, 0.75, 0.3));
+            const op::Imprint im3 = op::imprint(A3, B3);
+            AK_CHECK(!im3.ok);
+            AK_CHECK(im3.error.find("closer together than the data's rounding can separate") != std::string::npos);
+            std::printf("crossing curve near-tangent to the shared line: %s\n", im3.ok ? "solved (unexpected)" : im3.error.c_str());
+        }
     }
     return akt::finish("exact_test");
 }
