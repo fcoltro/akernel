@@ -172,6 +172,7 @@ struct ImprintStats {
     int near_misses = 0;             ///< pairs whose facing points are proven apart, with nothing between them in the region the search left
     int edge_touches = 0;            ///< edges in a plane touching a curved surface at one point, meeting it there
     int tiny_loops = 0;              ///< pairs whose small closed loops were found by a search over the region left
+    int graph_arcs = 0;              ///< arcs along a side in a plane, met with a graph surface by one exact polynomial
     int ssi_pairs_empty = 0;          ///< intersected surface pairs that gave no curve
     double ssi_ms_empty = 0.0, ssi_ms_curves = 0.0; ///< time in surface pairs without and with curves
     std::size_t ssi_nodes_empty = 0, ssi_nodes_curves = 0; ///< completeness-pass nodes, likewise
@@ -2329,6 +2330,159 @@ private:
         return roots_1d(left, lo, m, depth - 1, out) && roots_1d(right, m, hi, depth - 1, out);
     }
 
+    /// Points where an arc meets a graph surface, from one exact polynomial.
+    ///
+    /// The arc runs along side `sd` of one of its surfaces (ga), and that side
+    /// lies exactly in the other, a plane (gb). The side is a rational curve
+    /// (X, Y, Z, W)(tau) with double control points and positive weights. The
+    /// surface g is a graph: x = x0 + x1 u, y = y0 + y1 v exactly, z = f(u, v)
+    /// polynomial. With u = (X - x0 W) / (x1 W), and so on, a point of the
+    /// side lies on g exactly where
+    ///     G(tau) = x1^p y1^q Z W^(p+q-1) - sum f_ij C(p,i) C(q,j) Ua^i Ub^(p-i) Va^j Vb^(q-j) = 0,
+    /// Ua = X - x0 W, Ub = (x0 + x1) W - X, Va and Vb likewise: a polynomial
+    /// with expansion coefficients, of degree n (p + q). Its roots are
+    /// isolated by Bernstein subdivision, each proven unique. Two crossings
+    /// close together (an arc passing just over a hill top) are as easy as
+    /// any: one variable, and coefficients exact to the last bit. The search
+    /// in six unknowns cannot separate them when the surfaces meet at a small
+    /// angle.
+    ///
+    /// The arc is that side between its end vertices (their parameters on ga
+    /// lie on the side), and a point of the side between them lies on the
+    /// arc's certified curve (one solution per slice). Roots that cannot be
+    /// separated from an end of the arc, or from the border of g's square,
+    /// are left to the search: false.
+    bool graph_arc_roots(int k, const BEdge& edge, int g0, int g1, int g, TsiResult& out, const std::string& where) {
+        using E = num::Expansion;
+        using Poly = std::vector<E>; // sum a_i tau^i (1 - tau)^(n - i)
+        const PolyPatchD& Gs = im.carriers[static_cast<std::size_t>(g)];
+        double ax[2], ay[2];
+        if (!graph_axes(Gs, ax, ay)) return false;
+        auto binom = [](int n, int r) {
+            double b = 1.0;
+            for (int i = 1; i <= r; ++i) b = b * (n - r + i) / i;
+            return b;
+        };
+        auto mul = [](const Poly& a, const Poly& b) {
+            Poly c(a.size() + b.size() - 1);
+            for (std::size_t i = 0; i < a.size(); ++i)
+                for (std::size_t j = 0; j < b.size(); ++j) c[i + j] = c[i + j] + a[i] * b[j];
+            return c;
+        };
+        const int v0 = vmap[k][static_cast<std::size_t>(edge.v0)], v1 = vmap[k][static_cast<std::size_t>(edge.v1)];
+        for (int which = 0; which < 2; ++which) {
+            const int ga = which == 0 ? g0 : g1, gb = which == 0 ? g1 : g0;
+            const PolyPatchD& A = im.carriers[static_cast<std::size_t>(ga)];
+            const PolyPatchD& B = im.carriers[static_cast<std::size_t>(gb)];
+            if (!is_planar[static_cast<std::size_t>(gb)] || !planar_affine(B)) continue;
+            for (int sd = 0; sd < 4; ++sd) {
+                if (!side_in_plane(A, sd, B)) continue; // also: positive weights
+                const Chart* c0 = chart(v0, ga);
+                const Chart* c1 = chart(v1, ga);
+                Interval ta, tb;
+                if (!c0 || !c1 || on_side(*c0, sd, ta) != Tri::Yes || on_side(*c1, sd, tb) != Tri::Yes) continue;
+                if (tb.hi < ta.lo) std::swap(ta, tb);
+                if (!(ta.hi < tb.lo)) continue;
+                // Charts of a point of the side on (g0, g1); the point in space.
+                auto charts_at = [&](const Interval& tau, Box4& P, Vec3<Interval>& X) {
+                    Interval su, sv;
+                    side_uv(sd, tau, su, sv);
+                    const auto h = icarrier[static_cast<std::size_t>(ga)].eval(su, sv);
+                    X = {h.x / h.w, h.y / h.w, h.z / h.w};
+                    Interval pu, pv;
+                    if (!plane_params(B, X, pu, pv)) return false;
+                    P = which == 0 ? Box4{su, sv, pu, pv} : Box4{pu, pv, su, sv};
+                    return true;
+                };
+                {
+                    Box4 Pm;
+                    Vec3<Interval> Xm;
+                    bool on = false;
+                    CurvePos pos;
+                    if (!charts_at(Interval(0.5 * (num::mid(ta) + num::mid(tb))), Pm, Xm) ||
+                        !locate_on_curve(*edge.geom->base, Pm, on, pos) || !on || in_arc(*edge.geom, pos) != Tri::Yes)
+                        continue;
+                }
+                // The polynomial.
+                const std::vector<Vec4d> cp = side_control(A, sd);
+                const int n = static_cast<int>(cp.size()) - 1;
+                Poly X(cp.size()), Y(cp.size()), Z(cp.size()), W(cp.size());
+                for (int i = 0; i <= n; ++i) {
+                    const E b(binom(n, i));
+                    const Vec4d& c = cp[static_cast<std::size_t>(i)];
+                    X[static_cast<std::size_t>(i)] = E(c.x) * b;
+                    Y[static_cast<std::size_t>(i)] = E(c.y) * b;
+                    Z[static_cast<std::size_t>(i)] = E(c.z) * b;
+                    W[static_cast<std::size_t>(i)] = E(c.w) * b;
+                }
+                const E x0(ax[0]), xe = E(ax[0]) + E(ax[1]), y0(ay[0]), ye = E(ay[0]) + E(ay[1]);
+                Poly Ua(cp.size()), Ub(cp.size()), Va(cp.size()), Vb(cp.size());
+                for (std::size_t i = 0; i < cp.size(); ++i) {
+                    Ua[i] = X[i] - x0 * W[i];
+                    Ub[i] = xe * W[i] - X[i];
+                    Va[i] = Y[i] - y0 * W[i];
+                    Vb[i] = ye * W[i] - Y[i];
+                }
+                const int p = Gs.p, q = Gs.q;
+                auto powers = [&](const Poly& a, int m) {
+                    std::vector<Poly> r(static_cast<std::size_t>(m + 1));
+                    r[0] = Poly{E(1.0)};
+                    for (int i = 1; i <= m; ++i) r[static_cast<std::size_t>(i)] = mul(r[static_cast<std::size_t>(i - 1)], a);
+                    return r;
+                };
+                const auto pUa = powers(Ua, p), pUb = powers(Ub, p), pVa = powers(Va, q), pVb = powers(Vb, q);
+                const int N = n * (p + q);
+                Poly G = Z;
+                for (int r = 0; r + 1 < p + q; ++r) G = mul(G, W);
+                E s(1.0);
+                for (int r = 0; r < p; ++r) s = s * E(ax[1]);
+                for (int r = 0; r < q; ++r) s = s * E(ay[1]);
+                for (E& c : G) c = s * c;
+                for (int i = 0; i <= p; ++i)
+                    for (int j = 0; j <= q; ++j) {
+                        const Poly t = mul(mul(pUa[static_cast<std::size_t>(i)], pUb[static_cast<std::size_t>(p - i)]),
+                                           mul(pVa[static_cast<std::size_t>(j)], pVb[static_cast<std::size_t>(q - j)]));
+                        const E f = E(Gs.at(i, j).z) * E(binom(p, i) * binom(q, j));
+                        for (int r = 0; r <= N; ++r) G[static_cast<std::size_t>(r)] = G[static_cast<std::size_t>(r)] - f * t[static_cast<std::size_t>(r)];
+                    }
+                bool zero = true;
+                std::vector<Interval> c(static_cast<std::size_t>(N + 1));
+                for (int r = 0; r <= N; ++r) {
+                    zero = zero && G[static_cast<std::size_t>(r)].sign() == 0;
+                    c[static_cast<std::size_t>(r)] = enclose(G[static_cast<std::size_t>(r)]) / Interval(binom(N, r));
+                }
+                if (zero) return false; // the side lies in g
+                std::vector<Interval> roots;
+                if (!roots_1d(c, 0.0, 1.0, 48, roots)) return false;
+                TsiResult res;
+                res.complete = true;
+                for (const Interval& tau : roots) {
+                    if (tau.hi < ta.lo || tau.lo > tb.hi) continue; // beyond the arc
+                    if (!(ta.hi < tau.lo && tau.hi < tb.lo)) return false; // at an end
+                    Box4 P;
+                    Vec3<Interval> Xr;
+                    if (!charts_at(tau, P, Xr)) return false;
+                    const Interval ug = (Xr.x - Interval(ax[0])) / Interval(ax[1]), vg = (Xr.y - Interval(ay[0])) / Interval(ay[1]);
+                    if (ug.hi < 0.0 || ug.lo > 1.0 || vg.hi < 0.0 || vg.lo > 1.0) continue; // beyond g's square
+                    if (!(ug.lo > 0.0 && ug.hi < 1.0 && vg.lo > 0.0 && vg.hi < 1.0)) return false;
+                    TsiRoot r;
+                    for (int i = 0; i < 4; ++i) r.enc[static_cast<std::size_t>(i)] = P[static_cast<std::size_t>(i)];
+                    r.enc[4] = ug;
+                    r.enc[5] = vg;
+                    for (int i = 0; i < 6; ++i) r.y[static_cast<std::size_t>(i)] = num::mid(r.enc[static_cast<std::size_t>(i)]);
+                    r.unique = r.enc;
+                    res.roots.push_back(r);
+                }
+                note(where + ": the arc runs along side " + str(sd) + " of surface " + str(ga) + " in plane " + str(gb) +
+                     "; it meets the graph in the roots of one exact polynomial of degree " + str(N) + ": " +
+                     str(static_cast<int>(res.roots.size())) + " on the arc");
+                out = std::move(res);
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// The pair (x, y) as two graphs crossing where they share boundary
     /// lines. On success `res` holds the crossing curves, proven complete,
     /// `sys` is their system (A against C), and vertices where the curves
@@ -3462,6 +3616,17 @@ private:
                         const CurveBase& base = *edge.geom->base;
                         const auto t0 = std::chrono::steady_clock::now();
                         TsiResult res = intersect_arc_surface(*edge.geom, im.carriers[static_cast<std::size_t>(g)], opt.csi, enclosures);
+                        // An arc along a side in a plane against a graph: one exact
+                        // polynomial in the side's parameter (before the deeper search,
+                        // which costs seconds where it fails).
+                        if (!res.complete) {
+                            TsiResult alt;
+                            if (graph_arc_roots(k, edge, g0, g1, g, alt, where)) {
+                                alt.nodes = res.nodes;
+                                res = std::move(alt);
+                                ++im.stats.graph_arcs;
+                            }
+                        }
                         if (!res.complete) {
                             // A deeper search: near a root where the arc leaves the
                             // surface at a small angle the boxes must get very small
@@ -3729,6 +3894,46 @@ private:
                 const Tri in = in_arc(*edge.geom, pos);
                 if (in != Tri::No) return in;
             }
+        // Two distinct planes meet in one line. A straight edge whose side
+        // has both ends exactly in both planes runs along that line, whatever
+        // its own surfaces are (a ruling of a cylinder that touches one of the
+        // planes along it, on a plane coplanar with the other): the part is
+        // that edge if its point lies within the edge.
+        if (is_planar[static_cast<std::size_t>(x)] && is_planar[static_cast<std::size_t>(y)] && !equiv(x, y)) {
+            const PolyPatchD& Px = im.carriers[static_cast<std::size_t>(x)];
+            const PolyPatchD& Py = im.carriers[static_cast<std::size_t>(y)];
+            const auto p = curve.sys->point_a(mid);
+            for (int k = 0; k < 2; ++k)
+                for (int e = 0; e < static_cast<int>(S(k).edges.size()); ++e) {
+                    const BEdge& edge = S(k).edges[static_cast<std::size_t>(e)];
+                    if (edge.arc) continue;
+                    int g0 = -1, g1 = -1;
+                    edge_carriers(k, e, g0, g1);
+                    // A side affine in its parameter: equal weights, control
+                    // points evenly spaced on a line (homogeneous, so exact).
+                    std::vector<Vec4d> cp = side_control(im.carriers[static_cast<std::size_t>(g0)], edge.on[0].side);
+                    bool affine = cp.size() >= 2 && cp.front().w > 0.0;
+                    for (const Vec4d& c : cp) affine = affine && c.w == cp.front().w;
+                    if (!affine) continue;
+                    const double w = cp.front().w;
+                    for (Vec4d& c : cp) c.w = 1.0; // the same test on the same multiples
+                    if (!linear_side(cp)) continue;
+                    Vec4d A = cp.front(), B = cp.back();
+                    A.w = B.w = w;
+                    if (!planar_detail::on_plane(Px, A) || !planar_detail::on_plane(Px, B) || !planar_detail::on_plane(Py, A) ||
+                        !planar_detail::on_plane(Py, B))
+                        continue;
+                    // The point's side parameter is its projection onto the side.
+                    const Interval W(w);
+                    const Interval ax = Interval(A.x) / W, ay = Interval(A.y) / W, az = Interval(A.z) / W;
+                    const Interval dx = Interval(B.x) / W - ax, dy = Interval(B.y) / W - ay, dz = Interval(B.z) / W - az;
+                    Interval tau = ((p.x - ax) * dx + (p.y - ay) * dy + (p.z - az) * dz) / (dx * dx + dy * dy + dz * dz);
+                    if (edge.on[0].reversed) tau = Interval(1.0) - tau;
+                    if (tau.hi < edge.t0.lo || tau.lo > edge.t1.hi) continue;
+                    if (edge.t0.hi < tau.lo && tau.hi < edge.t1.lo) return Tri::Yes;
+                    return Tri::Unknown;
+                }
+        }
         return Tri::No;
     }
 
