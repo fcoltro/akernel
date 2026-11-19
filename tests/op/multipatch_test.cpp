@@ -150,5 +150,24 @@ int main() {
             },
             [&](const Vec3d& p) { return t.inside(p); }, {-0.6, -0.1, -0.1}, {2.1, 2.1, 1.1}, 505);
     }
+    // A sector over angles 0 to 2 atan(1/4), r in [1.25, 2.25], z in [0.25,
+    // 0.75], against a spline box whose top corner (1.25, 0.5, 0.25) lies
+    // exactly on the sector's bottom cap (a flat face on the rational annulus
+    // carrier), inside it; the box's vertical edge there ends on the cap. The
+    // cap is moved onto an exact parallelogram of its plane first (a vertex of
+    // the other solid in its plane), where the end is decided exactly
+    // (benchmark section 13, chain 8, step 5).
+    {
+        const Spline t({0.75, 0.0, -0.25}, 0.5, 0.5, 0.5, 2, 2,
+                       {0.25, 0, 0.125, 0, 0.0625, 0.125, 0.125, 0.25, 0.0625, 0.25, 0.25, 0.0625, 0.0625, 0.125, 0.125, 0});
+        const double t1 = 0.25;
+        run("spline box with a corner on a sector's cap", op::to_brep(op::make_cylinder_sector(1.25, 2.25, 0.0, t1, 0.25, 0.75)),
+            op::to_brep(t.solid()),
+            [&](const Vec3d& p) {
+                const double r = std::sqrt(p.x * p.x + p.y * p.y), th = std::atan2(p.y, p.x);
+                return r >= 1.25 && r <= 2.25 && th >= 0.0 && th <= 2.0 * std::atan(t1) && p.z >= 0.25 && p.z <= 0.75;
+            },
+            [&](const Vec3d& p) { return t.inside(p); }, {0.6, -0.1, -0.35}, {2.35, 1.2, 0.85}, 606);
+    }
     return akt::finish("multipatch_test");
 }

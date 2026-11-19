@@ -6473,6 +6473,29 @@ inline void conflicts(const Brep* s[2], std::vector<int> out[2]) {
                     }
                 if (!own) { conflict = true; break; }
             }
+            // Or a vertex of the other solid lying exactly in the plane (an
+            // edge ending on the cap, a corner of a box resting on it): its
+            // parameters on the cap would be enclosures of rational functions,
+            // where a plane decides it exactly. Vertices this solid has too,
+            // by construction, do not count.
+            auto point_of = [](const Brep& b, const BVertex& V, Vec4d& X) {
+                if (V.exact) { X = V.xp; return true; }
+                for (const Chart& c : V.charts)
+                    if (c.u.lo == c.u.hi && c.v.lo == c.v.hi && exact_point_at(b.carriers[static_cast<std::size_t>(c.carrier)], c.u.lo, c.v.lo, X))
+                        return true;
+                return false;
+            };
+            for (const BVertex& V : other.vertices) {
+                if (conflict) break;
+                Vec4d X;
+                if (!point_of(other, V, X) || !(X.w > 0.0) || !planar_detail::coplanar4(span[0], span[1], span[2], X)) continue;
+                bool own = false;
+                for (const BVertex& W : s[f.k]->vertices) {
+                    Vec4d Y;
+                    if (point_of(*s[f.k], W, Y) && planar_detail::same_point_h(X, Y)) { own = true; break; }
+                }
+                if (!own) conflict = true;
+            }
         }
         if (!conflict) continue;
         // Every flat rational carrier of either solid in that plane moves.
