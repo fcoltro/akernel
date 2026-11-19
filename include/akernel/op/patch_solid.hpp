@@ -18,6 +18,7 @@
 
 #include <akernel/geom/bernstein.hpp>
 #include <akernel/geom/bspline.hpp>
+#include <akernel/geom/nurbs_surface.hpp>
 #include <akernel/solve/csi.hpp>
 
 namespace ak::op {
@@ -251,6 +252,85 @@ inline PatchSolid make_bump_box(const Vec3d& o, double sx, double sy, double sz,
             L.at(i, j, 1) = {x, y, o.z + sz + ((i == 1 && j == 1) ? 4.0 * bump : 0.0), 1.0};
         }
     return make_hex(L);
+}
+
+/// The outer faces of a grid of lattices that fill a solid column by column:
+/// cell (a, b) of an m x n grid, row-major in a. Neighbouring cells must take
+/// their shared face from the same nodes; those inner faces are left out,
+/// and the rest are matched into one shell by PatchSolid::build (identical
+/// side control points). Faces of one carrier surface split into several
+/// patches (a B-spline's Bezier pieces) are separate faces sharing their
+/// sides: multi-patch faces.
+inline PatchSolid make_hex_grid(const std::vector<Lattice>& cells, int m, int n, std::string* error = nullptr) {
+    PatchSolid s;
+    for (int a = 0; a < m; ++a)
+        for (int b = 0; b < n; ++b) {
+            const Lattice& L = cells[static_cast<std::size_t>(a * n + b)];
+            const int p = L.p, q = L.q, r = L.r;
+            if (a == 0) {
+                PolyPatchD x0(r, q);
+                for (int i = 0; i <= r; ++i) for (int j = 0; j <= q; ++j) x0.at(i, j) = L.at(0, j, i);
+                s.faces.push_back(x0);
+            }
+            if (a == m - 1) {
+                PolyPatchD x1(q, r);
+                for (int i = 0; i <= q; ++i) for (int j = 0; j <= r; ++j) x1.at(i, j) = L.at(p, i, j);
+                s.faces.push_back(x1);
+            }
+            if (b == 0) {
+                PolyPatchD y0(p, r);
+                for (int i = 0; i <= p; ++i) for (int j = 0; j <= r; ++j) y0.at(i, j) = L.at(i, 0, j);
+                s.faces.push_back(y0);
+            }
+            if (b == n - 1) {
+                PolyPatchD y1(r, p);
+                for (int i = 0; i <= r; ++i) for (int j = 0; j <= p; ++j) y1.at(i, j) = L.at(j, q, i);
+                s.faces.push_back(y1);
+            }
+            PolyPatchD z0(q, p), z1(p, q);
+            for (int i = 0; i <= q; ++i) for (int j = 0; j <= p; ++j) z0.at(i, j) = L.at(j, i, 0);
+            for (int i = 0; i <= p; ++i) for (int j = 0; j <= q; ++j) z1.at(i, j) = L.at(i, j, r);
+            s.faces.push_back(z0);
+            s.faces.push_back(z1);
+        }
+    std::string err;
+    if (!s.build(err)) s.faces.clear();
+    if (error) *error = err;
+    return s;
+}
+
+/// Box with footprint [o.x, o.x+sx] x [o.y, o.y+sy] whose top is the graph
+/// z = o.z + sz + f(x', y') of a quadratic B-spline f in footprint
+/// coordinates, with clamped uniform knots of m and n spans and control
+/// heights h (row-major in x', (m + 2) x (n + 2) values). The x and y of the
+/// control points are the Greville abscissae, so x and y are affine in each
+/// piece's parameters: every top piece is a graph. The top is split into its
+/// m x n Bezier pieces, one face each (C1 across the seams), and so are the
+/// bottom and the sides below them. With dyadic o, sx, sy, sz, h and spans a
+/// power of two, every control point is exact.
+inline PatchSolid make_spline_box(const Vec3d& o, double sx, double sy, double sz, int m, int n, const std::vector<double>& h) {
+    const int p = 2, nu = m + p, nv = n + p;
+    if (static_cast<int>(h.size()) != nu * nv) return {};
+    geom::NurbsSurface top(p, p, nu, nv, geom::open_uniform_knots(nu, p), geom::open_uniform_knots(nv, p));
+    const auto gu = geom::greville(nu, p, top.U), gv = geom::greville(nv, p, top.V);
+    for (int i = 0; i < nu; ++i)
+        for (int j = 0; j < nv; ++j)
+            top.at(i, j) = {o.x + sx * gu[static_cast<std::size_t>(i)], o.y + sy * gv[static_cast<std::size_t>(j)],
+                            o.z + sz + h[static_cast<std::size_t>(i * nv + j)], 1.0};
+    const auto pieces = top.to_bezier();
+    std::vector<Lattice> cells;
+    for (const auto& piece : pieces) {
+        Lattice L(p, p, 1);
+        for (int i = 0; i <= p; ++i)
+            for (int j = 0; j <= p; ++j) {
+                const Vec4d& c = piece.patch.at(i, j);
+                L.at(i, j, 1) = c;
+                L.at(i, j, 0) = {c.x, c.y, o.z, 1.0};
+            }
+        cells.push_back(L);
+    }
+    // to_bezier lists pieces row-major in u: (a, b) at a * n + b.
+    return make_hex_grid(cells, m, n);
 }
 
 /// Quarter of a cylindrical shell: r0 <= sqrt(x^2 + y^2) <= r1, x, y >= 0,

@@ -48,6 +48,7 @@ ak_add_test(quadric_test           tests/op/quadric_test.cpp)
 ak_add_test(contact_test           tests/op/contact_test.cpp)
 ak_add_test(flat_test              tests/op/flat_test.cpp)
 ak_add_test(exact_test             tests/op/exact_test.cpp)
+ak_add_test(multipatch_test        tests/op/multipatch_test.cpp)
 
 add_executable(ak_bench bench/bench_main.cpp)
 target_link_libraries(ak_bench PRIVATE akernel)

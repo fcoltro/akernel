@@ -9,12 +9,12 @@ Measured on 2026-11-11, 2026-11-12 (tessellation, the vertex-manifoldness check,
 
 ## Test suite status
 
-Twenty-two test programs, one per module.
+Twenty-three test programs, one per module.
 
 | Build | Result on the final sources |
 |---|---|
-| Release | 22 of 22 pass |
-| Debug | 22 of 22 pass |
+| Release | 23 of 23 pass |
+| Debug | 23 of 23 pass |
 
 On this machine Windows refuses some freshly built executables ("An Application Control policy has blocked this file"), in either build, and which file is refused changes from build to build. That is an operating-system policy decision, not a test failure. Every test program has run and passed on the final sources.
 
@@ -963,6 +963,17 @@ Chain 7's last refusal comes from two hill tops that share the line y = 0.5. A's
 
 **On the curved chains (§3):** nothing changes. Chain 7 is refused as before, and no other benchmark pair reaches an exact double root.
 
+### Multi-patch faces: B-spline tops (section 13 of the benchmark)
+
+Real CAD faces are B-spline surfaces with many knot spans; until now every curved face of an operand was one Bézier patch. This round starts roadmap phase 3 with curved surfaces split into patches.
+- **Solids from columns.** `op::make_hex_grid` takes an m x n grid of trivariate lattices that fill a solid column by column and keeps their outer faces. Faces shared by two cells are left out, and `PatchSolid::build` matches the rest into one shell by identical side control points, as for any operand. `op::make_spline_box` uses it for a box whose top is the graph of a quadratic B-spline (clamped uniform knots, m and n spans, control heights h). The control points' x and y are the Greville abscissae, so each piece is a graph with x and y affine in its parameters. The top is split into its m x n Bézier pieces by `NurbsSurface::to_bezier`, one face each and C1 across the seams; the bottom and the sides below them are split the same way. With dyadic data and spans a power of two, the knot insertions divide by powers of two only, so every control point is exact. Neighbouring pieces share their boundary rows, and so their sides, exactly.
+- **What the Booleans needed.** Most of it already held: seams are ordinary edges shared by two faces, and a curve crossing a seam ends there at a vertex found by the edge/surface search. Two cases were new.
+  - **A seam in a plane of its own.** A seam of the top along x = 0.5 is a plane curve. When a sector's cylinder r = 0.5 is tangent to that plane along a ruling, the edge/surface search cannot finish, because the edge touches the cylinder at its end. The plane is now spanned by three of the side's control points, with every control point checked to lie in it exactly. If the curved surface meets that plane only along its sides (`sides_contact_flat`), the edge meets the surface only there, on edges of the other solid that are searched instead (`in_plane_meeting_sides`). This runs only where the search fails.
+  - **A point on a seam of the other solid's plane.** Two spline boxes have coplanar bottoms whose seams lie in different places. The interior point chosen for a region of one bottom can lie on a seam of the other, an edge between two of its faces in that plane, and is then undecided. Such an edge bounds no region, so the region lies wholly in those faces or wholly outside them, and another of its interior points decides (up to eight are tried).
+- **Tests.** `tests/op/multipatch_test.cpp` (53 checks) builds 2 x 2 and 4 x 2 spline boxes (16 and 28 faces, volumes against the closed form Σ h_ij I_i I_j sx sy). It runs four Booleans with inclusion-exclusion to 1e-12, Monte Carlo within 4 sigma and closed meshes: a box across both seams, a box through the top, a sector tangent to a seam's plane, and two spline boxes with coplanar bottoms. Red checks: without the plane-curve rule the sector case is refused, and without the retry the two-box case is (1 failure each).
+
+**Benchmark, section 13:** the chains of section 11 with every hill box replaced by a spline box with 1, 2 or 4 spans each way and random control heights in {0, 1/16, 1/8, 1/4}, borders included. The other operands' draws are those of section 11. With exact points, 159 of 181 steps are committed, with no result beyond 3 sigma (worst 2.62) and 154 of 155 meshes closed; one mesh has a degenerate triangle. Without exact points, 141 of 169. The 22 refusals with exact points all involve a spline box: a surface through a vertex of an edge (6), an edge that touches a surface (4), a vertex of the other solid without parameters on a face (3), an intersection not proven complete (2), and seven single cases. They are the next work.
+
 ### A compiler fault
 
 While building the quadric tests, `on_quadric` reported that an exact quarter cylinder was not on its cylinder, but only in the `/O2 /fp:strict` build of the test program. With `/Od`, `/O1`, `/Og`, `/fp:precise`, or with inlining off (`/Ob0`), the result was right, and so it was in smaller programs with the same headers and flags. The investigation:
@@ -1164,6 +1175,8 @@ The two Boolean sections have their own hashes. The first covers the three volum
 | Chains with curved operands (§3) | Release, a pierce next to a shared line (217 committed) | `873d2f1a99831e6e` |
 | Chains with curved operands (§3) | Release, a shallow double crossing by one exact polynomial (220 committed) | `68ff1b76100d8bfc` |
 | Chains with curved operands (§3) | Release, a shallow double crossing, exact points off (190 committed) | `03a1b78fe1a5607e` |
+| Chains with multi-patch faces (§3) | Release, first run (159 committed) | `4c5dcde7c7262170` |
+| Chains with multi-patch faces (§3) | Release, first run, exact points off (141 committed) | `78fbd455c75b35b0` |
 
 After the coplanar work, again after the tessellation work and the vertex-manifoldness check, and again after the identity work (grown uniqueness regions in the edge/surface and three-surface searches, closed-edge unification, empty operands), the core, single-operation, chain and reuse hashes were re-run in Release and are unchanged, and so are the grid-chain and tessellation hashes of the previous milestone. The grid-chain hash changed first because the newly refused pinched result ended its chain, and then again when non-manifold results became valid and the grid chains ran on. With non-manifold results the core, single-operation, chain and reuse hashes are again unchanged: none of those sections produces a contact of that kind. After the exact-quadric work every hash in this table is unchanged from the non-manifold milestone (core, Boolean pairs, chains, reuse, grid chains `cfafddb9df9fd21f`, tessellation `4be3b23e245a7be2`, identities `896b9c04bb9ba003`).
 
@@ -1224,6 +1237,8 @@ A shallow double crossing by one exact polynomial (§3): the curved-chain hash c
 
 A crossing curve touching a shared line (§3): every hash, with exact points and without, is unchanged. Chain 7 is still refused by design, and no other pair reaches the new rule. All 22 test programs pass in Release and in Debug.
 
+Multi-patch faces (§3): every earlier hash, with exact points and without, is unchanged; the new section 13 adds its own (`4c5dcde7c7262170`, without exact points `78fbd455c75b35b0`). All 23 test programs pass in Release and in Debug.
+
 Timings of the tangency-along-a-ruling round are not comparable with the earlier ones. The full benchmark took 503 s in one run and 679 s in another (925 s before), both with the Debug test suite running beside it; sections whose code and results are unchanged ran in about half their earlier time in the first of those runs (a random-box chain step at depth 6: 204 ms against 362 ms), so the difference is the state of the machine, not the code.
 
 So the Boolean results are bitwise identical between Debug and Release; the rewrite for trimmed operands, and the later rewrite for shared geometry, did not change any earlier result. The reuse chains have been run in Release only. All of this covers one machine, one compiler and single-threaded execution; other platforms and parallel execution are untested.
@@ -1247,6 +1262,7 @@ So the Boolean results are bitwise identical between Debug and Release; the rewr
 
 - Behaviour on real CAD models. Every input solid here has six faces, each one Bezier patch, except the tiled boxes of the scaling test (up to 1,536 flat faces); chained results grow to about 37 trimmed faces.
 - Curved chains at scale. §3 has 40 chains with cylinder sectors and hill boxes (221 steps, 220 committed). A crossing curve that touches the line two hill tops share, blurred by the rounding of non-dyadic bumps (1), stops the rest. On the stored data it is a face about 1e-8 by 1e-16, which double geometry cannot carry, so it is reported, never answered. The same touch on dyadic data is decided exactly when the curve stays outside the square, and refused when it touches from inside. The tessellator can fail on a sliver whose two boundary edges leave a vertex tangentially (their polylines cross); no committed benchmark result has hit this.
+- Multi-patch faces. Section 13 commits 159 of 181 steps with B-spline tops of up to 4 x 4 pieces; 22 steps are refused (see §3), and one mesh has a degenerate triangle. Only quadratic graphs over rectangles are built so far: no general B-spline faces, no trimmed B-spline input, and faces of one surface are not merged back into one face in the results.
 - Exact points beyond round numbers. A vertex is known exactly only if its homogeneous coordinates are doubles and it has parameters that are dyadic, or fractions with denominators up to 4096, on the surfaces it must be proven on. Vertices with irrational coordinates (most intersections of curved surfaces) stay enclosures, and their coincidences stay unprovable. Exact membership in a curved surface was exercised by one benchmark step (chain 18) and by the evaluator's unit tests, not by a Boolean test with a closed-form volume.
 - An edge lying in a curved surface other than along a line of constant parameter (a circle of a sphere, an edge along a cylinder that is not straight in its parameterisation), and an edge through an edge in space at a point whose coordinates are not round: reported. Line contacts are counted and reported; the fan check, which orders faces around shared edges, does not examine them.
 - Flat rational faces in planes that are not axis-aligned. A sector's cap is moved onto a parallelogram of its plane only when that plane is x, y or z = constant (exact points on it are then easy to choose); other flat rational faces in one plane with an unrelated flat face are still reported.

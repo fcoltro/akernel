@@ -1034,9 +1034,17 @@ void dump_refused(const op::Imprint& im, const op::BooleanResult& r) {
 /// circle parameterisation, dyadic ranges, so faces of different operands lie
 /// on one cylinder or plane), boxes with a hill on top, and rotated boxes.
 /// Starts from the quarter cylindrical shell.
-void bench_curved_chains(int chains, int depth, int first_chain = 0, bool trace = false) {
-    std::printf("## 11. Chained operations with curved operands\n\n");
-    std::printf("%d chains of up to %d operations from the quarter cylindrical shell (radii 1 to 2, height 1). Each "
+void bench_curved_chains(int chains, int depth, int first_chain = 0, bool trace = false, bool splines = false) {
+    if (splines) {
+        std::printf("## 13. Chained operations with multi-patch faces\n\n");
+        std::printf("The chains of section 11 with every hill box replaced by a box whose top is a quadratic B-spline "
+                    "graph with 1, 2 or 4 spans each way and random dyadic control heights (0 to 1/4, borders "
+                    "included). The top is split into its Bezier pieces, one face each, C1 across the seams, and so "
+                    "are the bottom and the sides below them: curved faces made of several patches. The random "
+                    "draws of the other operands are those of section 11.\n\n");
+    } else
+        std::printf("## 11. Chained operations with curved operands\n\n");
+    if (!splines) std::printf("%d chains of up to %d operations from the quarter cylindrical shell (radii 1 to 2, height 1). Each "
                 "step uses, with equal probability, a cylinder sector on the same family of cylinders (radii, angle "
                 "parameter and height ranges on dyadic grids, so faces of different operands often lie on one "
                 "cylinder or one plane without being the same patch), a box with a hill on top at a random grid "
@@ -1044,13 +1052,16 @@ void bench_curved_chains(int chains, int depth, int first_chain = 0, bool trace 
                 "200,000 points that uses only the analytic definition of the chain.\n\n",
                 chains, depth);
     struct Operand {
-        int kind = 0; // 0 sector, 1 hill box, 2 rotated box
+        int kind = 0; // 0 sector, 1 hill box, 2 rotated box, 3 spline box
         double r0 = 0, r1 = 0, t0 = 0, t1 = 0, z0 = 0, z1 = 0; // sector
-        Vec3d o{}; double sx = 0, sy = 0, sz = 0, bump = 0;    // hill box
+        Vec3d o{}; double sx = 0, sy = 0, sz = 0, bump = 0;    // hill box, spline box
+        int m = 1, n = 1; std::vector<double> h;               // spline box: spans, control heights
+        std::shared_ptr<geom::NurbsSurface> top;               // spline box: its heights over the unit square
         RandomBox box;                                         // rotated box
         op::PatchSolid solid() const {
             if (kind == 0) return op::make_cylinder_sector(r0, r1, t0, t1, z0, z1);
             if (kind == 1) return op::make_bump_box(o, sx, sy, sz, bump);
+            if (kind == 3) return op::make_spline_box(o, sx, sy, sz, m, n, h);
             return box.solid();
         }
         bool inside(const Vec3d& p) const {
@@ -1064,6 +1075,11 @@ void bench_curved_chains(int chains, int depth, int first_chain = 0, bool trace 
                 if (x < 0 || x > 1 || y < 0 || y > 1 || p.z < o.z) return false;
                 return p.z <= o.z + sz + 16.0 * bump * x * (1 - x) * y * (1 - y);
             }
+            if (kind == 3) {
+                const double x = (p.x - o.x) / sx, y = (p.y - o.y) / sy;
+                if (x < 0 || x > 1 || y < 0 || y > 1 || p.z < o.z) return false;
+                return p.z <= o.z + sz + top->point(x, y).z;
+            }
             return box.inside(p);
         }
     };
@@ -1076,11 +1092,11 @@ void bench_curved_chains(int chains, int depth, int first_chain = 0, bool trace 
     std::vector<Row> rows(static_cast<std::size_t>(depth));
     std::map<std::string, int> reasons;
     std::vector<std::string> failures;
-    int kinds[3] = {0, 0, 0};
+    int kinds[4] = {0, 0, 0, 0};
     long new_vertices = 0, exact_roots = 0, exact_ends = 0; // over the solved steps
     int steps_with_exact_ends = 0;
     TessTally tess; // kept apart from section 9 so its hash stays comparable
-    tess.name = "11. curved chains";
+    tess.name = splines ? "13. multi-patch chains" : "11. curved chains";
     // Covers every operand: sectors reach radius 2.5 and angles down to
     // 2 atan(-0.25) (negative y); hills reach x, y = 1.75 and z = 1.3.
     const Vec3d lo{-0.5, -1.5, -0.5}, hi{2.75, 2.75, 1.75};
@@ -1111,6 +1127,19 @@ void bench_curved_chains(int chains, int depth, int first_chain = 0, bool trace 
                 B.sy = pick(rng, {0.5, 0.75, 1.0});
                 B.sz = pick(rng, {0.5, 0.75});
                 B.bump = pick(rng, {0.1, 0.2, 0.3});
+                if (splines) {
+                    B.kind = 3;
+                    B.m = static_cast<int>(pick(rng, {1.0, 2.0, 4.0}));
+                    B.n = static_cast<int>(pick(rng, {1.0, 2.0, 4.0}));
+                    const int nu = B.m + 2, nv = B.n + 2;
+                    for (int i = 0; i < nu * nv; ++i) B.h.push_back(pick(rng, {0.0, 0.0625, 0.125, 0.25}));
+                    auto t = std::make_shared<geom::NurbsSurface>(2, 2, nu, nv, geom::open_uniform_knots(nu, 2), geom::open_uniform_knots(nv, 2));
+                    const auto gu = geom::greville(nu, 2, t->U), gv = geom::greville(nv, 2, t->V);
+                    for (int i = 0; i < nu; ++i)
+                        for (int j = 0; j < nv; ++j)
+                            t->at(i, j) = {gu[static_cast<std::size_t>(i)], gv[static_cast<std::size_t>(j)], B.h[static_cast<std::size_t>(i * nv + j)], 1.0};
+                    B.top = t;
+                }
             } else {
                 B.kind = 2;
                 B.box = random_box(rng, {0.3, 0.3, 0.2}, {1.6, 1.6, 0.8});
@@ -1129,12 +1158,16 @@ void bench_curved_chains(int chains, int depth, int first_chain = 0, bool trace 
             const double ms = now_ms() - t0;
             row.total_ms += ms;
             row.worst_ms = std::max(row.worst_ms, ms);
-            const char* kind_name = B.kind == 0 ? "sector" : (B.kind == 1 ? "hill box" : "rotated box");
+            const char* kind_name = B.kind == 0 ? "sector" : (B.kind == 1 ? "hill box" : (B.kind == 3 ? "spline box" : "rotated box"));
             if (trace) {
                 std::printf("chain %d step %d: %s %s", chain, step + 1,
                             o == op::Op::Difference ? "minus" : (o == op::Op::Union ? "or" : "and"), kind_name);
                 if (B.kind == 0) std::printf(" r %g-%g t %g-%g z %g-%g", B.r0, B.r1, B.t0, B.t1, B.z0, B.z1);
                 if (B.kind == 1) std::printf(" o (%g %g %g) size %g %g %g bump %g", B.o.x, B.o.y, B.o.z, B.sx, B.sy, B.sz, B.bump);
+                if (B.kind == 3) {
+                    std::printf(" o (%g %g %g) size %g %g %g spans %d x %d heights", B.o.x, B.o.y, B.o.z, B.sx, B.sy, B.sz, B.m, B.n);
+                    for (double hv : B.h) std::printf(" %g", hv);
+                }
                 std::printf(": imprint %s, result %s\n", im.ok ? "ok" : "failed", r.ok ? (r.empty ? "empty" : "ok") : "refused");
             }
             if (!im.ok) {
@@ -1205,7 +1238,10 @@ void bench_curved_chains(int chains, int depth, int first_chain = 0, bool trace 
                     static_cast<double>(row.faces) / kept, row.worst_z, row.beyond3,
                     row.total_ms / std::max(1, row.attempted), row.worst_ms);
     }
-    std::printf("\nOperands drawn: %d sectors, %d hill boxes, %d rotated boxes.\n", kinds[0], kinds[1], kinds[2]);
+    if (splines)
+        std::printf("\nOperands drawn: %d sectors, %d spline boxes, %d rotated boxes.\n", kinds[0], kinds[3], kinds[2]);
+    else
+        std::printf("\nOperands drawn: %d sectors, %d hill boxes, %d rotated boxes.\n", kinds[0], kinds[1], kinds[2]);
     std::printf("\nExact points, over the solved steps: %ld of %ld new vertices proven exact; %ld roots proven to be an end "
                 "vertex of their edge by its exact point, in %d steps.\n",
                 exact_roots, new_vertices, exact_ends, steps_with_exact_ends);
@@ -1448,6 +1484,14 @@ int main(int argc, char** argv) {
         std::printf("Curved chain result hash: %016llx\n", static_cast<unsigned long long>(g_hash));
         return 0;
     }
+    if (argc > 1 && std::string(argv[1]) == "splines") {
+        const int count = argc > 2 ? std::atoi(argv[2]) : 40, depth = argc > 3 ? std::atoi(argv[3]) : 6;
+        const int first = argc > 4 ? std::atoi(argv[4]) : 0;
+        g_dump_faces = argc > 5 && std::string(argv[5]) == "trace";
+        bench_curved_chains(count, depth, first, g_dump_faces, true);
+        std::printf("Spline chain result hash: %016llx\n", static_cast<unsigned long long>(g_hash));
+        return 0;
+    }
     if (argc > 1 && std::string(argv[1]) == "identities") {
         g_identity_trace = argc > 2 && std::string(argv[2]) == "trace";
         bench_identities();
@@ -1491,6 +1535,9 @@ int main(int argc, char** argv) {
     g_hash = 0xcbf29ce484222325ull;
     bench_curved_chains(40, 6);
     std::printf("Curved chain result hash: %016llx\n\n", static_cast<unsigned long long>(g_hash));
+    g_hash = 0xcbf29ce484222325ull;
+    bench_curved_chains(40, 6, 0, false, true);
+    std::printf("Spline chain result hash: %016llx\n\n", static_cast<unsigned long long>(g_hash));
     g_hash = 0xcbf29ce484222325ull;
     bench_scaling(16);
     std::printf("Scaling result hash: %016llx\n", static_cast<unsigned long long>(g_hash));

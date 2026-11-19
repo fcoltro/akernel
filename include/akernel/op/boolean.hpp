@@ -2484,6 +2484,25 @@ private:
         return false;
     }
 
+    /// Is side `side` of surface a a plane curve, in a plane that surface g
+    /// meets only along sides of g? The plane is spanned by the side's first,
+    /// second and last control points (exactly; collinear ones span none, and
+    /// then the plane function vanishes identically and nothing is claimed);
+    /// every control point of the side must lie in it, exactly.
+    bool in_plane_meeting_sides(int a, int side, int g) const {
+        const auto cp = side_control(im.carriers[static_cast<std::size_t>(a)], side);
+        if (cp.size() < 3) return false; // a straight side: the plane is not determined by it
+        PolyPatchD P(1, 1);
+        P.at(0, 0) = cp.front();
+        P.at(1, 0) = cp[1];
+        P.at(0, 1) = cp.back();
+        P.at(1, 1) = cp.back();
+        for (const Vec4d& c : cp)
+            if (!(c.w > 0.0) || contact_detail::det4(P.at(0, 0), P.at(1, 0), P.at(0, 1), c).sign() != 0) return false;
+        const SidesContact sc = sides_contact_flat(im.carriers[static_cast<std::size_t>(g)], P);
+        return sc.only_sides;
+    }
+
     /// A point where the crossing curve k = 0 touches a shared side from
     /// outside A's square: side `side`, side parameter t (dyadic), and s the
     /// sign of k at the points of the square near it.
@@ -3681,6 +3700,16 @@ private:
                             // plane, decide exactly whether the edge meets it only at
                             // its end vertices (then there is nothing new here).
                             if (is_planar[static_cast<std::size_t>(g)] && touches_at_ends(k, e, g, side_curve_patch)) continue;
+                            // Or the edge is a plane curve (a seam of a B-spline face
+                            // along a line of constant x, say) in a plane that the
+                            // curved surface g meets only along its sides (a cylinder
+                            // tangent to it along a ruling): the edge meets g only on
+                            // those sides, which edges of the other solid cover and
+                            // are searched against this solid's surfaces instead.
+                            if (!is_planar[static_cast<std::size_t>(g)] && in_plane_meeting_sides(g0, edge.on[0].side, g)) {
+                                note(where + ": the edge lies in a plane of its own, which the surface meets only along its sides (exact)");
+                                continue;
+                            }
                             // Or the edge lies in the surface, along a line of
                             // constant parameter (exact): nothing to find here.
                             // Its end vertices lie on g.
@@ -5896,7 +5925,17 @@ private:
                 return fail("no interior point could be found for a region of a shared surface");
             int other = -1;
             bool reversed = false;
-            const Hit hit = find_face_in_plane(1 - reg.solid, g, Interval(u), Interval(v), other, reversed);
+            Hit hit = find_face_in_plane(1 - reg.solid, g, Interval(u), Interval(v), other, reversed);
+            // The point may lie on an edge between two faces of the other solid
+            // in this plane (the seam of a surface split into patches): such an
+            // edge bounds no region, so the region lies wholly in those faces or
+            // wholly outside them, and another of its interior points decides.
+            for (int skip = 1; hit == Hit::Undecided && skip <= 8; ++skip) {
+                double u2 = 0.0, v2 = 0.0;
+                if (!interior_point(reg.geom, opt.refine_depth, u2, v2, skip)) break;
+                const Hit h2 = find_face_in_plane(1 - reg.solid, g, Interval(u2), Interval(v2), other, reversed);
+                if (h2 != Hit::Undecided) { hit = h2; u = u2; v = v2; }
+            }
             if (hit == Hit::Undecided) {
                 if (opt.trace) {
                     note("region of face " + str(reg.face) + " of solid " + str(reg.solid) + " on surface " + str(g) +
