@@ -169,5 +169,37 @@ int main() {
             },
             [&](const Vec3d& p) { return t.inside(p); }, {0.6, -0.1, -0.35}, {2.35, 1.2, 0.85}, 606);
     }
+    // Benchmark section 13, chain 36, steps 1 to 4: in the last, the top edge
+    // of a spline box's flat side y = 0.75 (a side of the top's pieces, in the
+    // plane of a face of the earlier result) crosses that face's boundary. The
+    // vertex there lies on a side of a top piece that lies in the plane, so it
+    // gets parameters on the plane when it is made (side_plane_charts), and the
+    // face's boundary is split at it.
+    {
+        struct Sector { double r0, r1, t0, t1, z0, z1; };
+        auto in_sector = [](const Sector& s, const Vec3d& p) {
+            const double rho = std::sqrt(p.x * p.x + p.y * p.y), th = std::atan2(p.y, p.x);
+            return rho >= s.r0 && rho <= s.r1 && p.z >= s.z0 && p.z <= s.z1 && th >= 2.0 * std::atan(s.t0) && th <= 2.0 * std::atan(s.t1);
+        };
+        const Sector shell{1.0, 2.0, 0.0, 1.0, 0.0, 1.0}, s1{1.5, 2.0, 0.0, 0.25, 0.0, 1.0}, s3{1.0, 1.5, 0.0, 0.5, 0.25, 0.5};
+        const Spline b2({-0.25, 0.25, 0.0}, 1, 1, 0.5, 1, 1, {0, 0, 0.125, 0.0625, 0.25, 0.0625, 0.125, 0, 0.0625});
+        const Spline b4({0.5, 0.75, 0.0}, 1, 0.5, 0.5, 4, 1,
+                        {0, 0.0625, 0.0625, 0.125, 0.125, 0.125, 0.125, 0.125, 0, 0, 0.0625, 0.125, 0.125, 0.125, 0.125, 0.0625, 0.125, 0.25});
+        auto sector = [](const Sector& s) { return op::to_brep(op::make_cylinder_sector(s.r0, s.r1, s.t0, s.t1, s.z0, s.z1)); };
+        Brep cur = sector(shell);
+        bool ok = true;
+        for (const auto& [B, o] : std::vector<std::pair<Brep, Op>>{
+                 {sector(s1), Op::Difference}, {op::to_brep(b2.solid()), Op::Intersection}, {sector(s3), Op::Intersection}}) {
+            const op::BooleanResult r = op::boolean_op(cur, B, o);
+            ok = ok && r.ok && !r.empty;
+            if (ok) cur = r.solid;
+        }
+        AK_CHECK(ok);
+        if (ok) {
+            auto inPrev = [&](const Vec3d& p) { return in_sector(shell, p) && !in_sector(s1, p) && b2.inside(p) && in_sector(s3, p); };
+            run("chain 36, step 4 (section 13)", cur, op::to_brep(b4.solid()), inPrev, [&](const Vec3d& p) { return b4.inside(p); },
+                {0.4, 0.2, -0.05}, {1.6, 1.3, 0.8}, 707);
+        }
+    }
     return akt::finish("multipatch_test");
 }

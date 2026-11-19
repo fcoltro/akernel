@@ -293,7 +293,12 @@ int main() {
                     double v[3];
                     ok = consistent(names[ci], current, B, im, v);
                     if (!ok) break;
-                    if (ci < 2) AK_CHECK(im.stats.merged_vertices > 0);
+                    // Chain 28's second root is merged with the vertex by their exact
+                    // points. In chain 30 the vertex now has parameters on the plane
+                    // its edge's side lies in (side_plane_charts), so the second root
+                    // is recognised as that vertex before any merge; one vertex
+                    // either way, and the volume is unchanged.
+                    if (ci == 1) AK_CHECK(im.stats.merged_vertices > 0);
                     if (ci == 3) AK_CHECK(im.stats.recarried_faces > 0);
                     if (ci == 5) AK_CHECK(im.stats.graph_arcs > 0);
                     r = op::select(im, st.op);

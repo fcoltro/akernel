@@ -843,6 +843,48 @@ class Builder {
                 map(c.carrier, h).apply(c.u, c.v, m.u, m.v);
                 im.vertices[static_cast<std::size_t>(v)].charts.push_back(m);
             }
+        side_plane_charts(v);
+    }
+    /// Per surface and side: the planes (surfaces carrying faces or edges)
+    /// that hold that side exactly, found once.
+    std::map<std::pair<int, int>, std::vector<int>> side_planes;
+    const std::vector<int>& planes_of_side(int g, int side) {
+        const auto key = std::make_pair(g, side);
+        const auto it = side_planes.find(key);
+        if (it != side_planes.end()) return it->second;
+        std::vector<int> out;
+        const PolyPatchD& X = im.carriers[static_cast<std::size_t>(g)];
+        for (int h = 0; h < static_cast<int>(im.carriers.size()); ++h) {
+            if (h == g || !is_planar[static_cast<std::size_t>(h)] || !surface_used[static_cast<std::size_t>(h)]) continue;
+            if (side_in_plane(X, side, im.carriers[static_cast<std::size_t>(h)])) out.push_back(h);
+        }
+        return side_planes[key] = std::move(out);
+    }
+    /// A vertex exactly on a side of a surface (an exact side coordinate),
+    /// where that side lies exactly in a plane, lies in the plane: parameters
+    /// there from its point on the surface. (A vertex on the top edge of a
+    /// spline box's flat side, found on the top's pieces, lies in that side's
+    /// plane, on which the other solid may have a face to split.)
+    void side_plane_charts(int v) {
+        const std::vector<Chart> own = im.vertices[static_cast<std::size_t>(v)].charts;
+        for (const Chart& c : own) {
+            const bool u0 = c.u.lo == 0.0 && c.u.hi == 0.0, u1 = c.u.lo == 1.0 && c.u.hi == 1.0;
+            const bool v0 = c.v.lo == 0.0 && c.v.hi == 0.0, v1 = c.v.lo == 1.0 && c.v.hi == 1.0;
+            if (!u0 && !u1 && !v0 && !v1) continue;
+            for (int side = 0; side < 4; ++side) {
+                if (!(side == 0 ? v0 : side == 1 ? u1 : side == 2 ? v1 : u0)) continue;
+                for (int h : planes_of_side(c.carrier, side)) {
+                    if (chart(v, h)) continue;
+                    // As in spread: only surfaces whose boxes meet the vertex's.
+                    if (solve::detail::boxes_disjoint(vertex_box(v), surface_box[static_cast<std::size_t>(h)])) continue;
+                    const auto p = icarrier[static_cast<std::size_t>(c.carrier)].eval(c.u, c.v);
+                    Chart m;
+                    m.carrier = h;
+                    if (!plane_params(im.carriers[static_cast<std::size_t>(h)], {p.x / p.w, p.y / p.w, p.z / p.w}, m.u, m.v)) continue;
+                    im.vertices[static_cast<std::size_t>(v)].charts.push_back(m);
+                }
+            }
+        }
     }
     /// Side `side` of surface a lies exactly in the plane of b, and a touches
     /// that plane only there (proven by the caller). Every vertex on that side
@@ -5253,6 +5295,26 @@ private:
             if (!plane_params(im.carriers[static_cast<std::size_t>(g)], P, m.u, m.v)) return;
             im.vertices[static_cast<std::size_t>(vid)].charts.push_back(m);
         };
+        // A vertex of a piece of the other solid that lies in this face's
+        // surface lies on that surface too. Charts are spread only to surfaces
+        // whose boxes meet the vertex's, so one may be missing: map it exactly
+        // from the vertex's chart on a surface of the same plane, or, on a
+        // plane, compute it from the vertex's certified position.
+        auto ensure_piece_chart = [&](int vid) {
+            if (chart(vid, g)) return;
+            const std::vector<Chart> own = im.vertices[static_cast<std::size_t>(vid)].charts;
+            for (const Chart& c : own) {
+                bool same = false;
+                for (int h : same_plane(g)) same = same || h == c.carrier;
+                if (!same) continue;
+                Chart m;
+                m.carrier = g;
+                map(c.carrier, g).apply(c.u, c.v, m.u, m.v);
+                im.vertices[static_cast<std::size_t>(vid)].charts.push_back(m);
+                return;
+            }
+            ensure_plane_chart(vid);
+        };
         // The face's own loops, split at the vertices on them.
         for (const auto& loop : face.loops)
             for (const BCoedge& ce : loop)
@@ -5337,7 +5399,13 @@ private:
                         // (it was split where it does).
                         const int far = !a ? p.v0 : p.v1;
                         if (solve::detail::boxes_disjoint(vertex_box(far), face_box[k][static_cast<std::size_t>(f)])) continue;
-                        return fail(name + ": a vertex of the other solid has no parameters on this face");
+                        // Near the face: the piece lies in its plane, and so do its
+                        // ends; give them parameters there.
+                        ensure_piece_chart(p.v0);
+                        ensure_piece_chart(p.v1);
+                        a = chart(p.v0, g);
+                        b = chart(p.v1, g);
+                        if (!a || !b) return fail(name + ": a vertex of the other solid has no parameters on this face");
                     }
                     mu = (a->u + b->u) * Interval(0.5);
                     mv = (a->v + b->v) * Interval(0.5);
@@ -5376,6 +5444,10 @@ private:
                 // reported below, never taken for a boundary piece.
                 if (!e.arc && w == Where::Boundary) continue;
                 if (w == Where::Outside) continue;
+                if (w == Where::Inside) {
+                    ensure_piece_chart(p.v0);
+                    ensure_piece_chart(p.v1);
+                }
                 if (w != Where::Inside) {
                     if (opt.trace) {
                         std::string s = name + " (surface " + sk(g) + "): piece " + str(pid) + " of the other solid's edge " +
@@ -5394,8 +5466,18 @@ private:
                     }
                     return fail(name + ": could not decide whether an edge of the other solid lies inside it");
                 }
-                if (!add_pair(p.v0, p.v1, Piece{false, pid, true, pid}))
+                if (!add_pair(p.v0, p.v1, Piece{false, pid, true, pid})) {
+                    if (opt.trace) {
+                        std::string s = name + " (surface " + sk(g) + "): piece " + str(pid) + " of the other solid's edge " + str(p.edge) +
+                                        (e.arc ? " (arc" : " (side") + " on surfaces " + sk(g0) + ", " + sk(g1) + "), vertices";
+                        for (int v : {p.v0, p.v1}) {
+                            s += " " + str(v) + (chart(v, g) ? "" : " (no chart)") + " on";
+                            for (const Chart& c : im.vertices[static_cast<std::size_t>(v)].charts) s += " " + sk(c.carrier);
+                        }
+                        note(s);
+                    }
                     return fail(name + ": a vertex of the other solid has no parameters on this face");
+                }
             }
 
         // A straight piece of the other solid that lies in this face along a
