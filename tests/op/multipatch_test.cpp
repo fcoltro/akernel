@@ -135,5 +135,20 @@ int main() {
         run("two spline boxes", A, op::to_brep(t.solid()), inA, [&](const Vec3d& p) { return t.inside(p); }, {-0.1, -0.1, -0.1},
             {1.5, 1.4, 1.1}, 404);
     }
+    // The quarter shell r in [1, 2] against a spline box whose bottom seam
+    // y = 1, z = 0.25 is tangent to the cylinder r = 1 at (0, 1, 0.25), inside
+    // the seam: a straight edge, in the plane y = 1 through it, which the
+    // cylinder meets only along its last ruling (in_plane_meeting_sides, a
+    // plane through the line and an axis).
+    {
+        const Spline t({-0.5, 0.5, 0.25}, 1, 1, 0.5, 2, 2, {0, 0, 0, 0, 0, 0.25, 0.125, 0, 0, 0.125, 0.25, 0, 0, 0, 0, 0});
+        run("shell and a spline box tangent inside a seam", op::to_brep(op::make_cylinder_sector(1.0, 2.0, 0.0, 1.0, 0.0, 1.0)),
+            op::to_brep(t.solid()),
+            [](const Vec3d& p) {
+                const double r = std::sqrt(p.x * p.x + p.y * p.y);
+                return r >= 1.0 && r <= 2.0 && p.x >= 0 && p.y >= 0 && p.z >= 0.0 && p.z <= 1.0;
+            },
+            [&](const Vec3d& p) { return t.inside(p); }, {-0.6, -0.1, -0.1}, {2.1, 2.1, 1.1}, 505);
+    }
     return akt::finish("multipatch_test");
 }

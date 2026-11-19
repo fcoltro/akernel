@@ -2484,23 +2484,36 @@ private:
         return false;
     }
 
-    /// Is side `side` of surface a a plane curve, in a plane that surface g
-    /// meets only along sides of g? The plane is spanned by the side's first,
-    /// second and last control points (exactly; collinear ones span none, and
-    /// then the plane function vanishes identically and nothing is claimed);
-    /// every control point of the side must lie in it, exactly.
+    /// Does side `side` of surface a lie in a plane that surface g meets only
+    /// along sides of g? The plane is spanned by the side's first and last
+    /// control points and a third point: its second control point (a plane
+    /// curve's own plane), or, for a straight side, its first point moved
+    /// along x, y or z (planes through the line; one may be tangent to g along
+    /// a ruling). Every control point of the side must lie in the plane,
+    /// exactly; three points on one line span none, the plane function then
+    /// vanishes identically, and nothing is claimed.
     bool in_plane_meeting_sides(int a, int side, int g) const {
         const auto cp = side_control(im.carriers[static_cast<std::size_t>(a)], side);
-        if (cp.size() < 3) return false; // a straight side: the plane is not determined by it
-        PolyPatchD P(1, 1);
-        P.at(0, 0) = cp.front();
-        P.at(1, 0) = cp[1];
-        P.at(0, 1) = cp.back();
-        P.at(1, 1) = cp.back();
         for (const Vec4d& c : cp)
-            if (!(c.w > 0.0) || contact_detail::det4(P.at(0, 0), P.at(1, 0), P.at(0, 1), c).sign() != 0) return false;
-        const SidesContact sc = sides_contact_flat(im.carriers[static_cast<std::size_t>(g)], P);
-        return sc.only_sides;
+            if (!(c.w > 0.0)) return false;
+        const Vec4d& A = cp.front();
+        std::vector<Vec4d> third;
+        if (cp.size() >= 3) third.push_back(cp[1]);
+        third.push_back({A.x + A.w, A.y, A.z, A.w});
+        third.push_back({A.x, A.y + A.w, A.z, A.w});
+        third.push_back({A.x, A.y, A.z + A.w, A.w});
+        for (const Vec4d& c3 : third) {
+            PolyPatchD P(1, 1);
+            P.at(0, 0) = A;
+            P.at(1, 0) = c3;
+            P.at(0, 1) = cp.back();
+            P.at(1, 1) = cp.back();
+            bool in = true;
+            for (const Vec4d& c : cp) in = in && contact_detail::det4(P.at(0, 0), P.at(1, 0), P.at(0, 1), c).sign() == 0;
+            if (!in) continue;
+            if (sides_contact_flat(im.carriers[static_cast<std::size_t>(g)], P).only_sides) return true;
+        }
+        return false;
     }
 
     /// A point where the crossing curve k = 0 touches a shared side from
