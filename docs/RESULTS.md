@@ -1301,3 +1301,56 @@ So the Boolean results are bitwise identical between Debug and Release; the rewr
 - Mesh self-intersection. Two faces that meet at a very small angle could give triangles that cross each other at a coarse chord; this is not checked.
 - Rigour of the completeness proof under a compiler that breaks strict IEEE semantics; only MSVC with `/fp:strict` was tested.
 - One limit of the surface/surface certificate on its own: where a curve ends on a domain boundary, it does not prove that the curve crosses the boundary instead of touching it and turning back. Inside a Boolean this is now proven, because each such end is matched to a regular edge/face root (§3); a stand-alone call to `solve::intersect` still has the limit.
+
+## 11. Generative surfaces and offset validity (features track, steps F1 and F2a)
+
+Measured on 2026-11-23 on Linux x64 with GCC 13.3 (`-O2 -ffp-contract=off -fno-fast-math`), single thread, from `tests/geom/sweep_test.cpp`, `tests/geom/offset_validity_test.cpp` and a timing driver over the same cases. This is not the MSVC setup of the other sections; the tests also build warning-free with Clang. Plan and literature: [FEATURES.md](FEATURES.md).
+
+### Exact generators (F1)
+
+| Construction | Check | Result |
+|---|---|---|
+| Exact circle, 1 to 4 quarter turns | every point on the circle; end angle | residual ≤ 1e-13 at 201 points each; end angle to 1e-14 |
+| Revolution: torus R = 3, r = 1 (16 Bézier pieces) | implicit equation at 51 × 51 points per piece | largest residual 3.4e-13 (the quartic's values reach about 1e3) |
+| Revolution: joints of a full turn | boundary rows of adjacent pieces | equal bitwise in homogeneous form, 36 of 36 |
+| Revolution: cone, sphere zone; extrusion: cylinder | implicit equations | ≤ 1e-13 |
+| Translational sweep, rational profile along a cubic | against P(u) + C(v) − C(0) | ≤ 1e-13 |
+| Ruled loft, rational circle to cubic | rails reproduced; rulings straight | ≤ 1e-13; ≤ 1e-12 |
+| Skinned loft through three circles, degree 2 | sections reproduced at 401 points each | largest deviation 9.9e-16 |
+| Skinned loft through identical sections | refused | refused (no surface returned) |
+
+Revolution multiplies control data only by 0, ±1, ±2 and powers of two, so the torus, cone and sphere patches lie on their surfaces exactly in real arithmetic; the residuals above are evaluation rounding.
+
+### Certified offset validity and curvature bounds (F2a)
+
+Offset validity: is $1 - d\kappa_i > 0$ for both principal curvatures everywhere on the patch? Cylinder of radius 2 (rational quarter, outward normal, $\kappa = -1/2$), the hill $z = 4u(1-u)v(1-v)$ (peak 0.25, saddles at the corners with $\kappa = \pm 4$), and the torus above.
+
+| Patch | Offset d | Verdict | Boxes | Time |
+|---|---|---|---|---|
+| cylinder | −1 | valid | 309 | 0.03 s |
+| cylinder | −1.9 | valid | 3,925 | 0.34 s |
+| cylinder | −1.99 | valid | 20,309 | 1.8 s |
+| cylinder | −1.999 | undecided (box budget 200,000) | 200,001 | 15 s |
+| cylinder | −2.1 | invalid, witness at the first box centre | 1 | < 1 ms |
+| hill | 0.24, −0.24 | valid | 21, 197 | ≤ 0.02 s |
+| hill | 0.26 | invalid | 8 | 1 ms |
+| torus, towards the tube centre | 0.9 | valid on all pieces; 1.1 invalid | | |
+| torus, away from the tube centre | 1.9 | valid on all pieces; 2.1 invalid (inner equator reaches the axis) | | |
+
+Certified bound on $\max\lvert\kappa\rvert$ over a uniform grid of boxes (exact values: 0.5 for the cylinder, 4 for the hill):
+
+| Grid | Cylinder | Hill |
+|---|---|---|
+| 8 × 8 | 4.84 | 6.20 |
+| 16 × 16 | 1.36 | 4.78 |
+| 32 × 32 | 0.603 | 4.32 |
+| 64 × 64 | 0.517 (0.45 s) | 4.14 (0.62 s) |
+| 128 × 128 | 0.503 (1.7 s) | 4.07 (2.7 s) |
+
+On 40 random biquadratic patches (half rational) with random offsets: 16 valid, 17 invalid, 7 undecided. Every valid verdict agrees with sampling at 65 × 65 points, every invalid witness violates the condition in doubles, and every undecided case has a sampled margin below 0.1, that is, an offset within 10 % of a focal point.
+
+What this shows and does not show:
+
+- The verdicts are proven: no box is called valid unless both conditions are positive on all of it in interval arithmetic. Undecided is returned near the focal boundary when the box budget runs out, never a guess.
+- The enclosure converges linearly with the box size. The rational quotient rule makes the direct interval enclosure useless on coarse boxes (on the cylinder, $|S_u \times S_v|^2$ encloses zero until boxes are 1/4 wide); the mean-value form fixes that, but deciding an offset within 0.5 % of a focal point still takes about 20,000 boxes. A second-order (Taylor-model) enclosure or a Bernstein form of the polynomial conditions would converge quadratically; that is the next speed step.
+- Only local validity. Global self-intersection (an offset passing the medial axis away from any focal point) needs the bottleneck search of FEATURES F2b.
