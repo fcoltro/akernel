@@ -170,7 +170,7 @@ Two designs are possible:
 - **A. Procedural carriers as the definition.** A carrier type defined by an equation (offset: $S + d\,n$; blend: the canal surface of a spine; sweep: profile in a frame), evaluated with certified enclosures (intervals through the square root of the normal). Intersection, classification and tessellation work through a carrier interface instead of `PolyPatch`. This is thesis T2 ("one definition, many certified evaluators") applied to features, and it is what keeps features free of stored tolerances. Cost: the certified solvers (solve/ssi.hpp, csi.hpp, contact_point.hpp) must be generalised from Bézier patches to the interface, and enclosures of procedural surfaces are looser than Bernstein hulls, so they are slower.
 - **B. Rational approximants with a certified deviation.** Fit a rational patch to the procedural surface and attach a certified bound on the distance between them. Decisions read the approximant. Cost: the fitted surface is the definition from then on, so the blend's contact with its supports is no longer exact; the edge between a support and its fillet must carry the deviation, which is a recorded tolerance (thesis T3 allows this, budgeted and local, but it is the commercial pattern).
 
-Recommendation: **A**, introduced gradually. Step F3a needs neither (its blends are rational). F2b and F3b need A. This is the decision to confirm with the project owner before F3b starts.
+Decision (2026-11-23, project owner): **A, procedural carriers as the definition**, introduced gradually. Step F3a needs neither (its blends are rational). F2b and F3b build on A.
 
 ---
 
@@ -186,7 +186,7 @@ The steps extend BLUEPRINT §5.3 as a seventh track, "Features". Cross-platform 
 | F2a | Certified local offset validity ($1 - d\kappa_i > 0$ on a whole patch: Valid, Invalid with witness, or Undecided) and certified bounds on $\max\lvert\kappa\rvert$, the largest safe fillet radius | — | **Done** (`geom/offset_validity.hpp`; RESULTS §11) |
 | F2b | Global offset validity: reach from F2a and certified bottleneck pairs; the same test for input-solid self-intersection | F2a, §5 for freeform | Open |
 | F3a | Constant-radius rolling-ball fillets and distance chamfers between planes and natural quadrics, as exact rational surfaces (cylinders, tori, cyclides), with contact curves as exact edges | F1, F2a | Next |
-| F3b | Rolling-ball fillets on freeform faces: spine as the certified intersection of two offset surfaces; contact curves as varieties in the supports' parameters | F2b, §5 (A) | Open |
+| F3b | Rolling-ball fillets on freeform faces: spine as the certified intersection of two offset surfaces; contact curves as varieties in the supports' parameters | F2b, procedural carriers (§5, decided) | Open |
 | F4 | Chamfers on freeform faces: distance–distance and distance–angle contact curves, ruled carrier | F3b | Open |
 | F5 | Blend topology: replace the edge by the blend face, trim the supports along contact curves, chain tangent edges, end caps | F3a, topo | Open |
 | F6 | The case library: overflow onto neighbouring faces, cliff edges, mitres, each detected by a certified predicate and reported when undecided | F5 | Open |
