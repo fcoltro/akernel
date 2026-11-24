@@ -1,6 +1,6 @@
 # Features on complex geometry: fillets, chamfers, sweeps and lofts
 
-Status: research notes and plan, version 0.18 (2026-11-23). Steps F1 and F2a below are implemented and tested (RESULTS §11); everything else is design.
+Status: research notes and plan, version 0.18 (2026-11-24). Steps F1, F2a and F3a are implemented and tested, and F3b is started: procedural carriers with certified enclosures and the certified spine of a rolling ball between freeform faces (RESULTS §11–12). Everything else is design.
 
 Booleans decide *where* two solids meet. Features decide *what new geometry* to put there, and they are where commercial kernels fail most visibly: a fillet that will not build, a blend that self-intersects, a sweep that folds over itself, a loft that twists. This document collects what the literature and the commercial kernels do, says where akernel's certified approach changes the picture and where it does not, and turns it into an ordered plan that extends the roadmap of [BLUEPRINT.md](BLUEPRINT.md) §5.3.
 
@@ -172,6 +172,8 @@ Two designs are possible:
 
 Decision (2026-11-23, project owner): **A, procedural carriers as the definition**, introduced gradually. Step F3a needs neither (its blends are rational). F2b and F3b build on A.
 
+First layer (2026-11-24). A carrier provides three evaluators: point and first partials in doubles (for Newton steps and seeds), a rigorous enclosure of the point at exact parameters, and rigorous enclosures of the point and first partials over a parameter box. That is exactly what the certified Newton–Krawczyk machinery of `solve/ssi.hpp` reads, so its routines are now templates over the system and work unchanged on any pair of carriers. The offset carrier's enclosures come from the base patch's homogeneous partials up to order 3 through the normal's derivative, intersected with a mean-value form so they converge as the box shrinks. The rolling-ball blend is then the certified spine (offset ∩ offset) plus the circular section at each spine point, with nothing fitted.
+
 ---
 
 ## 6. Plan
@@ -185,8 +187,8 @@ The steps extend BLUEPRINT §5.3 as a seventh track, "Features". Cross-platform 
 | F1c | Loft correspondence (seam alignment, twist control) and fold check; lofts with fairness as a variational problem with sections as constraints | F1, var | Open |
 | F2a | Certified local offset validity ($1 - d\kappa_i > 0$ on a whole patch: Valid, Invalid with witness, or Undecided) and certified bounds on $\max\lvert\kappa\rvert$, the largest safe fillet radius | — | **Done** (`geom/offset_validity.hpp`; RESULTS §11) |
 | F2b | Global offset validity: reach from F2a and certified bottleneck pairs; the same test for input-solid self-intersection | F2a, §5 for freeform | Open |
-| F3a | Constant-radius rolling-ball fillets and distance chamfers between planes and natural quadrics, as exact rational surfaces (cylinders, tori, cyclides), with contact curves as exact edges | F1, F2a | Next |
-| F3b | Rolling-ball fillets on freeform faces: spine as the certified intersection of two offset surfaces; contact curves as varieties in the supports' parameters | F2b, procedural carriers (§5, decided) | Open |
+| F3a | Constant-radius rolling-ball fillets between planes and natural quadrics, as exact rational surfaces | F1, F2a | **Done** for plane/plane (cylinder sectors) and for planes, cylinders, cones and spheres about one axis (torus zones), `geom/blend.hpp`. Open: quadrics in general position (cyclides), chamfers between quadrics |
+| F3b | Rolling-ball fillets on freeform faces: spine as the certified intersection of two offset surfaces; contact curves as varieties in the supports' parameters | F2b, procedural carriers (§5, decided) | **Started**: carrier interface with patch and offset carriers (`geom/carrier.hpp`); the Newton, Krawczyk and tracing routines of `solve/ssi.hpp` made generic over the system; certified spine tracing between freeform faces and the blend section at each spine point (`solve/carrier_ssi.hpp`). Open: seeding and completeness for carriers, a blend carrier for tessellation and further intersection |
 | F4 | Chamfers on freeform faces: distance–distance and distance–angle contact curves, ruled carrier | F3b | Open |
 | F5 | Blend topology: replace the edge by the blend face, trim the supports along contact curves, chain tangent edges, end caps | F3a, topo | Open |
 | F6 | The case library: overflow onto neighbouring faces, cliff edges, mitres, each detected by a certified predicate and reported when undecided | F5 | Open |

@@ -1354,3 +1354,31 @@ What this shows and does not show:
 - The verdicts are proven: no box is called valid unless both conditions are positive on all of it in interval arithmetic. Undecided is returned near the focal boundary when the box budget runs out, never a guess.
 - The enclosure converges linearly with the box size. The rational quotient rule makes the direct interval enclosure useless on coarse boxes (on the cylinder, $|S_u \times S_v|^2$ encloses zero until boxes are 1/4 wide); the mean-value form fixes that, but deciding an offset within 0.5 % of a focal point still takes about 20,000 boxes. A second-order (Taylor-model) enclosure or a Bernstein form of the polynomial conditions would converge quadratically; that is the next speed step.
 - Only local validity. Global self-intersection (an offset passing the medial axis away from any focal point) needs the bottleneck search of FEATURES F2b.
+
+## 12. Rolling-ball fillets and procedural carriers (features track, steps F3a and F3b)
+
+Measured on 2026-11-24, same Linux/GCC setup as §11, from `tests/geom/blend_test.cpp` (6,244 checks) and `tests/solve/carrier_test.cpp` (4,222 checks).
+
+### Exact fillets (F3a)
+
+| Fillet | Check | Result |
+|---|---|---|
+| Box edge, right angle, r = 0.5 | controls | contacts, corner and the weight 2 exact; setback exactly 0.5 |
+| | distance to the ball's axis at 200 points | equal to r to 1e-15 |
+| | normals at the contact lines against the faces' | parallel to 1e-15 (G1) |
+| 200 random edges, dihedral angles 6° to 172°, convex and concave, r in [0.05, 2] | centre at distance r from both planes; contacts on them; setback r tan(φ/2); points at distance r from the axis | all to 1e-13; G1 to 1e-12 |
+| Plane and cylinder (boss on a plate, R = 2, r = 1/4) | torus zone over a full turn | every control exact; torus residual below 1e-14; G1 with the plate and with the cylinder to 1e-14 |
+| Plane and cone; plane and sphere | torus residual, G1 with the sphere | below 1e-14; G1 to 1e-13 |
+| Bottom of a blind hole, R = 2 | r = 1.5 built; r = 2.5 refused (profile reaches the axis) | the certified offset test on the hole's wall agrees: valid at 1.5, invalid at 2.5 |
+| Folded faces, tangent faces, ball that cannot touch both | refused | refused, each with its reason |
+
+### Procedural carriers and certified spines (F3b, first layer)
+
+| Case | Result |
+|---|---|
+| Offset of a radius-2 cylinder by 0.5, at 200 random parameters | every point enclosure proven to contain a point of the radius-2.5 cylinder (x² + y² = 6.25), width below 1e-12 |
+| Box enclosures of point and first partials (offset cylinder, rational bicubic-by-quadratic offset, plain patches), 30 random boxes at two sizes, 10 samples each | every sample inside its enclosure; enclosure of S_u 10.8 wide on 1/8 boxes, 0.16 on 1/64 boxes |
+| Spine of a ball (r = 1/4) between a cylinder of radius 2 and the plane x = 1 | 14 certified tube segments across the cylinder's full height, both ends on the domain boundary; every segment end within 2.2e-16 of the exact spine line |
+| Spine of a ball (r = 0.1) between the freeform hill and a wall x = 0.6 | the certified offset test first proves the ball fits on the hill; 14 certified segments across the whole hill; at every segment end the centre is r from the wall and from the hill to 1.1e-16, and the section arc builds |
+
+What this does not show yet: spines found without a seed and proven complete (the completeness pass of `solve/ssi.hpp` subdivides Bézier patches and has not been generalised to carriers), the blend as a surface other code can intersect or tessellate, and trimming of the supports along the contact curves. Timing: the whole carrier test runs in 0.06 s.
