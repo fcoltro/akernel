@@ -272,5 +272,29 @@ int main() {
             }
         }
     }
+    // Operands whose boundaries do not meet: every part is placed by rays,
+    // against the blend too (certified ray crossings with the procedural
+    // face). A small box under the blend gives a cavity, one beside the
+    // block a second shell; with the block second, the box is kept or not.
+    if (rb.solid) {
+        const double vA = op::volume(*rb.solid);
+        const op::Brep in = op::to_brep(op::make_box({0.8, 0.9, 0.3}, {0.9, 1.0, 0.6}));
+        const op::Brep out = op::to_brep(op::make_box({1.2, 0.9, 0.3}, {1.3, 1.0, 0.6}));
+        const double vb = op::volume(in);
+        struct Case { const char* name; op::PolyOp o; const op::Brep* a; const op::Brep* b; double expect; };
+        const Case cases[] = {
+            {"block - inner box (cavity)", op::PolyOp::Difference, &*rb.solid, &in, vA - vb},
+            {"block + inner box", op::PolyOp::Union, &*rb.solid, &in, vA},
+            {"block & inner box", op::PolyOp::Intersection, &*rb.solid, &in, vb},
+            {"block + outer box (two shells)", op::PolyOp::Union, &*rb.solid, &out, vA + vb},
+            {"block - outer box", op::PolyOp::Difference, &*rb.solid, &out, vA},
+            {"inner box & block", op::PolyOp::Intersection, &in, &*rb.solid, vb},
+            {"outer box - block", op::PolyOp::Difference, &out, &*rb.solid, vb},
+        };
+        for (const Case& c : cases) {
+            const double v = check_result(c.name, c.o, op::poly_boolean(*c.a, *c.b, c.o));
+            AK_CHECK_NEAR(v, c.expect, 1e-12);
+        }
+    }
     return akt::finish("poly_boolean_test");
 }

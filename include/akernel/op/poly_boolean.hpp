@@ -43,6 +43,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -71,6 +72,99 @@ namespace poly_boolean_detail {
 
 using plane_cut_detail::signed_area;
 using plane_cut_detail::winding;
+
+/// A certified crossing of a ray with a carrier: (s, t) enclosed, the ray
+/// parameter's enclosure, and a unique root in the box.
+struct RayRoot {
+    Interval s, t, ray;
+};
+
+/// Every point where the ray X + r d (r > 0) meets the carrier over
+/// [0,1]^2, each certified unique in its box. Projected onto the plane
+/// across d, the ray is the origin, and the surface's image G(s, t) =
+/// (e1 . (S - X), e2 . (S - X)) has a zero at each crossing. Boxes whose
+/// image misses the origin, or that lie behind X, are dropped; the others
+/// are bisected until the 2-D Krawczyk operator maps a box into its
+/// interior (one root) or out of it (none). False when some box is still
+/// undecided at the depth limit (a tangent ray, a root on a box side): the
+/// caller tries another ray.
+inline bool ray_carrier_roots(const geom::Carrier& S, const Vec3d& X, const Vec3d& d, std::vector<RayRoot>& roots,
+                              int max_depth = 40, int max_boxes = 200000) {
+    roots.clear();
+    // e1, e2: an orthonormal pair across d (d is a unit vector).
+    const Vec3d a = std::fabs(d.x) < 0.6 ? Vec3d{1, 0, 0} : Vec3d{0, 1, 0};
+    Vec3d e1 = cross(d, a);
+    e1 = e1 / norm(e1);
+    const Vec3d e2 = cross(d, e1);
+    auto along = [](const geom::IVec3& P, const Vec3d& v) {
+        return Interval(v.x) * P.x + Interval(v.y) * P.y + Interval(v.z) * P.z;
+    };
+    const geom::IVec3 Xi{Interval(X.x), Interval(X.y), Interval(X.z)};
+    struct Box { double s0, s1, t0, t1; int depth; };
+    std::vector<Box> stack{{0.0, 1.0, 0.0, 1.0, 0}};
+    int boxes = 0;
+    while (!stack.empty()) {
+        const Box b = stack.back();
+        stack.pop_back();
+        if (++boxes > max_boxes) return false;
+        geom::IVec3 P, Ps, Pt;
+        if (!S.jet1_over(b.s0, b.s1, b.t0, b.t1, P, Ps, Pt)) return false;
+        const geom::IVec3 D{P.x - Xi.x, P.y - Xi.y, P.z - Xi.z};
+        const Interval g1 = along(D, e1), g2 = along(D, e2), r = along(D, d);
+        if (!num::contains_zero(g1) || !num::contains_zero(g2) || r.hi < 0.0) continue;
+        // Krawczyk on the box, centred at its midpoint.
+        const double sm = 0.5 * b.s0 + 0.5 * b.s1, tm = 0.5 * b.t0 + 0.5 * b.t1;
+        const Interval J[2][2] = {{along(Ps, e1), along(Pt, e1)}, {along(Ps, e2), along(Pt, e2)}};
+        bool decided = false;
+        const double m00 = num::mid(J[0][0]), m01 = num::mid(J[0][1]), m10 = num::mid(J[1][0]), m11 = num::mid(J[1][1]);
+        const double det = m00 * m11 - m01 * m10;
+        if (std::isfinite(det) && std::fabs(det) > 0.0) {
+            const double C[2][2] = {{m11 / det, -m01 / det}, {-m10 / det, m00 / det}};
+            const geom::IVec3 Pm = S.point_at(sm, tm);
+            const geom::IVec3 Dm{Pm.x - Xi.x, Pm.y - Xi.y, Pm.z - Xi.z};
+            const Interval gm[2] = {along(Dm, e1), along(Dm, e2)};
+            const Interval ds = Interval(b.s0, b.s1) - Interval(sm), dt = Interval(b.t0, b.t1) - Interval(tm);
+            Interval K[2];
+            const double mid[2] = {sm, tm};
+            for (int i = 0; i < 2; ++i) {
+                Interval k = Interval(mid[i]) - (Interval(C[i][0]) * gm[0] + Interval(C[i][1]) * gm[1]);
+                for (int j = 0; j < 2; ++j) {
+                    Interval e(i == j ? 1.0 : 0.0);
+                    e -= Interval(C[i][0]) * J[0][j] + Interval(C[i][1]) * J[1][j];
+                    k += e * (j == 0 ? ds : dt);
+                }
+                K[i] = k;
+            }
+            const Interval Bs(b.s0, b.s1), Bt(b.t0, b.t1);
+            if (num::is_finite(K[0]) && num::is_finite(K[1])) {
+                if (num::disjoint(K[0], Bs) || num::disjoint(K[1], Bt)) {
+                    decided = true; // no root in the box
+                } else if (num::strictly_inside(K[0], Bs) && num::strictly_inside(K[1], Bt)) {
+                    // One root in K; its ray parameter must be decided.
+                    geom::IVec3 Q, Qs, Qt;
+                    if (!S.jet1_over(K[0].lo, K[0].hi, K[1].lo, K[1].hi, Q, Qs, Qt)) return false;
+                    const Interval rr = along(geom::IVec3{Q.x - Xi.x, Q.y - Xi.y, Q.z - Xi.z}, d);
+                    if (rr.lo > 0.0) roots.push_back({K[0], K[1], rr});
+                    else if (rr.hi >= 0.0) return false; // the ray starts on the surface
+                    decided = true;
+                }
+            }
+        }
+        if (decided) continue;
+        if (b.depth >= max_depth) return false;
+        // Bisect the side that is longer in space.
+        const double ls = (b.s1 - b.s0) * num::mag(Ps.x) + (b.s1 - b.s0) * num::mag(Ps.y) + (b.s1 - b.s0) * num::mag(Ps.z);
+        const double lt = (b.t1 - b.t0) * num::mag(Pt.x) + (b.t1 - b.t0) * num::mag(Pt.y) + (b.t1 - b.t0) * num::mag(Pt.z);
+        if (ls >= lt || !std::isfinite(lt)) {
+            stack.push_back({b.s0, sm, b.t0, b.t1, b.depth + 1});
+            stack.push_back({sm, b.s1, b.t0, b.t1, b.depth + 1});
+        } else {
+            stack.push_back({b.s0, b.s1, b.t0, tm, b.depth + 1});
+            stack.push_back({b.s0, b.s1, tm, b.t1, b.depth + 1});
+        }
+    }
+    return true;
+}
 
 } // namespace poly_boolean_detail
 
@@ -693,21 +787,53 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
             }
         }
     };
-    double reach = 0.0;
-    bool P_rational = true;
-    for (int q = nfA; q < nF; ++q) P_rational = P_rational && M.faces[static_cast<std::size_t>(q)].proc < 0;
-    for (int q = nfA; q < nF && P_rational; ++q)
-        for (const geom::Vec4d& c : M.carriers[static_cast<std::size_t>(M.faces[static_cast<std::size_t>(q)].carrier)].c)
-            reach = std::max(reach, std::fabs(c.x / c.w) + std::fabs(c.y / c.w) + std::fabs(c.z / c.w));
-    auto inside_P = [&](const Vec3d& X, bool& inside) {
+    // A bound on |x| + |y| + |z| over each solid's faces, for the ray length.
+    double reach[2] = {0.0, 0.0};
+    for (int q = 0; q < nF; ++q) {
+        const BFace& Fq = M.faces[static_cast<std::size_t>(q)];
+        double& rq = reach[q < nfA ? 0 : 1];
+        if (Fq.proc < 0) {
+            for (const geom::Vec4d& c : M.carriers[static_cast<std::size_t>(Fq.carrier)].c)
+                rq = std::max(rq, std::fabs(c.x / c.w) + std::fabs(c.y / c.w) + std::fabs(c.z / c.w));
+        } else {
+            geom::IVec3 Pq, Ps, Pt;
+            if (fsurf[static_cast<std::size_t>(q)]->jet1_over(0.0, 1.0, 0.0, 1.0, Pq, Ps, Pt))
+                rq = std::max(rq, num::mag(Pq.x) + num::mag(Pq.y) + num::mag(Pq.z));
+            else
+                rq = std::numeric_limits<double>::infinity();
+        }
+    }
+    // Is X inside solid `other` (0 = A, 1 = P)? Parity of certified ray
+    // crossings with its faces, over up to four directions.
+    auto inside_of = [&](int other, const Vec3d& X, bool& inside) {
+        const int q0 = other == 0 ? 0 : nfA, q1 = other == 0 ? nfA : nF;
         static constexpr double dirs[4][3] = {{0.5377, 0.8339, 0.1258}, {-0.2769, 0.3319, 0.9018},
                                               {0.7254, -0.6131, 0.3127}, {-0.6490, -0.3035, 0.6976}};
-        const double Lr = 2.0 * (reach + std::fabs(X.x) + std::fabs(X.y) + std::fabs(X.z)) + 1.0;
+        const double Lr = 2.0 * (reach[other] + std::fabs(X.x) + std::fabs(X.y) + std::fabs(X.z)) + 1.0;
+        if (!std::isfinite(Lr)) return false;
         for (const auto& d : dirs) {
             const PolyPatchD ray = solve::make_line(X, X + Vec3d{d[0], d[1], d[2]} * Lr);
             int count = 0;
             bool valid = true;
-            for (int q = nfA; q < nF && valid; ++q) {
+            for (int q = q0; q < q1 && valid; ++q) {
+                if (M.faces[static_cast<std::size_t>(q)].proc >= 0) {
+                    // A procedural face: certified crossings with the whole ray.
+                    std::vector<poly_boolean_detail::RayRoot> rr;
+                    const Vec3d dir{d[0], d[1], d[2]};
+                    if (!poly_boolean_detail::ray_carrier_roots(*fsurf[static_cast<std::size_t>(q)], X, dir / norm(dir), rr)) {
+                        valid = false;
+                        break;
+                    }
+                    for (const auto& r : rr) {
+                        const double u = num::mid(r.s), v = num::mid(r.t);
+                        bool near = false;
+                        for (double du : {-1e-6, 1e-6})
+                            for (double dv : {-1e-6, 1e-6}) near = near || inside_face(q, u + du, v + dv) != inside_face(q, u, v);
+                        if (near) { valid = false; break; }
+                        if (inside_face(q, u, v)) ++count;
+                    }
+                    continue;
+                }
                 const PolyPatchD& C = M.carriers[static_cast<std::size_t>(M.faces[static_cast<std::size_t>(q)].carrier)];
                 const solve::CsiResult cs = solve::intersect_curve_surface(solve::CsiSystem(ray, C));
                 if (!cs.complete) { valid = false; break; }
@@ -732,12 +858,11 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
     for (std::size_t ri = 0; ri < regions.size(); ++ri) {
         Region& R = regions[ri];
         if (R.cls >= 0) continue;
-        if (solid_of_face(R.face) == 1) return fail("a part of the second operand never meets the first's boundary; not supported yet");
         const BEdge& e0 = E[static_cast<std::size_t>(R.loops[0][0].edge)];
         const Vec3d X = e0.proc ? e0.proc->point(0.5) : edge_point(e0, 0.5);
         bool inside = false;
-        if (!P_rational) return fail("a part of the first operand meets no curve, and the second has procedural faces; not supported yet");
-        if (!inside_P(X, inside)) return fail("a part of the first operand could not be placed inside or outside the second");
+        if (!inside_of(1 - solid_of_face(R.face), X, inside))
+            return fail("a part of one operand could not be placed inside or outside the other");
         R.cls = inside ? 1 : 0;
         propagate();
     }
