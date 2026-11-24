@@ -176,6 +176,26 @@ First layer (2026-11-24). A carrier provides three evaluators: point and first p
 
 ---
 
+### 5.1 Procedural faces in the B-rep (decided 2026-11-24)
+
+Decision (2026-11-24, project owner): a solid may have faces whose surface is a procedural carrier (`geom::Carrier`: offsets, rolling-ball blends, later sweeps). This is how a freeform fillet becomes part of a solid. The plan is to make checks, volume and meshing work on such solids first, and Booleans on those faces after.
+
+Data model, added to `op::Brep` without changing the rational path:
+
+- `Brep::procs`: the procedural carriers. A face with `proc >= 0` is that carrier over its whole parameter square. A blend is parametrised by sigma along the spine and theta across the section, so its square sides are the two contact curves and the two end sections.
+- Procedural edges. An edge that is a side of a procedural face is defined once, as that side. Each other face using the edge reads it through the carrier, in its own parameters:
+  - on a support it is a contact curve, whose parameters are the spine's own coordinates, with the same certified tubes;
+  - on a planar end face it is the end section, mapped by the plane's exact inverse.
+  
+  So the edge has one definition, as everywhere in the kernel, and no fitted trimming curve.
+- What reads which part:
+  - the audit reads only incidence, so it is unchanged;
+  - volume integrates S · n over procedural faces with the carrier's evaluator, and over trimmed rational faces by Green's theorem along the procedural edges' parameter curves;
+  - meshing samples each procedural edge once and shares the samples between its two faces, so the mesh stays watertight.
+- Booleans refuse procedural faces until their intersection code reads carriers. The certified carrier intersection already exists (`intersect_carriers`).
+
+First target: a block whose top is freeform, with the edge between the top and a side rounded. The top is chosen with zero slope across the two end planes, so each end section of the blend lies in its end plane, and the end faces are trimmed by a planar arc rather than by a cap.
+
 ## 6. Plan
 
 The steps extend BLUEPRINT §5.3 as a seventh track, "Features". Cross-platform work (Linux, macOS, CI) is deferred by decision of 2026-11-23.
