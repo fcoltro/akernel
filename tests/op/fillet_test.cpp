@@ -1,8 +1,9 @@
-// A fillet applied to a solid (op/fillet.hpp): one edge of a box rounded by
-// the exact rolling-ball fillet, with the supports trimmed along the contact
-// lines. The result must be a closed, regular shell with the exact volume,
-// tessellate watertight, and work as an operand of the Booleans (cuts
-// through the fillet included), each volume against a closed form.
+// Fillets and chamfers applied to solids (op/fillet.hpp): an edge of a box,
+// and circular edges of rings (plane meeting cylinder, the blend a torus zone
+// or a cone; a full turn is a closed chain of four edges), with the supports
+// trimmed along the contact curves. Every result must be a closed, regular
+// shell with exact (dyadic) controls and the closed-form volume, tessellate
+// watertight, and work as an operand of the Booleans.
 #include <akernel/op/boolean.hpp>
 #include <akernel/op/fillet.hpp>
 #include <akernel/op/tessellate.hpp>
@@ -24,9 +25,9 @@ double corner_area(double r, double w) {
     return r * w - (0.5 * w * std::sqrt(r * r - w * w) + 0.5 * r * r * std::asin(w / r));
 }
 
-void check_solid(const char* name, const op::Brep& b, double volume) {
+void check_solid(const char* name, const op::Brep& b, double volume, int euler = 2) {
     const auto rep = op::audit(b);
-    AK_CHECK(rep.closed() && rep.euler == 2);
+    AK_CHECK(rep.closed() && rep.euler == euler);
     const double v = op::volume(b);
     AK_CHECK_NEAR(v, volume, 1e-12);
     const op::TessResult t = op::tessellate(b);
@@ -40,6 +41,50 @@ void check_solid(const char* name, const op::Brep& b, double volume) {
     }
     std::printf("%s: %zu faces, volume %.15f (closed form %.15f), mesh deviation %.2e\n", name, b.faces.size(), v,
                 volume, dev);
+}
+
+/// Area and first moments of the section [0, a] x [0, b] with its corner
+/// (a, b) cut by `cut`.
+struct SectionMoments {
+    double area, mx, my; ///< integrals of 1, x and y
+};
+SectionMoments section(double a, double b, const op::EdgeCut& cut) {
+    SectionMoments m{a * b, a * b * a / 2, a * b * b / 2};
+    double ar, cx, cy; // the removed corner piece and its centroid
+    if (cut.kind == op::EdgeCut::Round) {
+        const double r = cut.dA, q = M_PI * r * r / 4, e = 4 * r / (3 * M_PI);
+        ar = r * r - q;
+        cx = (r * r * (a - r / 2) - q * (a - r + e)) / ar;
+        cy = (r * r * (b - r / 2) - q * (b - r + e)) / ar;
+    } else {
+        ar = cut.dA * cut.dB / 2;
+        cx = a - cut.dB / 3;
+        cy = b - cut.dA / 3;
+    }
+    m.area -= ar;
+    m.mx -= ar * cx;
+    m.my -= ar * cy;
+    return m;
+}
+
+/// Exact controls: every control of every face a dyadic rational; and no
+/// face with a singular point on a 21 x 21 grid.
+void check_faces(const char* name, const op::PatchSolid& s) {
+    bool dyadic = true;
+    double jmin = 1e300;
+    for (const auto& P : s.faces) {
+        for (const auto& h : P.c)
+            for (double x : {h.x, h.y, h.z, h.w}) dyadic = dyadic && std::ldexp(x, 20) == std::round(std::ldexp(x, 20));
+        const geom::BezierSurface S(P);
+        for (int i = 0; i <= 20; ++i)
+            for (int j = 0; j <= 20; ++j) {
+                const geom::Jet3 J = S.jet(i / 20.0, j / 20.0);
+                jmin = std::min(jmin, geom::norm(geom::cross(J[1], J[2])));
+            }
+    }
+    AK_CHECK(dyadic);
+    AK_CHECK(jmin > 1e-3);
+    std::printf("%s: controls dyadic %d, min |Su x Sv| %.3g\n", name, static_cast<int>(dyadic), jmin);
 }
 
 } // namespace
@@ -102,10 +147,91 @@ int main() {
         check_solid(k.name, res.solid, k.volume);
     }
 
+    // --- chamfers on the box ---------------------------------------------------
+    for (const op::EdgeCut cut : {op::EdgeCut::flat(0.5, 0.5), op::EdgeCut::flat(0.5, 0.75)}) {
+        const auto ch = op::blend_box_edge({0, 0, 0}, {a, 0, 0}, {0, b, 0}, {0, 0, c}, cut);
+        AK_CHECK(ch.solid.has_value());
+        if (!ch.solid) continue;
+        check_faces("chamfered box", *ch.solid);
+        check_solid("chamfered box", op::to_brep(*ch.solid), c * section(a, b, cut).area);
+    }
+
+    // --- rings: a circular edge between a flat face and a cylinder ------------
+    // The blend is a torus zone (fillet) or a cone (chamfer); with four
+    // quarters the edge is a closed chain and the ring has genus 1.
+    {
+        const double r0 = 1.0, r1 = 2.0, z0 = 0.0, z1 = 1.0;
+        struct Ring {
+            const char* name;
+            op::RingEdge edge;
+            op::EdgeCut cut;
+            int quarters;
+        };
+        const Ring rings[] = {
+            {"ring, outer top edge rounded, full turn", op::RingEdge::OuterTop, op::EdgeCut::round(0.25), 4},
+            {"ring, outer top edge rounded, one quarter", op::RingEdge::OuterTop, op::EdgeCut::round(0.25), 1},
+            {"ring, inner top edge rounded, three quarters", op::RingEdge::InnerTop, op::EdgeCut::round(0.5), 3},
+            {"ring, outer bottom edge rounded, half", op::RingEdge::OuterBottom, op::EdgeCut::round(0.25), 2},
+            {"ring, inner bottom edge chamfered, full turn", op::RingEdge::InnerBottom, op::EdgeCut::flat(0.25, 0.5), 4},
+        };
+        for (const Ring& rg : rings) {
+            const auto res = op::blend_ring_edge(r0, r1, z0, z1, rg.edge, rg.cut, rg.quarters);
+            AK_CHECK(res.solid.has_value());
+            if (!res.solid) {
+                std::printf("FAIL %s: %s\n", rg.name, res.error.c_str());
+                continue;
+            }
+            const bool outer = rg.edge == op::RingEdge::OuterTop || rg.edge == op::RingEdge::OuterBottom;
+            const SectionMoments m = section(r1 - r0, z1 - z0, rg.cut);
+            // Pappus: volume = angle * integral of rho over the section.
+            const double rho_moment = outer ? r0 * m.area + m.mx : r1 * m.area - m.mx;
+            const double volume = rg.quarters * (M_PI / 2) * rho_moment;
+            check_faces(rg.name, *res.solid);
+            check_solid(rg.name, op::to_brep(*res.solid), volume, rg.quarters == 4 ? 0 : 2);
+        }
+        // The rounded ring as an operand: keep the half y >= 0.
+        const auto full = op::blend_ring_edge(r0, r1, z0, z1, op::RingEdge::OuterTop, op::EdgeCut::round(0.25), 4);
+        if (full.solid) {
+            const auto res = op::boolean_op(op::to_brep(*full.solid),
+                                            op::to_brep(op::make_box({-3, 0.5, -1}, {3, 3, 2})),
+                                            op::Op::Intersection);
+            AK_CHECK(res.ok);
+            if (res.ok) {
+                const double v = op::volume(res.solid);
+                std::printf("rounded ring cut by y >= 1/2: %zu faces, volume %.12f, closed %d\n",
+                            res.solid.faces.size(), v, static_cast<int>(res.audit.closed()));
+                AK_CHECK(res.audit.closed());
+                // Reference by quadrature over the section: the angle range with
+                // rho sin(theta) >= 1/2 is pi - 2 asin(1 / (2 rho)).
+                const double rr = 0.25, A = r1 - r0, H = z1 - z0;
+                auto f = [&](double x) {
+                    const double rho = r0 + x;
+                    return rho * (M_PI - 2 * std::asin(0.5 / rho));
+                };
+                auto simpson = [](auto g, double lo, double hi, int n) {
+                    double sum = g(lo) + g(hi);
+                    for (int i = 1; i < n; ++i) sum += g(lo + (hi - lo) * i / n) * (i % 2 ? 4 : 2);
+                    return sum * (hi - lo) / (3 * n);
+                };
+                const double ref = simpson([&](double x) { return f(x) * H; }, 0, A - rr, 2000) +
+                                   simpson([&](double t) {
+                                       const double x = A - rr + rr * std::sin(t);
+                                       return f(x) * (H - rr + rr * std::cos(t)) * rr * std::cos(t);
+                                   }, 0, M_PI / 2, 2000);
+                std::printf("   reference by quadrature %.12f\n", ref);
+                AK_CHECK_NEAR(v, ref, 1e-9);
+            } else {
+                std::printf("FAIL rounded ring cut: %s\n", res.error.c_str());
+            }
+        }
+    }
+
     // Refusals.
     AK_CHECK(!op::fillet_box_edge({0, 0, 0}, {a, 0, 0}, {0, b, 0}, {0, 0, c}, 1.2).solid); // r > 2b/3
     AK_CHECK(!op::fillet_box_edge({0, 0, 0}, {a, 0, 0}, {0, b, 0}, {0, 0, c}, 0.0).solid);
     AK_CHECK(!op::fillet_box_edge({0, 0, 0}, {0, b, 0}, {a, 0, 0}, {0, 0, c}, r).solid); // left-handed
+    AK_CHECK(!op::blend_ring_edge(0.0, 1.0, 0.0, 1.0, op::RingEdge::OuterTop, op::EdgeCut::round(0.25)).solid);
+    AK_CHECK(!op::blend_box_edge({0, 0, 0}, {a, 0, 0}, {0, b, 0}, {0, 0, c}, op::EdgeCut{op::EdgeCut::Round, 0.25, 0.5}).solid);
 
     return akt::finish("fillet_test");
 }
