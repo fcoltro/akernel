@@ -1,35 +1,42 @@
 // akernel — Booleans between a solid that may have procedural faces and a
-// solid whose faces are all flat (docs/FEATURES.md §5.1; decided
-// 2026-11-24: cuts by planar solids first).
+// solid whose faces are all rational patches, flat or curved
+// (docs/FEATURES.md §5.1; decided 2026-11-24: cuts by planar solids first,
+// curved faces after).
 //
 // The rational Boolean engine (op/boolean.hpp) reads polynomial carriers
 // only. This one works on any surfaces of the first operand A (polynomial
 // or procedural, through geom::Carrier) and needs the second operand P to
-// be flat-faced, which keeps every new curve the intersection of one of A's
-// surfaces with a plane.
+// have polynomial carriers, so that a ray against P is a certified
+// line-surface intersection.
 //
-// 1. Where A's edges cross P's faces, and where P's edges pierce A's faces
-//    (along the curves of the next step), are new vertices.
-// 2. Every pair (face of A, face of P) whose enclosures meet is intersected
-//    by intersect_carriers (certified, complete). The pieces of each curve
-//    inside both faces are traced edges (op/proc_edge.hpp).
-// 3. Each face is split by the pieces lying on it: an arrangement in its
-//    parameters, traversed with the outgoing edges at each vertex sorted by
-//    angle; the cycles that are not outside the face are its regions.
+// 1. Every pair (face of A, face of P) whose enclosures meet is intersected
+//    by intersect_carriers (certified, complete), over the whole surfaces.
+// 2. New vertices: where a curve leaves one of its two faces it crosses an
+//    edge of that face (an edge of A crossing a face of P, or an edge of P
+//    piercing a face of A). The curves are complete, so walking them finds
+//    every such point; each is refined onto its edge by Gauss-Newton.
+// 3. The pieces of each curve inside both faces are traced edges
+//    (op/proc_edge.hpp). Each face is split by the pieces lying on it: an
+//    arrangement in its parameters, traversed with the outgoing edges at
+//    each vertex sorted by angle. Cycles running the face's way round are
+//    regions; cycles running the other way are holes in the region around
+//    them.
 // 4. Regions next to a curve are inside or outside the other solid by the
 //    side its outward normal points to; the others inherit it across the
-//    uncut edges they share, and A's remaining regions take a ray test
-//    against P.
+//    uncut edges they share, and a part of A no curve touches takes a ray
+//    test against P (certified line-surface roots).
 // 5. The result keeps A's regions outside P (union, difference) or inside
 //    it (intersection), and P's regions outside A (union), inside A
 //    (intersection) or inside A reversed (difference).
 //
-// Certified: the intersection curves and their completeness. Measured in
-// doubles, with refusals near a decision: where edges cross planes, which
-// pieces lie inside faces (winding on sampled loops), the order of edges
-// around vertices. Refused with a message for now: arc edges, faces of A
-// lying in a plane of P, curves closed inside a face, a P component that
-// never meets A's boundary.
+// Certified: the intersection curves and their completeness, and the ray
+// roots. Measured in doubles, with refusals near a decision: where a curve
+// leaves a face (winding on sampled loops, then refined), the order of edges
+// around vertices. Refused with a message for now: arc edges, faces with
+// inner loops in the operands, faces of the two solids on one surface,
+// curves through vertices, tangent contact, curves closed inside both
+// faces, and parts of the second solid that never meet the first's
+// boundary.
 #pragma once
 
 #include <algorithm>
@@ -46,6 +53,7 @@
 #include <akernel/op/plane_cut.hpp>
 #include <akernel/op/proc_edge.hpp>
 #include <akernel/solve/carrier_ssi.hpp>
+#include <akernel/solve/csi.hpp>
 
 namespace ak::op {
 
@@ -63,26 +71,6 @@ namespace poly_boolean_detail {
 using plane_cut_detail::signed_area;
 using plane_cut_detail::winding;
 
-/// Parameters of a point on a planar patch (Newton; exact for affine ones).
-inline bool plane_uv(const PolyPatchD& P, const Vec3d& X, double& u, double& v) {
-    u = v = 0.5;
-    const geom::BezierSurface S(P);
-    for (int it = 0; it < 60; ++it) {
-        const geom::Jet3 J = S.jet(u, v);
-        const Vec3d d = X - J[0];
-        const Vec3d& Su = J[static_cast<std::size_t>(geom::jet_index(1, 0))];
-        const Vec3d& Sv = J[static_cast<std::size_t>(geom::jet_index(0, 1))];
-        const double a11 = dot(Su, Su), a12 = dot(Su, Sv), a22 = dot(Sv, Sv);
-        const double b1 = dot(Su, d), b2 = dot(Sv, d), det = a11 * a22 - a12 * a12;
-        if (!(std::fabs(det) > 0.0)) return false;
-        const double du = (a22 * b1 - a12 * b2) / det, dv = (a11 * b2 - a12 * b1) / det;
-        u += du;
-        v += dv;
-        if (std::fabs(du) + std::fabs(dv) < 1e-16) break;
-    }
-    return std::isfinite(u) && std::isfinite(v);
-}
-
 } // namespace poly_boolean_detail
 
 inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, const solve::SsiOptions& opt = {}) {
@@ -98,7 +86,7 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
     for (const Brep* b : {&A, &P})
         for (const BEdge& e : b->edges)
             if (e.arc) return fail("arc edges are not supported by the polyhedral Boolean yet");
-    if (!P.procs.empty()) return fail("the second operand must have flat faces only");
+    if (!P.procs.empty()) return fail("the second operand must have polynomial (rational patch) faces only");
 
     // The merged model: A's carriers then P's, A's procs; vertices, edges and
     // faces of A then of P, with P's carrier indices shifted.
@@ -138,24 +126,6 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
         if (F.proc >= 0) fsurf[static_cast<std::size_t>(f)] = M.procs[static_cast<std::size_t>(F.proc)];
         else fsurf[static_cast<std::size_t>(f)] = std::make_shared<geom::PatchCarrier>(M.carriers[static_cast<std::size_t>(F.carrier)]);
     }
-    // P's planes, outward.
-    struct Plane {
-        Vec3d n;
-        double d;
-    };
-    std::vector<Plane> plane(static_cast<std::size_t>(nF));
-    for (int f = nfA; f < nF; ++f) {
-        const BFace& F = M.faces[static_cast<std::size_t>(f)];
-        const PolyPatchD& C = M.carriers[static_cast<std::size_t>(F.carrier)];
-        if (!planar_affine(C) && !same_plane_patches(C, C)) return fail("a face of the second operand is not flat");
-        Vec3d Q, Qu, Qv;
-        fsurf[static_cast<std::size_t>(f)]->eval(0.5, 0.5, Q, Qu, Qv);
-        Vec3d n = cross(Qu, Qv);
-        n = n / norm(n);
-        if (F.flipped) n = n * -1.0;
-        plane[static_cast<std::size_t>(f)] = {n, dot(n, Q)};
-    }
-
     // Edge evaluation, and an edge read in a face's parameters.
     auto edge_point = [&](const BEdge& e, double tau) {
         if (e.proc) return e.proc->point(tau);
@@ -221,79 +191,7 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
         if (!V.chart(carrier)) V.charts.push_back({carrier, Interval(u), Interval(v)});
     };
 
-    // 1a. A's edges crossing P's faces.
-    struct Split {
-        double tau;
-        int vertex;
-    };
-    std::vector<std::vector<Split>> splits(M.edges.size());
-    std::vector<std::pair<int, int>> vertex_on; // (vertex, P face) for crossings of A edges
-    for (int ei = 0; ei < neA; ++ei) {
-        const BEdge& e = M.edges[static_cast<std::size_t>(ei)];
-        const std::vector<double> bt = e.proc ? e.proc->breaks() : std::vector<double>{0.0, 1.0};
-        std::vector<double> taus;
-        for (std::size_t k = 0; k + 1 < bt.size(); ++k)
-            for (int i = 0; i < 32; ++i)
-                taus.push_back(bt[k] + (bt[k + 1] - bt[k]) * (i == 0 ? 0.0 : (i + 0.3819660112501051) / 32.5));
-        taus.push_back(1.0);
-        std::vector<Vec3d> pts(taus.size());
-        for (std::size_t i = 0; i < taus.size(); ++i) pts[i] = edge_point(e, taus[i]);
-        pts.front() = M.vertices[static_cast<std::size_t>(e.v0)].point;
-        pts.back() = M.vertices[static_cast<std::size_t>(e.v1)].point;
-        for (int q = nfA; q < nF; ++q) {
-            const Plane& H = plane[static_cast<std::size_t>(q)];
-            auto g = [&](const Vec3d& X) { return dot(H.n, X) - H.d; };
-            for (std::size_t i = 0; i + 1 < taus.size(); ++i) {
-                const double ga = g(pts[i]), gb = g(pts[i + 1]);
-                if ((ga < 0) == (gb < 0)) continue;
-                if (std::fabs(ga) < tol || std::fabs(gb) < tol) return fail("an edge of the first operand passes through a plane of the second at a vertex or sample");
-                double a = taus[i], b = taus[i + 1], gl = ga;
-                for (int it = 0; it < 80 && b - a > 1e-16; ++it) {
-                    const double m = 0.5 * (a + b), gm = g(edge_point(e, m));
-                    if ((gm < 0) == (gl < 0)) { a = m; gl = gm; }
-                    else b = m;
-                }
-                const double tau = 0.5 * (a + b);
-                const Vec3d X = edge_point(e, tau);
-                const int qc = M.faces[static_cast<std::size_t>(q)].carrier;
-                double qu, qv;
-                if (!plane_uv(M.carriers[static_cast<std::size_t>(qc)], X, qu, qv)) return fail("a point cannot be placed on a plane");
-                if (!inside_face(q, qu, qv)) continue;
-                const int vx = add_vertex(X);
-                add_chart(vx, qc, qu, qv);
-                for (int f : edge_faces[static_cast<std::size_t>(ei)]) {
-                    const BFace& F = M.faces[static_cast<std::size_t>(f)];
-                    if (F.proc >= 0) continue;
-                    double u, v, du, dv;
-                    if (!edge_uv(F, e, tau, u, v, du, dv)) return fail("an edge cannot be read in its face's parameters");
-                    add_chart(vx, F.carrier, u, v);
-                }
-                splits[static_cast<std::size_t>(ei)].push_back({tau, vx});
-                vertex_on.push_back({vx, q});
-            }
-            for (std::size_t i = 1; i + 1 < taus.size(); ++i)
-                if (std::fabs(g(pts[i])) < 1e-7) {
-                    // Only a problem where the point is on the face.
-                    double qu, qv;
-                    if (plane_uv(M.carriers[static_cast<std::size_t>(M.faces[static_cast<std::size_t>(q)].carrier)], pts[i], qu, qv) &&
-                        inside_face(q, qu, qv))
-                        return fail("an edge of the first operand nearly touches a face of the second");
-                }
-        }
-        for (int q = nfA; q < nF; ++q) {
-            const Plane& H = plane[static_cast<std::size_t>(q)];
-            for (int vx : {e.v0, e.v1})
-                if (std::fabs(dot(H.n, M.vertices[static_cast<std::size_t>(vx)].point) - H.d) < tol) {
-                    double qu, qv;
-                    if (plane_uv(M.carriers[static_cast<std::size_t>(M.faces[static_cast<std::size_t>(q)].carrier)],
-                                 M.vertices[static_cast<std::size_t>(vx)].point, qu, qv) &&
-                        inside_face(q, qu, qv))
-                        return fail("a vertex of the first operand lies on a face of the second");
-                }
-        }
-    }
-
-    // 2. Curves of (A face, P face) pairs.
+    // 1. Curves of (A face, P face) pairs whose enclosures meet.
     auto enclosure = [&](int f, geom::IVec3& box) {
         const BFace& F = M.faces[static_cast<std::size_t>(f)];
         if (F.proc >= 0) {
@@ -324,19 +222,13 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
     std::vector<CurveRec> curves;
     for (int fa = 0; fa < nfA; ++fa)
         for (int fp = nfA; fp < nF; ++fp) {
-            const Plane& H = plane[static_cast<std::size_t>(fp)];
-            if (fbox_ok[static_cast<std::size_t>(fa)]) {
+            if (fbox_ok[static_cast<std::size_t>(fa)] && fbox_ok[static_cast<std::size_t>(fp)]) {
                 const geom::IVec3& b = fbox[static_cast<std::size_t>(fa)];
-                const Interval gn = b.x * Interval(H.n.x) + b.y * Interval(H.n.y) + b.z * Interval(H.n.z) - Interval(H.d);
-                if (gn.lo > 0.0 || gn.hi < 0.0) continue; // the surface misses the plane
-                if (fbox_ok[static_cast<std::size_t>(fp)]) {
-                    const geom::IVec3& c = fbox[static_cast<std::size_t>(fp)];
-                    if (num::disjoint(b.x, c.x) || num::disjoint(b.y, c.y) || num::disjoint(b.z, c.z)) continue;
-                }
-                if (gn.hi - gn.lo < 1e-12) return fail("a face of the first operand lies in a plane of the second; not supported yet");
+                const geom::IVec3& c = fbox[static_cast<std::size_t>(fp)];
+                if (num::disjoint(b.x, c.x) || num::disjoint(b.y, c.y) || num::disjoint(b.z, c.z)) continue;
             }
             const solve::SsiResult sr = solve::intersect_carriers(*fsurf[static_cast<std::size_t>(fa)], *fsurf[static_cast<std::size_t>(fp)], opt);
-            if (!sr.complete) return fail("an intersection of two faces could not be proven complete");
+            if (!sr.complete) return fail("an intersection of two faces could not be proven complete (faces on one surface are not supported yet)");
             for (const solve::SsiCurve& c : sr.curves) {
                 auto te = std::make_shared<TracedEdge>();
                 te->a = fsurf[static_cast<std::size_t>(fa)];
@@ -352,87 +244,153 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
             }
         }
 
-    // 1b. P's edges piercing A's faces, found along the curves of one of the
-    // edge's two faces.
-    struct Pierce {
-        int vertex, edge, fa;
+    // 2. New vertices. A curve is traced over whole surfaces; where it leaves
+    // one of its two faces it crosses an edge of that face: an edge of A
+    // crossing a face of P, or an edge of P piercing a face of A. Every such
+    // point lies on a curve (the curves are complete), so walking the curves
+    // finds them all. Inside-ness is sampled along the curve (measured); each
+    // change is refined to the edge by Gauss-Newton on curve(sigma) = edge(tau).
+    struct Split {
+        double tau;
+        int vertex;
     };
-    std::vector<Pierce> pierces;
-    for (int ei = neA; ei < static_cast<int>(M.edges.size()); ++ei) {
-        const auto& ef = edge_faces[static_cast<std::size_t>(ei)];
-        if (ef.size() != 2) return fail("an edge of the second operand is not used by two faces");
-        const int q1 = ef[0], q2 = ef[1];
+    std::vector<std::vector<Split>> splits(M.edges.size());
+    struct Crossing {
+        int edge;
+        Vec3d X;
+        int vertex;
+    };
+    std::vector<Crossing> crossings;
+    std::vector<std::vector<std::pair<double, int>>> curve_on(curves.size());
+    auto curve_at = [&](const CurveRec& cr, double sg, solve::Pt4& x, Vec3d& X) {
+        if (!cr.te->path.point(cr.te->sys(), std::clamp(sg, 0.0, 1.0), x)) return false;
+        Vec3d Xu, Xv;
+        cr.te->a->eval(x[0], x[1], X, Xu, Xv);
+        return true;
+    };
+    // Closest approach of curve and edge near (sg, tau); returns the distance.
+    auto meet_edge = [&](const CurveRec& cr, int ei, double s_lo, double s_hi, double& sg, double& tau, Vec3d& X) {
         const BEdge& e = M.edges[static_cast<std::size_t>(ei)];
-        const Plane& H2 = plane[static_cast<std::size_t>(q2)];
-        for (const CurveRec& cr : curves) {
-            if (cr.fp != q1) continue;
-            const TracedEdge& te = *cr.te;
-            const auto sys = te.sys();
-            const int ns = 512;
-            std::vector<double> sg, gv;
-            for (int i = 0; i <= ns; ++i) {
-                const double s = (i + (i == 0 || i == ns ? 0.0 : 0.3819660112501051)) / ns;
-                solve::Pt4 x;
-                if (!te.path.point(sys, std::min(1.0, s), x)) return fail("an intersection curve could not be evaluated");
-                Vec3d X, Xu, Xv;
-                te.a->eval(x[0], x[1], X, Xu, Xv);
-                sg.push_back(std::min(1.0, s));
-                gv.push_back(dot(H2.n, X) - H2.d);
+        solve::Pt4 x;
+        auto C = [&](double s) {
+            Vec3d Y;
+            if (!curve_at(cr, s, x, Y)) Y = Vec3d{1e300, 1e300, 1e300};
+            return Y;
+        };
+        auto Ed = [&](double t) { return edge_point(e, std::clamp(t, 0.0, 1.0)); };
+        auto diff = [&](auto&& f, double t) {
+            const double h = 1e-7;
+            const double a = std::max(0.0, t - h), b = std::min(1.0, t + h);
+            return (f(b) - f(a)) / (b - a);
+        };
+        double d = 1e300;
+        for (int it = 0; it < 40; ++it) {
+            const Vec3d r = C(sg) - Ed(tau);
+            d = norm(r);
+            if (d < 1e-15) break;
+            const Vec3d Cs = diff(C, sg), Et = diff(Ed, tau);
+            const double a11 = dot(Cs, Cs), a12 = -dot(Cs, Et), a22 = dot(Et, Et);
+            const double b1 = -dot(Cs, r), b2 = dot(Et, r), det = a11 * a22 - a12 * a12;
+            if (!(std::fabs(det) > 0.0)) break;
+            const double ds = (a22 * b1 - a12 * b2) / det, dt = (a11 * b2 - a12 * b1) / det;
+            sg = std::clamp(sg + ds, s_lo, s_hi);
+            tau = std::clamp(tau + dt, 0.0, 1.0);
+            if (std::fabs(ds) + std::fabs(dt) < 1e-16) break;
+        }
+        X = C(sg);
+        return norm(X - Ed(tau));
+    };
+    // The edge of face f that the curve meets for sigma in [s_lo, s_hi]
+    // (starting at sg); -1 if none.
+    auto find_edge = [&](const CurveRec& cr, int f, double s_lo, double s_hi, double& sg, double& tau, Vec3d& X) {
+        Vec3d P0;
+        solve::Pt4 x0;
+        if (!curve_at(cr, sg, x0, P0)) return -1;
+        struct Cand {
+            double d, tau;
+            int edge;
+        };
+        std::vector<Cand> cand;
+        for (const auto& loop : M.faces[static_cast<std::size_t>(f)].loops)
+            for (const BCoedge& ce : loop) {
+                const BEdge& e = M.edges[static_cast<std::size_t>(ce.edge)];
+                Cand c{1e300, 0.0, ce.edge};
+                for (int k = 0; k <= 64; ++k) {
+                    const double t = k / 64.0, dd = norm(edge_point(e, t) - P0);
+                    if (dd < c.d) { c.d = dd; c.tau = t; }
+                }
+                cand.push_back(c);
             }
-            // The curve's ends lie on the plane q2 when the face q1 ends at
-            // the edge there (the usual case: the curve is traced inside q1's
-            // patch); crossings inside the curve are bracketed and bisected.
-            const bool end0 = std::fabs(gv.front()) < 1e-9, end1 = std::fabs(gv.back()) < 1e-9;
-            std::vector<double> hits;
-            if (end0) hits.push_back(0.0);
-            if (end1) hits.push_back(1.0);
-            for (int i = 0; i < ns; ++i) {
-                if ((i == 0 && end0) || (i + 1 == ns && end1)) continue;
-                if ((gv[static_cast<std::size_t>(i)] < 0) == (gv[static_cast<std::size_t>(i) + 1] < 0)) continue;
-                double a = sg[static_cast<std::size_t>(i)], b = sg[static_cast<std::size_t>(i) + 1], gl = gv[static_cast<std::size_t>(i)];
-                for (int it = 0; it < 80 && b - a > 1e-16; ++it) {
-                    const double m = 0.5 * (a + b);
-                    solve::Pt4 x;
-                    te.path.point(sys, m, x);
-                    Vec3d X, Xu, Xv;
-                    te.a->eval(x[0], x[1], X, Xu, Xv);
-                    const double gm = dot(H2.n, X) - H2.d;
-                    if ((gm < 0) == (gl < 0)) { a = m; gl = gm; }
-                    else b = m;
-                }
-                hits.push_back(0.5 * (a + b));
+        std::sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.d < b.d; });
+        int best = -1;
+        double bd = 1e-8;
+        for (std::size_t k = 0; k < std::min<std::size_t>(3, cand.size()); ++k) {
+            double s = sg, t = cand[k].tau;
+            Vec3d Y;
+            const double dd = meet_edge(cr, cand[k].edge, s_lo, s_hi, s, t, Y);
+            if (dd < bd) { bd = dd; best = cand[k].edge; sg = s; tau = t; X = Y; }
+        }
+        return best;
+    };
+    for (std::size_t ci = 0; ci < curves.size(); ++ci) {
+        const CurveRec& cr = curves[ci];
+        const int ns = 256;
+        std::vector<char> in_a(ns + 1), in_p(ns + 1);
+        for (int i = 0; i <= ns; ++i) {
+            solve::Pt4 x;
+            Vec3d X;
+            if (!curve_at(cr, static_cast<double>(i) / ns, x, X)) return fail("an intersection curve could not be evaluated");
+            in_a[static_cast<std::size_t>(i)] = inside_face(cr.fa, x[0], x[1]);
+            in_p[static_cast<std::size_t>(i)] = inside_face(cr.fp, x[2], x[3]);
+        }
+        // Events: (sigma guess, face whose boundary is crossed).
+        std::vector<std::pair<double, int>> events;
+        for (int i = 0; i < ns; ++i) {
+            const double sm = (i + 0.5) / ns;
+            if (in_a[static_cast<std::size_t>(i)] != in_a[static_cast<std::size_t>(i) + 1]) events.push_back({sm, cr.fa});
+            if (in_p[static_cast<std::size_t>(i)] != in_p[static_cast<std::size_t>(i) + 1]) events.push_back({sm, cr.fp});
+        }
+        // A curve's ends lie on the boundary of a surface's patch, which is
+        // often an edge of the face (a box face is its whole patch).
+        if (!cr.closed)
+            for (double se : {0.0, 1.0})
+                for (int f : {cr.fa, cr.fp}) events.push_back({se, f});
+        for (const auto& [s_guess, f] : events) {
+            double sg = s_guess, tau = 0.0;
+            Vec3d X;
+            const bool at_end = s_guess == 0.0 || s_guess == 1.0;
+            const double win = 1.5 / ns;
+            const int ei = find_edge(cr, f, std::max(0.0, s_guess - win), std::min(1.0, s_guess + win), sg, tau, X);
+            if (ei < 0) {
+                if (at_end) continue; // the end is off the face
+                return fail("an intersection curve leaves a face but meets none of its edges");
             }
-            for (double hit : hits) {
-                solve::Pt4 x;
-                te.path.point(sys, hit, x);
-                // On the edge's segment, and inside A's face.
-                const BEdge::SideRef* ref = side_on(e, M.faces[static_cast<std::size_t>(q1)].carrier);
-                if (!ref) return fail("an edge of the second operand is not a side of its face");
-                const double su = x[2], sv = x[3];
-                double t = (ref->side == 0 || ref->side == 2) ? su : sv;
-                if (ref->reversed) t = 1.0 - t;
-                const double t0 = num::mid(e.t0), t1 = num::mid(e.t1);
-                const double tau = (t - t0) / (t1 - t0);
-                if (!(tau > 1e-9 && tau < 1.0 - 1e-9)) {
-                    if (tau > -1e-9 && tau < 1.0 + 1e-9) return fail("a vertex of the second operand lies on a face of the first");
-                    continue;
-                }
-                if (!inside_face(cr.fa, x[0], x[1])) continue;
-                Vec3d X, Xu, Xv;
-                te.a->eval(x[0], x[1], X, Xu, Xv);
-                const int vx = add_vertex(X);
-                const BFace& FA = M.faces[static_cast<std::size_t>(cr.fa)];
-                if (FA.proc < 0) add_chart(vx, FA.carrier, x[0], x[1]);
-                for (int q : {q1, q2}) {
-                    const BEdge::SideRef* r = side_on(e, M.faces[static_cast<std::size_t>(q)].carrier);
-                    const double tt = t0 + tau * (t1 - t0);
-                    double u, v;
-                    side_uv(r->side, r->reversed ? 1.0 - tt : tt, u, v);
-                    add_chart(vx, M.faces[static_cast<std::size_t>(q)].carrier, u, v);
-                }
+            if (!(tau > tol && tau < 1.0 - tol)) return fail("an intersection passes through a vertex; not supported yet");
+            int vx = -1;
+            for (const Crossing& c : crossings)
+                if (c.edge == ei && norm(c.X - X) < 1e-7) vx = c.vertex;
+            if (vx < 0) {
+                vx = add_vertex(X);
+                crossings.push_back({ei, X, vx});
                 splits[static_cast<std::size_t>(ei)].push_back({tau, vx});
-                pierces.push_back({vx, ei, cr.fa});
+                for (int g : edge_faces[static_cast<std::size_t>(ei)]) {
+                    const BFace& F = M.faces[static_cast<std::size_t>(g)];
+                    if (F.proc >= 0) continue;
+                    double u, v, du, dv;
+                    if (!edge_uv(F, M.edges[static_cast<std::size_t>(ei)], tau, u, v, du, dv))
+                        return fail("an edge cannot be read in its face's parameters");
+                    add_chart(vx, F.carrier, u, v);
+                }
             }
+            solve::Pt4 x;
+            Vec3d Y;
+            curve_at(cr, sg, x, Y);
+            const BFace& FA = M.faces[static_cast<std::size_t>(cr.fa)];
+            if (FA.proc < 0) add_chart(vx, FA.carrier, x[0], x[1]);
+            add_chart(vx, M.faces[static_cast<std::size_t>(cr.fp)].carrier, x[2], x[3]);
+            bool seen = false;
+            for (const auto& o : curve_on[ci]) seen = seen || o.second == vx;
+            if (!seen) curve_on[ci].push_back({sg, vx});
         }
     }
 
@@ -476,67 +434,11 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
         int fa, fp;
     };
     std::map<int, CurveEdgeInfo> curve_edges;
-    for (const CurveRec& cr : curves) {
+    for (std::size_t ci = 0; ci < curves.size(); ++ci) {
+        const CurveRec& cr = curves[ci];
         const TracedEdge& te = *cr.te;
         const auto sys = te.sys();
-        // Points on this curve: crossings of fa's edges with fp, pierces of
-        // fp's edges through fa.
-        std::vector<int> pts; // vertices on the curve, located below by distance in space
-        const BFace& FA = M.faces[static_cast<std::size_t>(cr.fa)];
-        for (const auto& [vx, q] : vertex_on) {
-            if (q != cr.fp) continue;
-            // Is vx on one of fa's edges?
-            bool on_fa = false;
-            double u = 0, v = 0;
-            for (const BCoedge& ce : FA.loops[0])
-                for (const Split& s : splits[static_cast<std::size_t>(ce.edge)])
-                    if (s.vertex == vx) {
-                        double du, dv;
-                        on_fa = edge_uv(FA, M.edges[static_cast<std::size_t>(ce.edge)], s.tau, u, v, du, dv);
-                    }
-            if (on_fa) pts.push_back(vx);
-        }
-        for (const Pierce& p : pierces) {
-            if (p.fa != cr.fa) continue;
-            const auto& ef = edge_faces[static_cast<std::size_t>(p.edge)];
-            if (ef[0] != cr.fp && ef[1] != cr.fp) continue;
-            pts.push_back(p.vertex);
-        }
-        // Sample the curve.
-        const int ns = 512;
-        std::vector<solve::Pt4> smp(ns + 1);
-        std::vector<Vec3d> spt(ns + 1);
-        for (int i = 0; i <= ns; ++i) {
-            if (!te.path.point(sys, static_cast<double>(i) / ns, smp[static_cast<std::size_t>(i)])) return fail("an intersection curve could not be evaluated");
-            Vec3d Xu, Xv;
-            te.a->eval(smp[static_cast<std::size_t>(i)][0], smp[static_cast<std::size_t>(i)][1], spt[static_cast<std::size_t>(i)], Xu, Xv);
-        }
-        std::vector<std::pair<double, int>> on;
-        for (int vx : pts) {
-            const Vec3d X = M.vertices[static_cast<std::size_t>(vx)].point;
-            auto dist = [&](double s) {
-                solve::Pt4 x;
-                te.path.point(sys, s, x);
-                Vec3d Y, Yu, Yv;
-                te.a->eval(x[0], x[1], Y, Yu, Yv);
-                return norm(Y - X);
-            };
-            int best = 0;
-            double bd = 1e300;
-            for (int i = 0; i <= ns; ++i) {
-                const double dd = norm(spt[static_cast<std::size_t>(i)] - X);
-                if (dd < bd) { bd = dd; best = i; }
-            }
-            double a = std::max(0.0, (best - 1.0) / ns), b = std::min(1.0, (best + 1.0) / ns);
-            const double gr = 0.5 * (std::sqrt(5.0) - 1.0);
-            double c1 = b - gr * (b - a), c2 = a + gr * (b - a), f1 = dist(c1), f2 = dist(c2);
-            for (int it = 0; it < 100 && b - a > 1e-15; ++it) {
-                if (f1 < f2) { b = c2; c2 = c1; f2 = f1; c1 = b - gr * (b - a); f1 = dist(c1); }
-                else { a = c1; c1 = c2; f1 = f2; c2 = a + gr * (b - a); f2 = dist(c2); }
-            }
-            const double s = 0.5 * (a + b);
-            if (dist(s) < 1e-7) on.push_back({s, vx});
-        }
+        auto& on = curve_on[ci];
         std::sort(on.begin(), on.end());
         if (cr.closed && on.empty()) {
             solve::Pt4 x;
@@ -580,7 +482,7 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
     };
     struct Region {
         int face;
-        std::vector<BCoedge> loop;
+        std::vector<std::vector<BCoedge>> loops; ///< outer loop first, then holes
         std::vector<int> halves;
         int cls = -1; ///< 1 inside the other solid, 0 outside, -1 unknown
     };
@@ -640,6 +542,7 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
         // Next half after arriving by i: the outgoing half just clockwise of
         // the twin's direction (faces on the left).
         std::vector<char> used(H.size(), 0);
+        std::vector<std::vector<int>> cycles;
         for (std::size_t i0 = 0; i0 < H.size(); ++i0) {
             if (used[i0]) continue;
             std::vector<int> cyc;
@@ -657,12 +560,69 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
                 const int n = static_cast<int>(list.size());
                 i = list[static_cast<std::size_t>((pos - 1 + n) % n)];
             }
-            if (outside) continue;
+            if (!outside) cycles.push_back(std::move(cyc));
+        }
+        // A cycle running the same way round as the face's own loop bounds a
+        // region; one running the other way is a hole (a closed chain of
+        // curves) in the smallest such region around it.
+        auto cycle_poly = [&](const std::vector<int>& cyc) {
+            std::vector<std::array<double, 2>> poly;
+            for (int h : cyc) {
+                const Half& hh = H[static_cast<std::size_t>(h)];
+                const BEdge& e = E[static_cast<std::size_t>(hh.edge)];
+                for (int k = 0; k < 16; ++k) {
+                    const double tau = hh.rev ? 1.0 - k / 16.0 : k / 16.0;
+                    double u = 0, v = 0, du, dv;
+                    if (e.proc && F.proc >= 0) e.proc->on_proc(F.proc, tau, u, v);
+                    else if (e.proc) e.proc->on_carrier(F.carrier, tau, u, v, du, dv);
+                    else edge_uv(F, e, tau, u, v, du, dv);
+                    poly.push_back({u, v});
+                }
+            }
+            return poly;
+        };
+        const double face_sign = signed_area(outline[static_cast<std::size_t>(f)]) > 0.0 ? 1.0 : -1.0;
+        std::vector<std::vector<std::array<double, 2>>> polys;
+        std::vector<double> areas;
+        for (const auto& cyc : cycles) {
+            polys.push_back(cycle_poly(cyc));
+            areas.push_back(signed_area(polys.back()) * face_sign);
+        }
+        // The island inside a hole runs along the same curves the other way:
+        // it is never the hole's owner.
+        auto share_edge = [&](const std::vector<int>& a, const std::vector<int>& b) {
+            for (int x : a)
+                for (int y : b)
+                    if (H[static_cast<std::size_t>(x)].edge == H[static_cast<std::size_t>(y)].edge) return true;
+            return false;
+        };
+        std::vector<int> owner(cycles.size(), -1);
+        for (std::size_t c = 0; c < cycles.size(); ++c) {
+            if (areas[c] > 0.0) continue;
+            double best = 1e300;
+            for (std::size_t o = 0; o < cycles.size(); ++o)
+                if (areas[o] > 0.0 && areas[o] < best && !share_edge(cycles[o], cycles[c]) &&
+                    winding(polys[o], polys[c][0][0], polys[c][0][1]) != 0) {
+                    best = areas[o];
+                    owner[c] = static_cast<int>(o);
+                }
+            if (owner[c] < 0) return fail("a closed chain of curves in a face lies in no region of it");
+        }
+        for (std::size_t c0 = 0; c0 < cycles.size(); ++c0) {
+            if (!(areas[c0] > 0.0)) continue;
             Region R;
             R.face = f;
-            for (int h : cyc) {
-                R.loop.push_back({H[static_cast<std::size_t>(h)].edge, H[static_cast<std::size_t>(h)].rev});
-                R.halves.push_back(h);
+            std::vector<int> cyc;
+            for (std::size_t c = 0; c < cycles.size(); ++c) {
+                if (c != c0 && owner[c] != static_cast<int>(c0)) continue;
+                std::vector<BCoedge> L;
+                for (int h : cycles[c]) {
+                    L.push_back({H[static_cast<std::size_t>(h)].edge, H[static_cast<std::size_t>(h)].rev});
+                    R.halves.push_back(h);
+                    cyc.push_back(h);
+                }
+                if (c == c0) R.loops.insert(R.loops.begin(), std::move(L));
+                else R.loops.push_back(std::move(L));
             }
             // Classification from a curve on its boundary: the region lies on
             // the left of the half; inside the other solid if that side is
@@ -703,39 +663,66 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
     }
 
     // 4. Unclassified regions inherit across shared boundary pieces (same
-    // solid), then A's remaining ones take a ray test against P.
-    for (bool changed = true; changed;) {
-        changed = false;
-        for (const auto& rs : regions_of_edge) {
-            if (rs.size() != 2) continue;
-            Region& a = regions[static_cast<std::size_t>(rs[0])];
-            Region& b = regions[static_cast<std::size_t>(rs[1])];
-            if (solid_of_face(a.face) != solid_of_face(b.face)) continue;
-            if (a.cls < 0 && b.cls >= 0) { a.cls = b.cls; changed = true; }
-            else if (b.cls < 0 && a.cls >= 0) { b.cls = a.cls; changed = true; }
+    // solid). A part of A that no curve touches takes a ray test against P:
+    // the parity of certified line-surface roots inside P's faces, from a
+    // point on the part's boundary; one test per part, then inheritance again.
+    auto propagate = [&] {
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (const auto& rs : regions_of_edge) {
+                if (rs.size() != 2) continue;
+                Region& a = regions[static_cast<std::size_t>(rs[0])];
+                Region& b = regions[static_cast<std::size_t>(rs[1])];
+                if (solid_of_face(a.face) != solid_of_face(b.face)) continue;
+                if (a.cls < 0 && b.cls >= 0) { a.cls = b.cls; changed = true; }
+                else if (b.cls < 0 && a.cls >= 0) { b.cls = a.cls; changed = true; }
+            }
         }
-    }
-    for (Region& R : regions) {
+    };
+    double reach = 0.0;
+    for (int q = nfA; q < nF; ++q)
+        for (const geom::Vec4d& c : M.carriers[static_cast<std::size_t>(M.faces[static_cast<std::size_t>(q)].carrier)].c)
+            reach = std::max(reach, std::fabs(c.x / c.w) + std::fabs(c.y / c.w) + std::fabs(c.z / c.w));
+    auto inside_P = [&](const Vec3d& X, bool& inside) {
+        static constexpr double dirs[4][3] = {{0.5377, 0.8339, 0.1258}, {-0.2769, 0.3319, 0.9018},
+                                              {0.7254, -0.6131, 0.3127}, {-0.6490, -0.3035, 0.6976}};
+        const double Lr = 2.0 * (reach + std::fabs(X.x) + std::fabs(X.y) + std::fabs(X.z)) + 1.0;
+        for (const auto& d : dirs) {
+            const PolyPatchD ray = solve::make_line(X, X + Vec3d{d[0], d[1], d[2]} * Lr);
+            int count = 0;
+            bool valid = true;
+            for (int q = nfA; q < nF && valid; ++q) {
+                const PolyPatchD& C = M.carriers[static_cast<std::size_t>(M.faces[static_cast<std::size_t>(q)].carrier)];
+                const solve::CsiResult cs = solve::intersect_curve_surface(solve::CsiSystem(ray, C));
+                if (!cs.complete) { valid = false; break; }
+                for (const solve::CsiRoot& r : cs.roots) {
+                    const double t = num::mid(r.enc[0]), u = num::mid(r.enc[1]), v = num::mid(r.enc[2]);
+                    if (!(r.enc[0].lo > 1e-9 && r.enc[0].hi < 1.0)) { valid = false; break; } // starts on a surface
+                    if (!(u > -1e-12 && u < 1.0 + 1e-12 && v > -1e-12 && v < 1.0 + 1e-12)) continue;
+                    // Near a face boundary the winding test is a measurement: try another ray.
+                    bool near = false;
+                    for (double du : {-1e-6, 1e-6})
+                        for (double dv : {-1e-6, 1e-6}) near = near || inside_face(q, u + du, v + dv) != inside_face(q, u, v);
+                    if (near) { valid = false; break; }
+                    if (inside_face(q, u, v)) ++count;
+                    (void)t;
+                }
+            }
+            if (valid) { inside = count % 2 == 1; return true; }
+        }
+        return false;
+    };
+    propagate();
+    for (std::size_t ri = 0; ri < regions.size(); ++ri) {
+        Region& R = regions[ri];
         if (R.cls >= 0) continue;
         if (solid_of_face(R.face) == 1) return fail("a part of the second operand never meets the first's boundary; not supported yet");
-        // A point of the region: a vertex of its loop, nudged is not needed
-        // for parity against flat faces unless it lies on one.
-        const BEdge& e0 = E[static_cast<std::size_t>(R.loop[0].edge)];
+        const BEdge& e0 = E[static_cast<std::size_t>(R.loops[0][0].edge)];
         const Vec3d X = e0.proc ? e0.proc->point(0.5) : edge_point(e0, 0.5);
-        // Ray in an irrational direction; parity of crossings with P's faces.
-        const Vec3d dir = Vec3d{0.5773502691896258, 0.6123724356957945, 0.5400617248673217};
-        int crossings = 0;
-        for (int q = nfA; q < nF; ++q) {
-            const Plane& Hq = plane[static_cast<std::size_t>(q)];
-            const double den = dot(Hq.n, dir);
-            if (std::fabs(den) < 1e-12) continue;
-            const double t = (Hq.d - dot(Hq.n, X)) / den;
-            if (!(t > 1e-12)) continue;
-            double qu, qv;
-            if (!plane_uv(M.carriers[static_cast<std::size_t>(M.faces[static_cast<std::size_t>(q)].carrier)], X + dir * t, qu, qv)) continue;
-            if (inside_face(q, qu, qv)) ++crossings;
-        }
-        R.cls = crossings % 2;
+        bool inside = false;
+        if (!inside_P(X, inside)) return fail("a part of the first operand could not be placed inside or outside the second");
+        R.cls = inside ? 1 : 0;
+        propagate();
     }
 
     // 5. Selection and assembly.
@@ -758,25 +745,27 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
         nf.carrier = F.carrier;
         nf.proc = F.proc;
         nf.flipped = reverse ? !F.flipped : F.flipped;
-        std::vector<BCoedge> L;
-        for (const BCoedge& ce : R.loop) {
-            int& id = emap[static_cast<std::size_t>(ce.edge)];
-            if (id < 0) {
-                BEdge ne = E[static_cast<std::size_t>(ce.edge)];
-                for (int* vp : {&ne.v0, &ne.v1}) {
-                    int& vm = vmap[static_cast<std::size_t>(*vp)];
-                    if (vm < 0) {
-                        vm = static_cast<int>(out.vertices.size());
-                        out.vertices.push_back(M.vertices[static_cast<std::size_t>(*vp)]);
+        for (const auto& loop : R.loops) {
+            std::vector<BCoedge> L;
+            for (const BCoedge& ce : loop) {
+                int& id = emap[static_cast<std::size_t>(ce.edge)];
+                if (id < 0) {
+                    BEdge ne = E[static_cast<std::size_t>(ce.edge)];
+                    for (int* vp : {&ne.v0, &ne.v1}) {
+                        int& vm = vmap[static_cast<std::size_t>(*vp)];
+                        if (vm < 0) {
+                            vm = static_cast<int>(out.vertices.size());
+                            out.vertices.push_back(M.vertices[static_cast<std::size_t>(*vp)]);
+                        }
+                        *vp = vm;
                     }
-                    *vp = vm;
+                    id = static_cast<int>(out.edges.size());
+                    out.edges.push_back(ne);
                 }
-                id = static_cast<int>(out.edges.size());
-                out.edges.push_back(ne);
+                L.push_back({id, ce.reversed});
             }
-            L.push_back({id, ce.reversed});
+            nf.loops.push_back(std::move(L));
         }
-        nf.loops.push_back(std::move(L));
         out.faces.push_back(std::move(nf));
     }
     if (out.faces.empty()) return fail("the result is empty");

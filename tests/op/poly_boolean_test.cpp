@@ -1,11 +1,12 @@
-// Booleans between a solid with procedural faces and a flat-faced solid
-// (op/poly_boolean.hpp). Every result must be a closed shell that meshes
+// Booleans between a solid with procedural faces and a solid with rational
+// faces, flat or curved (op/poly_boolean.hpp). Every result must be a closed shell that meshes
 // watertight; the volumes must satisfy the inclusion-exclusion identities,
 // match closed forms where there are some, and match the same region cut
 // out by successive plane cuts (op/plane_cut.hpp), an independent route.
 #include <akernel/op/plane_cut.hpp>
 #include <akernel/op/poly_boolean.hpp>
 #include <akernel/op/proc_fillet.hpp>
+#include <akernel/op/surfaces.hpp>
 #include <akernel/op/tessellate.hpp>
 
 #include <cmath>
@@ -67,6 +68,18 @@ Vols check_all(const char* name, const op::Brep& A, const op::Brep& P, double to
     AK_CHECK_NEAR(w.uni + w.inter, vA + vP, tol);
     AK_CHECK_NEAR(w.diff + w.inter, vA, tol);
     return w;
+}
+
+/// A solid moved by t (exact for dyadic t and control points).
+op::Brep moved(op::Brep B, const Vec3d& t) {
+    for (op::PolyPatchD& C : B.carriers)
+        for (geom::Vec4d& c : C.c) {
+            c.x += t.x * c.w;
+            c.y += t.y * c.w;
+            c.z += t.z * c.w;
+        }
+    for (op::BVertex& v : B.vertices) v.point = v.point + t;
+    return B;
 }
 
 /// A cut to the box lo..hi by its six planes.
@@ -150,6 +163,18 @@ int main() {
         AK_CHECK_NEAR(w.diff, 1.0 - 0.175, 1e-12);
     }
 
+    // A cube and a sector of a thick cylinder wall (quarter turn, radii 1/8
+    // and 3/8, axis vertical through (1/4, 1/4)) standing through its top:
+    // curved faces of the second operand, closed forms.
+    {
+        const op::Brep A = op::to_brep(op::make_box(Vec3d{0, 0, 0}, Vec3d{1, 1, 1}));
+        const op::Brep P = moved(op::to_brep(op::make_cylinder_sector(0.125, 0.375, 0.0, 1.0, 0.5, 1.5)), {0.25, 0.25, 0.0});
+        const double pi = 3.14159265358979323846, area = pi / 4 * (0.375 * 0.375 - 0.125 * 0.125);
+        const Vols w = check_all("cube and cylinder sector", A, P, 1e-11);
+        AK_CHECK_NEAR(w.inter, area * 0.5, 1e-11);
+        AK_CHECK_NEAR(w.diff, 1.0 - area * 0.5, 1e-11);
+    }
+
     // The rounded freeform block (a = 1, L = 2, h = 3/4, r = 1/4, c = 1/2)
     // and a box notch through the blend, the top and the side: the
     // intersection is compared with six plane cuts of the block.
@@ -170,6 +195,21 @@ int main() {
         std::printf("  intersection by slices %.15f, difference %.2e\n", boxpart - removed, w.inter - (boxpart - removed));
         AK_CHECK_NEAR(w.inter, boxpart - removed, 2e-11);
         AK_CHECK_NEAR(w.inter, cuts, 1e-11);
+
+        // A cylinder sector (radii 1/16 and 1/2, from -90 to 0 degrees, axis
+        // vertical through (5/8, 11/8)) whose outer wall cuts through the
+        // blend, the top and the side: the blend against a cylinder. The
+        // same volumes when both solids move together.
+        const op::Brep Sec = moved(op::to_brep(op::make_cylinder_sector(0.0625, 0.5, -1.0, 0.0, 0.3, 2.0)), {0.625, 1.375, 0.0});
+        const Vols c1 = check_all("rounded block and cylinder sector", *rb.solid, Sec, 1e-11);
+        const Vec3d shift{0.5, -0.5, 0.0};
+        const op::ProcFilletResult rb2 = op::round_block_edge(top_patch(a, L, h, c, shift.x, shift.y), r);
+        if (rb2.solid) {
+            const op::PolyBooleanResult m = op::poly_boolean(*rb2.solid, moved(Sec, shift), op::PolyOp::Intersection);
+            const double v2 = check_result("same, moved", op::PolyOp::Intersection, m);
+            std::printf("  difference %.2e\n", v2 - c1.inter);
+            AK_CHECK_NEAR(v2, c1.inter, 1e-11);
+        }
     }
     return akt::finish("poly_boolean_test");
 }
