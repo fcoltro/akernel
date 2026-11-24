@@ -27,7 +27,6 @@ jobs:
         include:
           - name: Windows MSVC Release
             os: windows-latest
-            generator: Visual Studio 17 2022
             config: Release
           - name: Linux GCC Release
             os: ubuntu-24.04
@@ -46,7 +45,7 @@ jobs:
             config: Debug
             cxxflags: -D_GLIBCXX_ASSERTIONS
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Ninja
         if: runner.os == 'Linux'
         run: sudo apt-get install -y ninja-build
@@ -54,9 +53,11 @@ jobs:
         shell: bash
         run: |
           args=()
+          # Windows: CMake picks the newest Visual Studio on the runner.
+          [ -n "${{ matrix.generator }}" ] && args+=(-G "${{ matrix.generator }}")
           [ -n "${{ matrix.cxx }}" ] && args+=("-DCMAKE_CXX_COMPILER=${{ matrix.cxx }}")
           [ -n "${{ matrix.cxxflags }}" ] && args+=("-DCMAKE_CXX_FLAGS=${{ matrix.cxxflags }}")
-          cmake -S . -B build -G "${{ matrix.generator }}" -DCMAKE_BUILD_TYPE=${{ matrix.config }} "${args[@]}"
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.config }} "${args[@]}"
       - name: Build
         run: cmake --build build --config ${{ matrix.config }} --parallel 4
       - name: Test
@@ -67,7 +68,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Ninja and the sanitizer runtimes
         run: sudo apt-get install -y ninja-build libclang-rt-18-dev
       - name: Configure
@@ -94,7 +95,6 @@ jobs:
         include:
           - name: windows-msvc
             os: windows-latest
-            generator: Visual Studio 17 2022
           - name: linux-gcc
             os: ubuntu-24.04
             cxx: g++
@@ -104,7 +104,7 @@ jobs:
             cxx: clang++
             generator: Ninja
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Ninja
         if: runner.os == 'Linux'
         run: sudo apt-get install -y ninja-build
@@ -112,8 +112,10 @@ jobs:
         shell: bash
         run: |
           args=()
+          # Windows: CMake picks the newest Visual Studio on the runner.
+          [ -n "${{ matrix.generator }}" ] && args+=(-G "${{ matrix.generator }}")
           [ -n "${{ matrix.cxx }}" ] && args+=("-DCMAKE_CXX_COMPILER=${{ matrix.cxx }}")
-          cmake -S . -B build -G "${{ matrix.generator }}" -DCMAKE_BUILD_TYPE=Release "${args[@]}"
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release "${args[@]}"
           cmake --build build --config Release --target ak_bench --parallel 4
       - name: Run
         shell: bash
@@ -135,7 +137,7 @@ jobs:
     needs: bench
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
           pattern: hashes-*
