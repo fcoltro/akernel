@@ -1,0 +1,152 @@
+# Build and test on Windows (MSVC) and Linux (GCC, Clang), run the tests under
+# AddressSanitizer and UndefinedBehaviorSanitizer, and check that the benchmark
+# gives the same result hashes on Windows and on Linux.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows MSVC Release
+            os: windows-latest
+            generator: Visual Studio 17 2022
+            config: Release
+          - name: Linux GCC Release
+            os: ubuntu-24.04
+            cxx: g++
+            generator: Ninja
+            config: Release
+          - name: Linux Clang Release
+            os: ubuntu-24.04
+            cxx: clang++
+            generator: Ninja
+            config: Release
+          - name: Linux GCC Debug, checked library
+            os: ubuntu-24.04
+            cxx: g++
+            generator: Ninja
+            config: Debug
+            cxxflags: -D_GLIBCXX_ASSERTIONS
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Ninja
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y ninja-build
+      - name: Configure
+        shell: bash
+        run: |
+          args=()
+          [ -n "${{ matrix.cxx }}" ] && args+=("-DCMAKE_CXX_COMPILER=${{ matrix.cxx }}")
+          [ -n "${{ matrix.cxxflags }}" ] && args+=("-DCMAKE_CXX_FLAGS=${{ matrix.cxxflags }}")
+          cmake -S . -B build -G "${{ matrix.generator }}" -DCMAKE_BUILD_TYPE=${{ matrix.config }} "${args[@]}"
+      - name: Build
+        run: cmake --build build --config ${{ matrix.config }} --parallel 4
+      - name: Test
+        run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure --parallel 4 --timeout 3600
+
+  sanitizers:
+    name: Tests (Linux Clang, ASan + UBSan)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Ninja and the sanitizer runtimes
+        run: sudo apt-get install -y ninja-build libclang-rt-18-dev
+      - name: Configure
+        env:
+          CXX: clang++
+          CXXFLAGS: -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -g
+          LDFLAGS: -fsanitize=address,undefined
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+      - name: Build
+        run: cmake --build build --parallel 4
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build --output-on-failure --parallel 4 --timeout 5400
+
+  bench:
+    name: Benchmark hashes (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-msvc
+            os: windows-latest
+            generator: Visual Studio 17 2022
+          - name: linux-gcc
+            os: ubuntu-24.04
+            cxx: g++
+            generator: Ninja
+          - name: linux-clang
+            os: ubuntu-24.04
+            cxx: clang++
+            generator: Ninja
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Ninja
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y ninja-build
+      - name: Build
+        shell: bash
+        run: |
+          args=()
+          [ -n "${{ matrix.cxx }}" ] && args+=("-DCMAKE_CXX_COMPILER=${{ matrix.cxx }}")
+          cmake -S . -B build -G "${{ matrix.generator }}" -DCMAKE_BUILD_TYPE=Release "${args[@]}"
+          cmake --build build --config Release --target ak_bench --parallel 4
+      - name: Run
+        shell: bash
+        run: |
+          exe=build/ak_bench
+          [ -f build/Release/ak_bench.exe ] && exe=build/Release/ak_bench.exe
+          "$exe" | tr -d '\r' | tee bench-output.txt
+          grep -E 'hash: [0-9a-f]{16}$' bench-output.txt > hashes-${{ matrix.name }}.txt
+          cat hashes-${{ matrix.name }}.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hashes-${{ matrix.name }}
+          path: |
+            hashes-${{ matrix.name }}.txt
+            bench-output.txt
+
+  bench-compare:
+    name: Benchmark hashes agree across platforms
+    needs: bench
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: hashes-*
+      - name: Compare
+        run: |
+          status=0
+          for f in hashes-*/hashes-*.txt; do
+            echo "== $f"
+            if ! diff -u bench/hashes.txt "$f"; then
+              echo "::error::$f differs from bench/hashes.txt"
+              status=1
+            fi
+          done
+          exit $status

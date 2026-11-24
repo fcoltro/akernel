@@ -300,7 +300,7 @@ inline ContactResult classify_contact(const PolyPatchD& A, const PolyPatchD& B, 
     bool proven = false;
     Box5 K{};
     for (int k = 0; k < 24 && !proven; ++k) {
-        const double r = 1e-13 * std::pow(4.0, k);
+        const double r = 1e-13 * std::ldexp(1.0, 2 * k);
         Box5 X, P;
         for (int i = 0; i < 5; ++i) {
             const double w = r * (1.0 + std::fabs(x[static_cast<std::size_t>(i)]));

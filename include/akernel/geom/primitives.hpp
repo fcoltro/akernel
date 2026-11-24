@@ -5,6 +5,7 @@
 #include <functional>
 #include <vector>
 
+#include <akernel/num/detmath.hpp>
 #include <akernel/geom/bernstein.hpp>
 #include <akernel/geom/nurbs_surface.hpp>
 #include <akernel/num/dense.hpp>
@@ -65,13 +66,13 @@ inline PolyPatchD fit_patch(const std::function<Vec3d(double, double)>& f, int p
     auto nodes = [](int n) {
         std::vector<double> x(n + 1);
         const double pi = 3.14159265358979323846;
-        for (int i = 0; i <= n; ++i) x[i] = n == 0 ? 0.5 : 0.5 - 0.5 * std::cos(pi * i / n);
+        for (int i = 0; i <= n; ++i) x[i] = n == 0 ? 0.5 : 0.5 - 0.5 * num::det::cos(pi * i / n);
         return x;
     };
     auto bern = [](int n, int i, double t) {
         double c = 1.0;
         for (int k = 1; k <= i; ++k) c = c * (n - i + k) / k;
-        return c * std::pow(t, i) * std::pow(1.0 - t, n - i);
+        return c * num::det::ipow(t, i) * num::det::ipow(1.0 - t, n - i);
     };
     const auto un = nodes(p), vn = nodes(q);
     const int nu = p + 1, nv = q + 1;

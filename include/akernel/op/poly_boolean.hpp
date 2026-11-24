@@ -50,6 +50,7 @@
 #include <string>
 #include <vector>
 
+#include <akernel/num/detmath.hpp>
 #include <akernel/op/brep.hpp>
 #include <akernel/op/brep_transform.hpp>
 #include <akernel/op/plane_cut.hpp>
@@ -615,7 +616,7 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
             }
             if (!ok) return false;
             if (rev) { du = -du; dv = -dv; }
-            h.angle = std::atan2(dv, du);
+            h.angle = num::det::atan2(dv, du);
             H.push_back(h);
             return true;
         };

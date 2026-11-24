@@ -6,6 +6,8 @@
 #include <cmath>
 #include <vector>
 
+#include <akernel/num/detmath.hpp>
+
 namespace ak::geom {
 
 /// Open (clamped) uniform knot vector on [0,1] for `ncp` control points of degree p.
@@ -106,7 +108,7 @@ inline void gauss_legendre(int n, std::vector<double>& x, std::vector<double>& w
     w.assign(n, 0.0);
     const double pi = 3.14159265358979323846;
     for (int i = 0; i < (n + 1) / 2; ++i) {
-        double z = std::cos(pi * (i + 0.75) / (n + 0.5));
+        double z = num::det::cos(pi * (i + 0.75) / (n + 0.5));
         double pp = 1.0;
         for (int it = 0; it < 100; ++it) {
             double p1 = 1.0, p2 = 0.0;

@@ -9,6 +9,7 @@
 #include <array>
 #include <cmath>
 
+#include <akernel/num/detmath.hpp>
 #include <akernel/geom/bernstein.hpp>
 
 namespace ak::geom {
@@ -122,7 +123,7 @@ inline SeamJump seam_jump(const Jet3& JA, const Jet3& JB, const Vec3d& seam_tang
     const auto tB = to_param(B, tau), nB = to_param(B, nu);
 
     SeamJump j{};
-    j.normal_angle = std::atan2(norm(cross(A.n, B.n)), std::fabs(c));
+    j.normal_angle = num::det::atan2(norm(cross(A.n, B.n)), std::fabs(c));
     j.db_tt = sgn * second_form(B, tB, tB) - second_form(A, tA, tA);
     j.db_tn = sgn * second_form(B, tB, nB) - second_form(A, tA, nA);
     j.db_nn = sgn * second_form(B, nB, nB) - second_form(A, nA, nA);

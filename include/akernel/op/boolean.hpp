@@ -71,6 +71,7 @@
 #include <utility>
 #include <vector>
 
+#include <akernel/num/detmath.hpp>
 #include <akernel/num/expansion.hpp>
 #include <akernel/geom/box_index.hpp>
 #include <akernel/op/brep.hpp>
@@ -2261,7 +2262,7 @@ private:
                 for (int i = 0; i + r <= n; ++i)
                     pts[static_cast<std::size_t>(i)] = E(x.b - x.a) * pts[static_cast<std::size_t>(i)] + E(x.a) * pts[static_cast<std::size_t>(i + 1)];
             }
-            out[static_cast<std::size_t>(k)] = pts[0] * E(std::pow(x0.b, k) * std::pow(x1.b, n - k));
+            out[static_cast<std::size_t>(k)] = pts[0] * E(num::det::ipow(x0.b, k) * num::det::ipow(x1.b, n - k));
         }
         return out;
     }
@@ -2701,7 +2702,7 @@ private:
         for (int i = 0; i <= A.p; ++i)
             for (int j = 0; j <= A.q; ++j) { zA.at(i, j) = E(A.at(i, j).z); zB.at(i, j) = E(B.at(i, j).z); }
         const ExactBernstein zBA = restrict_rat2(zB, s0, s1, t0, t1);
-        const double S = std::pow(s0.b * s1.b, A.p) * std::pow(t0.b * t1.b, A.q);
+        const double S = num::det::ipow(s0.b * s1.b, A.p) * num::det::ipow(t0.b * t1.b, A.q);
         ExactBernstein D(A.p, A.q);
         for (std::size_t i = 0; i < D.c.size(); ++i) D.c[i] = E(S) * zA.c[i] - zBA.c[i];
         // Divide out the sides of A's square on which D vanishes.
@@ -2775,7 +2776,7 @@ private:
             ExactBernstein K(A.p, A.q);
             for (std::size_t i = 0; i < K.c.size(); ++i) K.c[i] = D.c[i] - ke.c[i];
             const ExactBernstein KB = restrict_rat2(K, u0, u1, v0, v1);
-            const double S2 = std::pow(u0.b * u1.b, A.p) * std::pow(v0.b * v1.b, A.q);
+            const double S2 = num::det::ipow(u0.b * u1.b, A.p) * num::det::ipow(v0.b * v1.b, A.q);
             PolyPatchI Ci = geom::to_interval(B);
             PolyPatchD Cm = B;
             for (int i = 0; i <= B.p; ++i)
@@ -4015,7 +4016,7 @@ private:
                     if (te.hi < edge.t0.lo || te.lo > edge.t1.hi) continue;
                     // The line's point at that edge parameter, on both surfaces.
                     const Interval tm(std::min(1.0, std::max(0.0, num::mid(te))));
-                    Interval su, sv, lu, lv;
+                    Interval su, sv;
                     side_uv(edge.on[i].side, edge.on[i].reversed ? Interval(1.0) - tm : tm, su, sv);
                     const Chart lc = iso_chart(k, e, L, tm);
                     Box4 Q;
@@ -6300,7 +6301,7 @@ inline bool recarry(Brep& b, int g, const solve::SsiOptions& sopt) {
         lo[i] = std::floor(lo[i] * grid) / grid - 1.0 / grid;
         extent = std::max(extent, std::ceil(hi[i] * grid) / grid + 1.0 / grid - lo[i]);
     }
-    const double size = std::ldexp(1.0, static_cast<int>(std::ceil(std::log2(extent))));
+    const double size = std::ldexp(1.0, num::det::ceil_log2(extent));
     for (int i : {a, c}) hi[i] = lo[i] + size;
     PolyPatchD P(1, 1);
     P.at(0, 0) = axis_point(axis, h, a, lo[a], c, lo[c]);
