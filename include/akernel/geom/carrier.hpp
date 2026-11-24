@@ -184,6 +184,24 @@ public:
         return true;
     }
 
+    /// As jet1_over_with_patch, with the second partials (uu, uv, vv) as
+    /// well: S and P hold value, u, v, uu, uv, vv. The second partials come
+    /// from the same forward-mode pass (the derivative parts of the first
+    /// partials' jets) and are direct enclosures over the box.
+    bool jet2_over_with_patch(double u0, double u1, double v0, double v1, IVec3 S[6], IVec3 P[6]) const {
+        IVec3 patch[3];
+        if (!jets(u0, u1, v0, v1, P[0], P[1], P[2], offset_ ? patch : nullptr, P + 3, offset_ ? S + 3 : nullptr))
+            return false;
+        if (!offset_) {
+            for (int i = 0; i < 6; ++i) S[i] = P[i];
+            return true;
+        }
+        S[0] = patch[0];
+        S[1] = patch[1];
+        S[2] = patch[2];
+        return true;
+    }
+
 private:
     /// Value and first two derivatives of the Bezier curve b[0..n] at t, by
     /// stopping de Casteljau two levels early (order = how many to fill).
@@ -224,7 +242,8 @@ private:
         X[3] = fuu; X[4] = gu; X[5] = h;
     }
 
-    bool jets(double u0, double u1, double v0, double v1, IVec3& P, IVec3& Pu, IVec3& Pv, IVec3* patch) const {
+    bool jets(double u0, double u1, double v0, double v1, IVec3& P, IVec3& Pu, IVec3& Pv, IVec3* patch,
+              IVec3* second = nullptr, IVec3* patch_second = nullptr) const {
         // The offset needs the patch's partials to order 2 with their own
         // derivatives (order 3); the patch itself only to order 1 (order 2).
         const int order = offset_ ? 2 : 1;
@@ -243,17 +262,24 @@ private:
         for (int i = 0; i < (offset_ ? 6 : 3); ++i) Xc[i] = P_.d[i].eval(Interval(uc), Interval(vc));
         const Interval du = Interval(u0) - Interval(uc), dv = Interval(v0) - Interval(vc);
         const Interval eu = num::hull(du, -du), ev = num::hull(dv, -dv);
-        auto finish = [&](double d, bool off, IVec3& Q, IVec3& Qu, IVec3& Qv) {
+        auto finish = [&](double d, bool off, IVec3& Q, IVec3& Qu, IVec3& Qv, IVec3* sec) {
             const auto g = first_jet(Xd, d, off);
             const auto c = first_jet(Xc, d, off);
             if (!g.ok || !c.ok) return false;
             Q = meet(values(g.p), mean_value(c.p, g.p, eu, ev));
             Qu = meet(values(g.pu), mean_value(c.pu, g.pu, eu, ev));
             Qv = meet(values(g.pv), mean_value(c.pv, g.pv, eu, ev));
+            if (sec) {
+                // d/du of the u partial, and so on; the uv partial is
+                // enclosed twice (d/dv P_u and d/du P_v) and the two meet.
+                sec[0] = {g.pu.x.du, g.pu.y.du, g.pu.z.du};
+                sec[1] = meet(IVec3{g.pu.x.dv, g.pu.y.dv, g.pu.z.dv}, IVec3{g.pv.x.du, g.pv.y.du, g.pv.z.du});
+                sec[2] = {g.pv.x.dv, g.pv.y.dv, g.pv.z.dv};
+            }
             return true;
         };
-        if (!finish(d_, offset_, P, Pu, Pv)) return false;
-        if (patch && !finish(0.0, false, patch[0], patch[1], patch[2])) return false;
+        if (!finish(d_, offset_, P, Pu, Pv, second)) return false;
+        if (patch && !finish(0.0, false, patch[0], patch[1], patch[2], patch_second)) return false;
         return true;
     }
 };

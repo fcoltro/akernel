@@ -202,6 +202,54 @@ int main() {
             AK_CHECK_NEAR(v, v_cut, 1e-10);
         }
     }
+    // The blend's enclosures over boxes: they must hold the point and the
+    // first partials (central differences, good to about 1e-6) everywhere in
+    // the box, and on small boxes the partials' enclosures must be within a
+    // few times their true spread (second-order mean-value form; larger
+    // boxes, or boxes across a spine segment's end, are looser), which is
+    // what lets curve tracing take long certified steps.
+    {
+        const op::ProcFilletResult rb = op::round_block_edge(top_patch(a, L, h, c), r);
+        AK_CHECK(rb.solid.has_value());
+        if (rb.solid) {
+            const geom::Carrier& B = *rb.solid->procs[0];
+            akt::Rng rng(11);
+            int outside = 0, n = 0, failed = 0;
+            double worst_ratio = 0.0;
+            for (int it = 0; it < 400; ++it) {
+                const double w = std::pow(10.0, -3.0 + 2.0 * rng.unit()), ws = w * (0.5 + rng.unit());
+                const double s0 = rng.unit() * (1 - ws), t0 = rng.unit() * (1 - w), s1 = s0 + ws, t1 = t0 + w;
+                geom::IVec3 P, Ps, Pt;
+                if (!B.jet1_over(s0, s1, t0, t1, P, Ps, Pt)) { ++failed; continue; }
+                double lo[6], hi[6];
+                for (int k = 0; k < 6; ++k) { lo[k] = 1e300; hi[k] = -1e300; }
+                for (int i = 0; i <= 4; ++i)
+                    for (int j = 0; j <= 4; ++j) {
+                        Vec3d p, ps, pt;
+                        B.eval(s0 + (s1 - s0) * i / 4, t0 + (t1 - t0) * j / 4, p, ps, pt);
+                        auto in = [&](const num::Interval& I, double x, double tol) {
+                            ++n;
+                            if (x < I.lo - tol || x > I.hi + tol) ++outside;
+                        };
+                        in(P.x, p.x, 1e-12); in(P.y, p.y, 1e-12); in(P.z, p.z, 1e-12);
+                        in(Ps.x, ps.x, 1e-5); in(Ps.y, ps.y, 1e-5); in(Ps.z, ps.z, 1e-5);
+                        in(Pt.x, pt.x, 1e-5); in(Pt.y, pt.y, 1e-5); in(Pt.z, pt.z, 1e-5);
+                        const double v[6] = {ps.x, ps.y, ps.z, pt.x, pt.y, pt.z};
+                        for (int k = 0; k < 6; ++k) { lo[k] = std::min(lo[k], v[k]); hi[k] = std::max(hi[k], v[k]); }
+                    }
+                // Widest enclosure against the widest sampled spread, over all six.
+                const num::Interval e[6] = {Ps.x, Ps.y, Ps.z, Pt.x, Pt.y, Pt.z};
+                double we = 0.0, ww = 0.0;
+                for (int k = 0; k < 6; ++k) { we = std::max(we, e[k].hi - e[k].lo); ww = std::max(ww, hi[k] - lo[k]); }
+                if (w < 3e-3 && ws < 3e-3) worst_ratio = std::max(worst_ratio, we / ww);
+            }
+            std::printf("blend enclosures: %d values, %d outside, %d boxes refused, widest derivative enclosure on boxes under 3e-3 %.1f x spread\n",
+                        n, outside, failed, worst_ratio);
+            AK_CHECK(outside == 0);
+            AK_CHECK(failed == 0);
+            AK_CHECK(worst_ratio < 10.0);
+        }
+    }
     // Refusals.
     {
         op::PolyPatchD T = top_patch(a, L, h, c);

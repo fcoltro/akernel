@@ -222,7 +222,10 @@ int main() {
         // (the spine's Newton points agree to about 1e-12): the same
         // tolerance as the identities.
         AK_CHECK_NEAR(op::volume(Q), op::volume(*rb.solid), 1e-11);
-        const Vols f1 = check_all("two rounded blocks", *rb.solid, Q, 1e-11);
+        // Four volumes enter each identity, and each moves by about 5e-12
+        // with the quadrature (the block's own volume does when the rule is
+        // refined), so the bound is twice that of the cases above.
+        const Vols f1 = check_all("two rounded blocks", *rb.solid, Q, 2e-11);
         if (rb2.solid) {
             const op::Brep Q2 = op::transformed(*rb.solid, op::SignedPermutation::quarter_turn_z(Vec3d{1.5, 0.5, 0.125} + shift));
             const op::PolyBooleanResult m = op::poly_boolean(*rb2.solid, Q2, op::PolyOp::Intersection);

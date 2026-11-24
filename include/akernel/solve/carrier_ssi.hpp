@@ -426,61 +426,123 @@ inline V2 lift(const geom::IVec3& v, const geom::IVec3& dv_dsigma) {
             D2(v.z, dv_dsigma.z, Interval(0.0))};
 }
 
-/// Rigorous enclosure of dx/dc over K for the sliced system (see above).
-inline bool spine_derivative(const CarrierPairSystem& sys, const Pt4& m, const Box4& K,
-                             std::array<Interval, 4>& xp) {
-    Interval M[4][4];
-    sys.J_over(K, M);
-    for (int k = 0; k < 4; ++k) M[3][k] = Interval(m[k]);
+/// Rigorous enclosure of the solution y of M y = r for every M and r in
+/// the given intervals, by a preconditioned fixed point: with C ~ mid(M)^-1
+/// and E = I - C M, y = C r + E y. If |E| < 1 (row sums), |y| <= |C r| /
+/// (1 - |E|), and iterating y <- (C r + E y) ∩ y from that bound keeps y and
+/// brings each component close to its own size.
+inline bool linear_enclosure(const Interval M[4][4], const Interval r[4], std::array<Interval, 4>& y) {
     double Mm[4][4], C[4][4];
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < 4; ++i) {
+        if (!num::is_finite(r[i])) return false;
         for (int j = 0; j < 4; ++j) {
             if (!num::is_finite(M[i][j])) return false;
             Mm[i][j] = num::mid(M[i][j]);
         }
+    }
     if (!invert4(Mm, C)) return false;
-    Interval E[4][4];
-    Interval q(0.0);
-    double qmax = 0.0;
+    Interval E[4][4], Cr[4];
+    double qmax = 0.0, crmax = 0.0;
     for (int i = 0; i < 4; ++i) {
-        Interval row(0.0);
+        Interval row(0.0), cr(0.0);
         for (int j = 0; j < 4; ++j) {
             Interval e(i == j ? 1.0 : 0.0);
             for (int k = 0; k < 4; ++k) e -= Interval(C[i][k]) * M[k][j];
             E[i][j] = e;
             row += Interval(num::mag(e));
+            cr += Interval(C[i][j]) * r[j];
         }
+        Cr[i] = cr;
         qmax = std::max(qmax, row.hi);
+        crmax = std::max(crmax, num::mag(cr));
     }
-    (void)q;
     if (!(qmax < 1.0)) return false;
-    double ce = 0.0;
-    for (int i = 0; i < 4; ++i) ce = std::max(ce, std::fabs(C[i][3]));
-    const double b = (Interval(ce) / (Interval(1.0) - Interval(qmax))).hi;
-    const Interval Y(-b, b);
-    for (int i = 0; i < 4; ++i) {
-        Interval v(C[i][3]);
-        for (int j = 0; j < 4; ++j) v += E[i][j] * Y;
-        xp[static_cast<std::size_t>(i)] = v;
+    const double b = (Interval(crmax) / (Interval(1.0) - Interval(qmax))).hi;
+    for (auto& x : y) x = Interval(-b, b);
+    for (int it = 0; it < 4; ++it) {
+        std::array<Interval, 4> nx;
+        for (int i = 0; i < 4; ++i) {
+            Interval v = Cr[i];
+            for (int j = 0; j < 4; ++j) v += E[i][j] * y[static_cast<std::size_t>(j)];
+            nx[static_cast<std::size_t>(i)] = meet(v, y[static_cast<std::size_t>(i)]);
+        }
+        y = nx;
     }
     return true;
+}
+
+/// The sliced system's matrix [F_x; m] over K from the two carriers' first
+/// partials (F = A(u, v) - B(s, t)).
+inline void sliced_matrix(const geom::IVec3& Au, const geom::IVec3& Av, const geom::IVec3& Bs,
+                          const geom::IVec3& Bt, const Pt4& m, Interval M[4][4]) {
+    const geom::IVec3* col[4] = {&Au, &Av, &Bs, &Bt};
+    for (int j = 0; j < 4; ++j) {
+        const Interval c[3] = {col[j]->x, col[j]->y, col[j]->z};
+        for (int k = 0; k < 3; ++k) M[k][j] = j < 2 ? c[k] : -c[k];
+        M[3][j] = Interval(m[static_cast<std::size_t>(j)]);
+    }
+}
+
+/// Second-order forward mode in (sigma, theta): value, first and second
+/// partials, each an interval enclosure over a box.
+struct H2 {
+    Interval v{}, ds{}, dt{}, dss{}, dst{}, dtt{};
+    H2() = default;
+    H2(double x) : v(x) {}
+    H2(const Interval& x) : v(x) {}
+    H2(const Interval& x, const Interval& s, const Interval& t, const Interval& ss, const Interval& st,
+       const Interval& tt)
+        : v(x), ds(s), dt(t), dss(ss), dst(st), dtt(tt) {}
+};
+inline H2 operator+(const H2& a, const H2& b) {
+    return {a.v + b.v, a.ds + b.ds, a.dt + b.dt, a.dss + b.dss, a.dst + b.dst, a.dtt + b.dtt};
+}
+inline H2 operator-(const H2& a, const H2& b) {
+    return {a.v - b.v, a.ds - b.ds, a.dt - b.dt, a.dss - b.dss, a.dst - b.dst, a.dtt - b.dtt};
+}
+inline H2 operator-(const H2& a) { return {-a.v, -a.ds, -a.dt, -a.dss, -a.dst, -a.dtt}; }
+inline H2 operator*(const H2& a, const H2& b) {
+    const Interval two(2.0);
+    return {a.v * b.v,
+            a.ds * b.v + a.v * b.ds,
+            a.dt * b.v + a.v * b.dt,
+            a.dss * b.v + two * (a.ds * b.ds) + a.v * b.dss,
+            a.dst * b.v + a.ds * b.dt + a.dt * b.ds + a.v * b.dst,
+            a.dtt * b.v + two * (a.dt * b.dt) + a.v * b.dtt};
+}
+/// q = a / b from a = q b, differentiated.
+inline H2 operator/(const H2& a, const H2& b) {
+    const Interval two(2.0);
+    H2 q;
+    q.v = a.v / b.v;
+    q.ds = (a.ds - q.v * b.ds) / b.v;
+    q.dt = (a.dt - q.v * b.dt) / b.v;
+    q.dss = (a.dss - two * (q.ds * b.ds) - q.v * b.dss) / b.v;
+    q.dst = (a.dst - q.ds * b.dt - q.dt * b.ds - q.v * b.dst) / b.v;
+    q.dtt = (a.dtt - two * (q.dt * b.dt) - q.v * b.dtt) / b.v;
+    return q;
 }
 
 /// The arc point and its derivatives from lifted contacts, centre and the
 /// unit directions uu = (a - c) / r, vv = (b - c) / r (passed separately so
 /// that their enclosures can be tighter than the difference's).
-inline V2 arc_point(const V2& a, const V2& c, const V2& b, const V2& uu, const V2& vv, double r,
-                    const D2& theta, bool& ok) {
-    const D2 R(r), one(1.0), two(2.0);
-    const D2 k = dot(uu, vv);
-    const D2 onek = one + k;
+/// S is D2 (first order) or H2 (second order).
+template <class S>
+Vec3<S> arc_point(const Vec3<S>& a, const Vec3<S>& c, const Vec3<S>& b, const Vec3<S>& uu, const Vec3<S>& vv,
+                  double r, const S& theta, bool& ok) {
+    const S R(r), one(1.0), two(2.0);
+    const S k = dot(uu, vv);
+    const S onek = one + k;
     ok = onek.v.lo > 0.0;
     if (!ok) return {};
-    const V2 corner = c + (uu + vv) * (R / onek);
-    const D2 w2 = two / onek;
-    const D2 s = one - theta;
-    const D2 B0 = s * s, B1 = two * s * theta, B2 = theta * theta * w2;
-    return (a * B0 + corner * B1 + b * B2) / (B0 + B1 + B2);
+    const Vec3<S> corner = c + (uu + vv) * (R / onek);
+    const S w2 = two / onek;
+    const S s = one - theta;
+    const S B0 = s * s, B1 = two * s * theta, B2 = theta * theta * w2;
+    const S W = B0 + B1 + B2;
+    ok = W.v.lo > 0.0;
+    if (!ok) return {};
+    return (a * B0 + corner * B1 + b * B2) / W;
 }
 
 } // namespace carrier_detail
@@ -553,6 +615,7 @@ class BlendCarrier final : public geom::Carrier {
     struct SpineJet {
         carrier_detail::V2 a, c, b; ///< contacts and centre
         carrier_detail::V2 u, v;    ///< (a - c) / r and (b - c) / r
+        geom::IVec3 a2, c2, b2;     ///< second sigma derivatives of a, c, b
     };
     struct Cache {
         std::mutex mutex;
@@ -617,22 +680,47 @@ class BlendCarrier final : public geom::Carrier {
             }
             if (after > 0.5 * before || after < 1e-15) break; // stalled or tight
         }
-        std::array<Interval, 4> xp;
-        if (!spine_derivative(sy, seg.m, K, xp)) return std::nullopt;
+        // Supports and offsets over K, to second order, each pair from one
+        // restriction of the patch.
+        geom::IVec3 SA[6], OA[6], SB[6], OB[6];
+        if (!oa_.jet2_over_with_patch(K[0].lo, K[0].hi, K[1].lo, K[1].hi, SA, OA)) return std::nullopt;
+        if (!ob_.jet2_over_with_patch(K[2].lo, K[2].hi, K[3].lo, K[3].hi, SB, OB)) return std::nullopt;
+        // dx/dc from [F_x; m] x' = e3, and x'' from [F_x; m] x'' = [-F_xx(x', x'); 0]
+        // (F = OA - OB; the slice is linear in x, so it adds nothing).
+        Interval M[4][4];
+        carrier_detail::sliced_matrix(OA[1], OA[2], OB[1], OB[2], seg.m, M);
+        std::array<Interval, 4> xp, xpp;
+        const Interval e3[4] = {Interval(0.0), Interval(0.0), Interval(0.0), Interval(1.0)};
+        if (!carrier_detail::linear_enclosure(M, e3, xp)) return std::nullopt;
+        auto quad = [&](const geom::IVec3* D, const Interval& p, const Interval& q) {
+            // D[3] p^2 + 2 D[4] p q + D[5] q^2
+            const Interval pp = num::sqr(p), pq = Interval(2.0) * (p * q), qq = num::sqr(q);
+            return geom::IVec3{D[3].x * pp + D[4].x * pq + D[5].x * qq, D[3].y * pp + D[4].y * pq + D[5].y * qq,
+                               D[3].z * pp + D[4].z * pq + D[5].z * qq};
+        };
+        const geom::IVec3 H = quad(OA, xp[0], xp[1]) - quad(OB, xp[2], xp[3]);
+        const Interval rhs[4] = {-H.x, -H.y, -H.z, Interval(0.0)};
+        const bool second = carrier_detail::linear_enclosure(M, rhs, xpp);
         const Interval wk = Interval(brk_[static_cast<std::size_t>(k) + 1]) - Interval(brk_[static_cast<std::size_t>(k)]);
         const Interval dcds = Interval(seg.reversed ? -seg.len : seg.len) / wk;
+        const Interval dcds2 = num::sqr(dcds);
         for (auto& d : xp) d = d * dcds;
+        for (auto& d : xpp) d = d * dcds2;
 
-        geom::IVec3 SA, SAu, SAv, OA, OAu, OAv, SB, SBs, SBt;
-        geom::IVec3 OB, OBs, OBt;
-        // Each support and its offset from one restriction of the patch.
-        if (!oa_.jet1_over_with_patch(K[0].lo, K[0].hi, K[1].lo, K[1].hi, SA, SAu, SAv, OA, OAu, OAv)) return std::nullopt;
-        if (!ob_.jet1_over_with_patch(K[2].lo, K[2].hi, K[3].lo, K[3].hi, SB, SBs, SBt, OB, OBs, OBt)) return std::nullopt;
         SpineJet j;
-        j.a = lift(SA, SAu * xp[0] + SAv * xp[1]);
+        j.a = lift(SA[0], SA[1] * xp[0] + SA[2] * xp[1]);
         // The centre is on both offsets: A's enclosure meets B's.
-        j.c = lift(geom::carrier_detail::meet(OA, OB), OAu * xp[0] + OAv * xp[1]);
-        j.b = lift(SB, SBs * xp[2] + SBt * xp[3]);
+        j.c = lift(geom::carrier_detail::meet(OA[0], OB[0]), OA[1] * xp[0] + OA[2] * xp[1]);
+        j.b = lift(SB[0], SB[1] * xp[2] + SB[2] * xp[3]);
+        // d^2/dsigma^2 of a point Q(x(sigma)): Q_xx(x', x') + Q_x x''.
+        const Interval ent = Interval::entire();
+        if (second) {
+            j.a2 = quad(SA, xp[0], xp[1]) + SA[1] * xpp[0] + SA[2] * xpp[1];
+            j.c2 = quad(OA, xp[0], xp[1]) + OA[1] * xpp[0] + OA[2] * xpp[1];
+            j.b2 = quad(SB, xp[2], xp[3]) + SB[1] * xpp[2] + SB[2] * xpp[3];
+        } else {
+            j.a2 = j.c2 = j.b2 = {ent, ent, ent};
+        }
         const D2 R(r_);
         j.u = (j.a - j.c) / R;
         j.v = (j.b - j.c) / R;
@@ -645,15 +733,20 @@ class BlendCarrier final : public geom::Carrier {
             if (const auto m = spine_jet(k, sm, sm)) {
                 const Interval h = Interval(s1) - Interval(sm);
                 const Interval e = num::hull(h, -h);
-                auto tighten = [&](V2& q, const V2& qm) {
-                    auto one = [&](D2& x, const D2& xm) {
+                // The sigma derivatives likewise, from the second ones.
+                auto tighten = [&](V2& q, const V2& qm, const geom::IVec3& q2) {
+                    auto one = [&](D2& x, const D2& xm, const Interval& x2) {
                         const Interval mv = xm.v + x.du * e;
                         if (num::is_finite(mv)) x.v = meet(x.v, mv);
+                        const Interval md = xm.du + x2 * e;
+                        if (num::is_finite(md)) x.du = meet(x.du, md);
                     };
-                    one(q.x, qm.x); one(q.y, qm.y); one(q.z, qm.z);
+                    one(q.x, qm.x, q2.x); one(q.y, qm.y, q2.y); one(q.z, qm.z, q2.z);
                 };
-                tighten(j.a, m->a); tighten(j.c, m->c); tighten(j.b, m->b);
-                tighten(j.u, m->u); tighten(j.v, m->v);
+                const Interval R1(r_);
+                const geom::IVec3 u2 = (j.a2 - j.c2) / R1, v2 = (j.b2 - j.c2) / R1;
+                tighten(j.a, m->a, j.a2); tighten(j.c, m->c, j.c2); tighten(j.b, m->b, j.b2);
+                tighten(j.u, m->u, u2); tighten(j.v, m->v, v2);
             }
         }
         return j;
@@ -661,10 +754,35 @@ class BlendCarrier final : public geom::Carrier {
 
     /// Enclosures for sigma in [s0, s1] within segment k and theta in T.
     bool segment_jet(int k, double s0, double s1, const Interval& T, geom::IVec3& P,
-                     geom::IVec3& Ps, geom::IVec3& Pt) const {
+                     geom::IVec3& Ps, geom::IVec3& Pt, geom::IVec3* second = nullptr) const {
         using namespace carrier_detail;
         const auto j = spine_jet(k, s0, s1);
         if (!j) return false;
+        if (second) {
+            // Second partials (ss, st, tt) over the box, by second-order
+            // forward mode through the arc; the contacts and centre do not
+            // depend on theta.
+            auto h = [](const V2& q, const geom::IVec3& q2) {
+                auto one = [](const D2& x, const Interval& x2) {
+                    return H2(x.v, x.du, Interval(0.0), x2, Interval(0.0), Interval(0.0));
+                };
+                return Vec3<H2>{one(q.x, q2.x), one(q.y, q2.y), one(q.z, q2.z)};
+            };
+            const Interval R1(r_);
+            const geom::IVec3 u2 = (j->a2 - j->c2) / R1, v2 = (j->b2 - j->c2) / R1;
+            bool ok2 = false;
+            const Vec3<H2> q = arc_point(h(j->a, j->a2), h(j->c, j->c2), h(j->b, j->b2), h(j->u, u2), h(j->v, v2), r_,
+                                         H2(T, Interval(0.0), Interval(1.0), Interval(0.0), Interval(0.0), Interval(0.0)),
+                                         ok2);
+            const Interval ent = Interval::entire();
+            if (ok2) {
+                second[0] = {q.x.dss, q.y.dss, q.z.dss};
+                second[1] = {q.x.dst, q.y.dst, q.z.dst};
+                second[2] = {q.x.dtt, q.y.dtt, q.z.dtt};
+            } else {
+                second[0] = second[1] = second[2] = {ent, ent, ent};
+            }
+        }
         // The arc's rational form loses the correlation between its basis
         // functions over a theta interval; pieces of theta, hulled, keep
         // the derivative enclosures within a few times their true spread.
@@ -785,12 +903,16 @@ public:
     bool jet1_over(double s0, double s1, double t0, double t1, geom::IVec3& P, geom::IVec3& Ps,
                    geom::IVec3& Pt) const override {
         const int k0 = segment_of(s0), k1 = segment_of(s1);
+        // Within one spine segment the blend is smooth, and the first
+        // partials get a mean-value form from the second ones below.
+        geom::IVec3 sec[3];
+        const bool smooth = k0 == k1 && (s1 > s0 || t1 > t0);
         bool first = true;
         for (int k = k0; k <= k1; ++k) {
             const double a = std::max(s0, brk_[static_cast<std::size_t>(k)]);
             const double b = std::min(s1, brk_[static_cast<std::size_t>(k) + 1]);
             geom::IVec3 p, ps, pt;
-            if (!segment_jet(k, a, b, Interval(t0, t1), p, ps, pt)) return false;
+            if (!segment_jet(k, a, b, Interval(t0, t1), p, ps, pt, smooth ? sec : nullptr)) return false;
             if (first) { P = p; Ps = ps; Pt = pt; first = false; }
             else {
                 auto h = [](geom::IVec3& x, const geom::IVec3& y) {
@@ -813,6 +935,18 @@ public:
                 return c + gs * es + gt * et;
             };
             const geom::IVec3 M{mv(C.x, Ps.x, Pt.x), mv(C.y, Ps.y, Pt.y), mv(C.z, Ps.z, Pt.z)};
+            if (smooth) {
+                // The same for P_s and P_t, with the second partials.
+                auto fin = [](const geom::IVec3& x) {
+                    return num::is_finite(x.x) && num::is_finite(x.y) && num::is_finite(x.z);
+                };
+                const geom::IVec3 Ms{mv(Cs_.x, sec[0].x, sec[1].x), mv(Cs_.y, sec[0].y, sec[1].y),
+                                     mv(Cs_.z, sec[0].z, sec[1].z)};
+                const geom::IVec3 Mt{mv(Ct_.x, sec[1].x, sec[2].x), mv(Ct_.y, sec[1].y, sec[2].y),
+                                     mv(Ct_.z, sec[1].z, sec[2].z)};
+                if (fin(Ms)) Ps = geom::carrier_detail::meet(Ps, Ms);
+                if (fin(Mt)) Pt = geom::carrier_detail::meet(Pt, Mt);
+            }
             P = geom::carrier_detail::meet(P, M);
         }
         return true;
