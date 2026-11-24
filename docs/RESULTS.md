@@ -1422,3 +1422,25 @@ The sphere corners. A sphere octant is three-sided, so a single patch would be d
 As Boolean operands: the rounded box halved by z ≤ 1/2, cut by x ≥ 7/4 (a curved section through the fillet) and united with a block all match their closed forms to 1e-15. The rounded full ring cut by y ≥ 1/2 (through the torus) gives 3.621678018550, the same to 12 digits as an independent quadrature over the section.
 
 What this does not show yet: edges of solids that are not swept (faces that are themselves trimmed, edges between two curved faces, varying dihedral angle), corners where blends of different radii or setbacks meet, and freeform supports, where the blend face is the `BlendCarrier` and the contact curves are procedural.
+
+### A freeform fillet inside a solid (F5 on freeform supports, procedural faces)
+
+From `tests/op/proc_fillet_test.cpp` (23 checks, about 45 s, most of it the mesh-deviation measurement). `op/proc_fillet.hpp` builds a block whose top is a polynomial graph over the rectangle and rounds the edge between the top and the side x = a with a rolling ball. The dihedral angle varies along the edge, so the blend is not a rational surface. It is a procedural face: `Brep::procs` holds the `BlendCarrier` and the face is that carrier over its whole parameter square (docs/FEATURES.md §5.1). The top and the side are trimmed along the contact curves, which are procedural edges read in each support's parameters through the certified spine's own coordinates. The end faces are trimmed by the blend's end sections, which lie in the end planes because the top has zero slope across them.
+
+The top is z = h + c x s(y/L), with s the smoothstep 3t² − 2t³ (degree (1, 3); a = 1, L = 2, h = 3/4, r = 1/4).
+
+| Case | Faces / edges / vertices | Euler | Volume |
+|---|---|---|---|
+| Flat top (c = 0); the blend is a quarter cylinder | 7 / 15 / 10 | 2 | 1.473174770430353 vs a L h − (1 − π/4) r² L = …424681 (5.7e-12) |
+| Freeform top (c = 1/2), edge angle 90° at y = 0 to 63.4° at y = L | 7 / 15 / 10 | 2 | 1.700878161978803; removed 0.049121838022, against 0.049121838026 by slice integration (4.5e-12) |
+| Same, moved by (3, −5, 0) | 7 / 15 / 10 | 2 | differs by 3.1e-11 |
+
+The slice integration is independent of the divergence sum. For each plane y = y0 it finds the blend's section curve by solving P(sigma, theta).y = y0 per theta (regula falsi), measures the cut corner by a shoelace with Richardson extrapolation, and integrates over y by Gauss 8 on 8 cells. Moving the solid changes every face's flux, but the sum of a closed surface does not move, so that check tests closure. Both meshes are watertight and within 2.6e-4 of the surfaces (the blend: 10,664 triangles, mesh in 0.4 s). A Boolean with the rounded solid is refused with a clear error.
+
+Three things had to change in the carrier for this.
+
+- Sigma is now split between spine segments in proportion to the length of each segment's centre path, not equally. A traced spine can end in a very short segment (here 0.15% of the edge); with equal shares, sigma's speed jumped by a factor of 400 there and the blend's mesh lost the surface (deviation 6e-2).
+- Quadrature and sampling align with the carrier's smooth pieces (`Carrier::breaks_u`, `ProcEdge::breaks`), since the speed in sigma still has small jumps between segments.
+- The differences that give the double-precision partials stay inside a piece, one-sided at its ends. Central differences across sigma = 0 had cut the blend's flux by 2e-7.
+
+What this does not show yet: Booleans on procedural faces, blends that do not end in planes (end caps, chains meeting other blends), and freeform support pairs other than a graph top with a plane.

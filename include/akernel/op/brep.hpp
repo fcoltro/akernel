@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include <akernel/geom/carrier.hpp>
 #include <akernel/op/contact.hpp>
 #include <akernel/op/patch_solid.hpp>
 #include <akernel/op/planar.hpp>
@@ -59,9 +60,26 @@ struct BVertex {
     }
 };
 
+/// An edge defined procedurally: a side of a procedural face's parameter
+/// square, read by every face that uses it in that face's own parameters
+/// (docs/FEATURES.md §5.1). tau in [0, 1] runs from the edge's v0 to v1.
+struct ProcEdge {
+    virtual ~ProcEdge() = default;
+    virtual Vec3d point(double tau) const = 0;
+    /// Parameters (u, v) on Brep::carriers[carrier] at tau, and their
+    /// derivatives in tau; false if the edge is not on that carrier.
+    virtual bool on_carrier(int carrier, double tau, double& u, double& v, double& du, double& dv) const = 0;
+    /// Parameters on Brep::procs[proc]; false if the edge is not on it.
+    virtual bool on_proc(int proc, double tau, double& s, double& t) const = 0;
+    /// Break points 0 = b0 < ... < bn = 1 of tau: the edge is smooth on each
+    /// piece (e.g. a spine segment). Quadrature and sampling align with them.
+    virtual std::vector<double> breaks() const { return {0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0}; }
+};
+
 struct BEdge {
     int v0 = -1, v1 = -1;
     bool arc = false;
+    std::shared_ptr<const ProcEdge> proc; ///< set for a procedural edge (then arc is false)
 
     // Side edge: the curve is side `on[0].side` of carrier `on[0].carrier`,
     // for the edge parameter t in [t0, t1]; the same curve is a side of
@@ -87,12 +105,16 @@ struct BCoedge {
 
 struct BFace {
     int carrier = -1;
+    int proc = -1;        ///< >= 0: the face is Brep::procs[proc] over its whole parameter square
     bool flipped = false; ///< outward normal is -(Su x Sv)
     std::vector<std::vector<BCoedge>> loops;
 };
 
 struct Brep {
     std::vector<PolyPatchD> carriers;
+    /// Procedural carriers (offsets, blends): faces on them have proc >= 0.
+    /// Booleans do not read them yet and refuse such operands.
+    std::vector<std::shared_ptr<const geom::Carrier>> procs;
     std::vector<BVertex> vertices;
     std::vector<BEdge> edges;
     std::vector<BFace> faces;
@@ -238,7 +260,7 @@ inline topo::Complex to_complex(const Brep& b) {
             }
             loops.push_back(std::move(L));
         }
-        c.add_face(f.carrier, std::move(loops));
+        c.add_face(f.proc >= 0 ? static_cast<int>(b.carriers.size()) + f.proc : f.carrier, std::move(loops));
     }
     return c;
 }
@@ -260,6 +282,29 @@ inline double volume(const Brep& b, bool quick = false) {
     };
     double total = 0.0;
     for (const BFace& face : b.faces) {
+        if (face.proc >= 0) {
+            // S . (Ss x St) over the whole square, Gauss 8 x 8 on a grid of
+            // cells aligned with the carrier's smooth pieces in s.
+            const geom::Carrier& C = *b.procs[static_cast<std::size_t>(face.proc)];
+            const UnitRule& g = rule(8);
+            const std::vector<double> bs = C.breaks_u();
+            const int sub = 4, nt = 8;
+            double flux = 0.0;
+            for (std::size_t piece = 0; piece + 1 < bs.size(); ++piece)
+                for (int a = 0; a < sub; ++a) {
+                    const double s0 = bs[piece] + (bs[piece + 1] - bs[piece]) * a / sub;
+                    const double ds = (bs[piece + 1] - bs[piece]) / sub;
+                    for (int c = 0; c < nt; ++c)
+                        for (std::size_t i = 0; i < g.x.size(); ++i)
+                            for (std::size_t j = 0; j < g.x.size(); ++j) {
+                                Vec3d P, Ps, Pt;
+                                C.eval(s0 + g.x[i] * ds, (c + g.x[j]) / nt, P, Ps, Pt);
+                                flux += g.w[i] * g.w[j] * dot(P, cross(Ps, Pt)) * ds / nt;
+                            }
+                }
+            total += face.flipped ? -flux : flux;
+            continue;
+        }
         const PolyPatchD& P = b.carriers[static_cast<std::size_t>(face.carrier)];
         const geom::BezierSurface S(P);
         // The density S . (Su x Sv) of a polynomial patch has degree 3p - 1 in
@@ -283,6 +328,23 @@ inline double volume(const Brep& b, bool quick = false) {
         for (const auto& loop : face.loops)
             for (const BCoedge& ce : loop) {
                 const BEdge& e = b.edges[static_cast<std::size_t>(ce.edge)];
+                if (e.proc) {
+                    // The loop integral of G dv along the edge in this face's parameters.
+                    const std::vector<double> bt = e.proc->breaks();
+                    for (std::size_t piece = 0; piece + 1 < bt.size(); ++piece)
+                        for (int k = 0; k < 4; ++k) {
+                            const double dt = (bt[piece + 1] - bt[piece]) / 4, t0 = bt[piece] + k * dt;
+                            // Along the edge's own tau (nodes aligned with its
+                            // breaks); a reversed coedge changes the sign.
+                            for (std::size_t i = 0; i < outer.x.size(); ++i) {
+                                const double tau = t0 + outer.x[i] * dt;
+                                double u, v, du, dv;
+                                if (!e.proc->on_carrier(face.carrier, tau, u, v, du, dv)) continue;
+                                flux += outer.w[i] * G(u, v) * (ce.reversed ? -dv : dv) * dt;
+                            }
+                        }
+                    continue;
+                }
                 if (!e.arc) {
                     double ua, va, ub, vb;
                     if (const BEdge::SideRef* ref = side_on(e, face.carrier)) {

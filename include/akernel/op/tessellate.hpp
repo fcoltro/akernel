@@ -493,6 +493,40 @@ inline CarrierShape carrier_shape(const geom::BezierSurface& S) {
     return c;
 }
 
+/// The same for a procedural carrier, from its first partials and their
+/// central differences, sampled inside each of its smooth pieces in u.
+inline CarrierShape carrier_shape(const geom::Carrier& C) {
+    CarrierShape c;
+    const std::vector<double> bs = C.breaks_u();
+    const int n = 9;
+    int cnt = 0;
+    for (std::size_t k = 0; k + 1 < bs.size(); ++k)
+        for (int i = 0; i < n; ++i)
+            for (int j = 0; j < n; ++j) {
+                const double h = 1e-4 * (bs[k + 1] - bs[k]);
+                const double u = bs[k] + (bs[k + 1] - bs[k]) * (i + 0.5) / n;
+                const double v = std::clamp(static_cast<double>(j) / (n - 1), 1e-4, 1 - 1e-4);
+                Vec3d P, Pu, Pv, A, Au, Av, B, Bu, Bv, D, Du, Dv, E, Eu, Ev;
+                C.eval(u, v, P, Pu, Pv);
+                C.eval(u + h, v, A, Au, Av);
+                C.eval(u - h, v, B, Bu, Bv);
+                C.eval(u, v + 1e-4, D, Du, Dv);
+                C.eval(u, v - 1e-4, E, Eu, Ev);
+                const double su = norm(Pu), sv = norm(Pv);
+                c.Lu = std::max(c.Lu, su);
+                c.Lv = std::max(c.Lv, sv);
+                c.Lu_mean += su;
+                c.Lv_mean += sv;
+                ++cnt;
+                c.Kuu = std::max(c.Kuu, norm(Au - Bu) / (2 * h));
+                c.Kuv = std::max(c.Kuv, norm(Av - Bv) / (2 * h));
+                c.Kvv = std::max(c.Kvv, norm(Dv - Ev) / 2e-4);
+            }
+    c.Lu_mean /= cnt;
+    c.Lv_mean /= cnt;
+    return c;
+}
+
 /// Parameter steps for a face's interior grid: each term of the second-order
 /// deviation of a triangle is kept below a share of `chord`. Infinity for a
 /// direction that needs no interior lines.
@@ -561,12 +595,24 @@ inline TessResult tessellate(const Brep& b, const TessOptions& opt = {}) {
         surf.emplace_back(c);
         shape.push_back(carrier_shape(surf.back()));
     }
+    // Procedural carriers follow the polynomial ones in `shape`.
+    for (const auto& pc : b.procs) shape.push_back(carrier_shape(*pc));
+    auto shape_of = [&](const BFace& f) -> const CarrierShape& {
+        return shape[static_cast<std::size_t>(f.proc >= 0 ? static_cast<int>(b.carriers.size()) + f.proc : f.carrier)];
+    };
+    // Point of a face's surface at parameters (u, v).
+    auto face_point = [&](const BFace& f, double u, double v) {
+        if (f.proc < 0) return surf[static_cast<std::size_t>(f.carrier)].point(u, v);
+        Vec3d P, Pu, Pv;
+        b.procs[static_cast<std::size_t>(f.proc)]->eval(u, v, P, Pu, Pv);
+        return P;
+    };
 
     // Spacing wanted along each face, in space: edges are sampled no coarser.
     const double inf = std::numeric_limits<double>::infinity();
     std::vector<double> face_len(b.faces.size(), inf);
     for (std::size_t f = 0; f < b.faces.size(); ++f) {
-        const CarrierShape& c = shape[static_cast<std::size_t>(b.faces[f].carrier)];
+        const CarrierShape& c = shape_of(b.faces[f]);
         double du, dv;
         grid_steps(c, opt, du, dv);
         face_len[f] = std::min(du * c.Lu, dv * c.Lv);
@@ -592,7 +638,37 @@ inline TessResult tessellate(const Brep& b, const TessOptions& opt = {}) {
         std::vector<double> s;
         std::vector<Vec3d> pts;
         S.gid.push_back(e.v0);
-        if (!e.arc) {
+        if (e.proc) {
+            // Procedural edge: sampled in tau, piece by piece.
+            auto f = [&](double tau, Vec3d& p) {
+                p = e.proc->point(tau);
+                return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z);
+            };
+            const std::vector<double> bt = e.proc->breaks();
+            const int n = static_cast<int>(bt.size()) - 1;
+            S.t.push_back(0.0);
+            Vec3d prev = p0;
+            for (int k = 0; k < n; ++k) {
+                const double ta = bt[static_cast<std::size_t>(k)], tb = bt[static_cast<std::size_t>(k) + 1];
+                Vec3d end = p1;
+                if (k + 1 < n && !f(tb, end)) return fail("could not evaluate a procedural edge");
+                s.clear();
+                pts.clear();
+                if (!subdivide(f, ta, tb, prev, end, 0, n == 1 ? 1 : 0, edge_len[ei], opt, s, pts))
+                    return fail("could not evaluate a procedural edge");
+                if (k + 1 < n) {
+                    s.push_back(tb);
+                    pts.push_back(end);
+                }
+                for (std::size_t q = 0; q < s.size(); ++q) {
+                    S.t.push_back(s[q]);
+                    S.gid.push_back(static_cast<int>(M.points.size()));
+                    M.points.push_back(pts[q]);
+                }
+                prev = end;
+            }
+            S.t.push_back(1.0);
+        } else if (!e.arc) {
             const BEdge::SideRef& ref = e.on[0];
             const geom::BezierSurface& C = surf[static_cast<std::size_t>(ref.carrier)];
             auto f = [&](double t, Vec3d& p) {
@@ -738,8 +814,7 @@ inline TessResult tessellate(const Brep& b, const TessOptions& opt = {}) {
     // Faces.
     for (std::size_t fi = 0; fi < b.faces.size(); ++fi) {
         const BFace& face = b.faces[fi];
-        const geom::BezierSurface& C = surf[static_cast<std::size_t>(face.carrier)];
-        const CarrierShape& cs = shape[static_cast<std::size_t>(face.carrier)];
+        const CarrierShape& cs = shape_of(face);
         struct Node {
             double u, v;
             int gid;
@@ -750,15 +825,36 @@ inline TessResult tessellate(const Brep& b, const TessOptions& opt = {}) {
             for (const BCoedge& ce : loop) {
                 const BEdge& e = b.edges[static_cast<std::size_t>(ce.edge)];
                 const EdgeSamples& S = samples[static_cast<std::size_t>(ce.edge)];
+                const std::size_t n = S.gid.size();
+                std::vector<Node> pts(n);
+                if (face.proc >= 0) {
+                    // A procedural face: its edges are sides of its square.
+                    if (!e.proc) return fail("a procedural face is bounded by an edge that is not procedural");
+                    for (std::size_t k = 0; k < n; ++k) {
+                        double u, v;
+                        if (!e.proc->on_proc(face.proc, S.t[k], u, v))
+                            return fail("a procedural edge does not lie on the procedural face it bounds");
+                        pts[k] = {u, v, S.gid[k]};
+                    }
+                    if (ce.reversed) std::reverse(pts.begin(), pts.end());
+                    if (!L.empty() && L.back().gid != pts.front().gid) return fail("a face loop is not connected");
+                    for (std::size_t k = L.empty() ? 0 : 1; k < pts.size(); ++k) L.push_back(pts[k]);
+                    continue;
+                }
                 const Chart* c0 = b.vertices[static_cast<std::size_t>(e.v0)].chart(face.carrier);
                 const Chart* c1 = b.vertices[static_cast<std::size_t>(e.v1)].chart(face.carrier);
                 if (!c0 || !c1) return fail("a vertex has no parameters on a face it bounds");
                 const double u0 = num::mid(c0->u), v0 = num::mid(c0->v), u1 = num::mid(c1->u), v1 = num::mid(c1->v);
-                const std::size_t n = S.gid.size();
-                std::vector<Node> pts(n);
                 pts.front() = {u0, v0, S.gid.front()};
                 pts.back() = {u1, v1, S.gid.back()};
-                if (!e.arc) {
+                if (e.proc) {
+                    for (std::size_t k = 1; k + 1 < n; ++k) {
+                        double u, v, du, dv;
+                        if (!e.proc->on_carrier(face.carrier, S.t[k], u, v, du, dv))
+                            return fail("a procedural edge does not lie on the carrier of a face it bounds");
+                        pts[k] = {u, v, S.gid[k]};
+                    }
+                } else if (!e.arc) {
                     const double t0 = S.t.front(), t1 = S.t.back();
                     for (std::size_t k = 1; k + 1 < n; ++k) {
                         const double w = (S.t[k] - t0) / (t1 - t0);
@@ -881,7 +977,7 @@ inline TessResult tessellate(const Brep& b, const TessOptions& opt = {}) {
                     const double u = q[0], vv = q[1] / sv;
                     gid_of.push_back(static_cast<int>(M.points.size()));
                     uv_of.push_back({u, vv});
-                    M.points.push_back(C.point(u, vv));
+                    M.points.push_back(face_point(face, u, vv));
                     ++res.stats.interior_points;
                 }
             }
@@ -947,7 +1043,7 @@ inline TessResult tessellate(const Brep& b, const TessOptions& opt = {}) {
                 if (!pairs) continue;
                 for (int t : ts) touched[static_cast<std::size_t>(t)] = 1;
                 for (const auto& [f, list] : by_face) {
-                    const geom::BezierSurface& C = surf[static_cast<std::size_t>(b.faces[static_cast<std::size_t>(f)].carrier)];
+                    const BFace& lf = b.faces[static_cast<std::size_t>(f)];
                     int mid = -1;
                     double mu = 0.0, mv = 0.0;
                     for (int t : list) {
@@ -963,7 +1059,7 @@ inline TessResult tessellate(const Brep& b, const TessOptions& opt = {}) {
                             mu = 0.5 * (uv[static_cast<std::size_t>(2 * i)] + uv[static_cast<std::size_t>(2 * j)]);
                             mv = 0.5 * (uv[static_cast<std::size_t>(2 * i + 1)] + uv[static_cast<std::size_t>(2 * j + 1)]);
                             mid = static_cast<int>(M.points.size());
-                            M.points.push_back(C.point(mu, mv));
+                            M.points.push_back(face_point(lf, mu, mv));
                         }
                         // (p_i, p_j, p_l) becomes (p_i, m, p_l) and (m, p_j, p_l).
                         std::array<int, 3> g1 = g, g2 = g;
@@ -1093,6 +1189,28 @@ inline double surface_distance(const geom::BezierSurface& S, const Vec3d& q, dou
     return norm(q - S.point(u, v));
 }
 
+/// The same for a procedural carrier (its partials are differences, so the
+/// steps stop at 1e-12 rather than at rounding).
+inline double surface_distance(const geom::Carrier& S, const Vec3d& q, double u, double v) {
+    Vec3d P, Pu, Pv;
+    for (int it = 0; it < 12; ++it) {
+        S.eval(u, v, P, Pu, Pv);
+        const Vec3d r = q - P;
+        const double a = dot(Pu, Pu), c = dot(Pu, Pv), d = dot(Pv, Pv);
+        const double g1 = dot(Pu, r), g2 = dot(Pv, r);
+        const double det = a * d - c * c;
+        if (!(det > 0.0)) break;
+        const double du = (d * g1 - c * g2) / det, dv = (a * g2 - c * g1) / det;
+        const double nu = std::min(1.0, std::max(0.0, u + du)), nv = std::min(1.0, std::max(0.0, v + dv));
+        const bool done = std::fabs(nu - u) + std::fabs(nv - v) < 1e-12;
+        u = nu;
+        v = nv;
+        if (done) break;
+    }
+    S.eval(u, v, P, Pu, Pv);
+    return norm(q - P);
+}
+
 /// Largest distance from the mesh to its surfaces, over the centroid and the
 /// side midpoints of every triangle (closest points on the triangle's
 /// carrier). A measurement of how well the mesh follows the surfaces, not a
@@ -1103,8 +1221,7 @@ inline double mesh_deviation(const Mesh& m, const Brep& b) {
     for (const PolyPatchD& c : b.carriers) surf.emplace_back(c);
     double worst = 0.0;
     for (std::size_t t = 0; t < m.tris.size(); ++t) {
-        const geom::BezierSurface& S =
-            surf[static_cast<std::size_t>(b.faces[static_cast<std::size_t>(m.tri_face[t])].carrier)];
+        const BFace& face = b.faces[static_cast<std::size_t>(m.tri_face[t])];
         const auto& T = m.tris[t];
         const auto& uv = m.tri_uv[t];
         const Vec3d p[3] = {m.points[static_cast<std::size_t>(T[0])], m.points[static_cast<std::size_t>(T[1])],
@@ -1115,7 +1232,9 @@ inline double mesh_deviation(const Mesh& m, const Brep& b) {
             const double u = w[0] * uv[0] + w[1] * uv[2] + w[2] * uv[4];
             const double v = w[0] * uv[1] + w[1] * uv[3] + w[2] * uv[5];
             const Vec3d q = p[0] * w[0] + p[1] * w[1] + p[2] * w[2];
-            worst = std::max(worst, surface_distance(S, q, u, v));
+            worst = std::max(worst, face.proc >= 0
+                                        ? surface_distance(*b.procs[static_cast<std::size_t>(face.proc)], q, u, v)
+                                        : surface_distance(surf[static_cast<std::size_t>(face.carrier)], q, u, v));
         }
     }
     return worst;

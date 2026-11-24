@@ -6785,6 +6785,12 @@ inline BooleanResult select(const Imprint& im, Op op) {
 /// An empty operand (no faces) is the empty set: A or {} = A, A and {} = {},
 /// A - {} = A, {} - B = {}.
 inline BooleanResult boolean_op(const Brep& A, const Brep& B, Op op, const BooleanOptions& opt = {}) {
+    if (!A.procs.empty() || !B.procs.empty()) {
+        BooleanResult r;
+        r.op = op;
+        r.error = "Booleans on procedural faces are not supported yet (docs/FEATURES.md 5.1)";
+        return r;
+    }
     if (A.faces.empty() || B.faces.empty()) {
         BooleanResult r;
         r.op = op;

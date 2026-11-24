@@ -463,6 +463,11 @@ class BlendCarrier final : public geom::Carrier {
     geom::OffsetCarrier oa_, ob_;
     double r_;
     std::vector<TubeSegment> segs_; ///< in curve order
+    /// sigma at the segments' ends: brk_[k] to brk_[k + 1] is segment k, a
+    /// share of [0, 1] proportional to the length of its centre path, so
+    /// the speed in sigma is nearly even along the blend (a traced curve can
+    /// end in a very short segment).
+    std::vector<double> brk_;
 
     CarrierPairSystem sys() const { return CarrierPairSystem(oa_, ob_); }
     int count() const { return static_cast<int>(segs_.size()); }
@@ -472,7 +477,49 @@ class BlendCarrier final : public geom::Carrier {
         return (s.reversed ? 1.0 - f : f) * s.len;
     }
     int segment_of(double sigma) const {
-        return std::clamp(static_cast<int>(std::floor(sigma * count())), 0, count() - 1);
+        const auto it = std::upper_bound(brk_.begin() + 1, brk_.end() - 1, sigma);
+        return static_cast<int>(it - brk_.begin()) - 1;
+    }
+    /// Local fraction of sigma along segment k (doubles: the map sigma -> slice
+    /// is defined by these operations, and enclosures are taken over the
+    /// slices it gives).
+    double local(int k, double sigma) const {
+        const double a = brk_[static_cast<std::size_t>(k)], b = brk_[static_cast<std::size_t>(k) + 1];
+        return std::clamp((sigma - a) / (b - a), 0.0, 1.0);
+    }
+    void make_breaks() {
+        const int n = count();
+        std::vector<double> w(static_cast<std::size_t>(n), 1.0);
+        double total = 0.0;
+        for (int k = 0; k < n; ++k) {
+            const TubeSegment& seg = segs_[static_cast<std::size_t>(k)];
+            Vec3d prev{};
+            double len = 0.0;
+            bool ok = true;
+            for (int i = 0; i <= 4 && ok; ++i) {
+                const double c = slice(k, i / 4.0);
+                Pt4 x;
+                for (int d = 0; d < 4; ++d) x[d] = seg.a[d] + c * seg.m[d];
+                ok = newton_slice(sys(), seg.m, seg.a, c, x);
+                Vec3d C, Cu, Cv;
+                oa_.eval(x[0], x[1], C, Cu, Cv);
+                if (i > 0) len += norm(C - prev);
+                prev = C;
+            }
+            if (ok && std::isfinite(len)) w[static_cast<std::size_t>(k)] = len;
+            total += w[static_cast<std::size_t>(k)];
+        }
+        brk_.assign(static_cast<std::size_t>(n) + 1, 0.0);
+        const bool even = !(total > 0.0);
+        // A floor keeps every segment a positive share of sigma.
+        double sum = 0.0;
+        for (int k = 0; k < n; ++k) sum += even ? 1.0 : std::max(w[static_cast<std::size_t>(k)], 1e-6 * total);
+        double acc = 0.0;
+        for (int k = 0; k < n; ++k) {
+            acc += even ? 1.0 : std::max(w[static_cast<std::size_t>(k)], 1e-6 * total);
+            brk_[static_cast<std::size_t>(k) + 1] = acc / sum;
+        }
+        brk_.back() = 1.0;
     }
 
     /// Contacts and centre over a sigma range, lifted with their sigma-derivatives.
@@ -506,9 +553,7 @@ class BlendCarrier final : public geom::Carrier {
     std::optional<SpineJet> compute_spine_jet(int k, double s0, double s1) const {
         using namespace carrier_detail;
         const TubeSegment& seg = segs_[static_cast<std::size_t>(k)];
-        const double n = count();
-        const double f0 = s0 * n - k, f1 = s1 * n - k;
-        const double c0 = slice(k, std::clamp(f0, 0.0, 1.0)), c1 = slice(k, std::clamp(f1, 0.0, 1.0));
+        const double c0 = slice(k, local(k, s0)), c1 = slice(k, local(k, s1));
         const Interval Cs(std::min(c0, c1), std::max(c0, c1));
         const auto sy = sys();
         Pt4 xhat;
@@ -541,7 +586,8 @@ class BlendCarrier final : public geom::Carrier {
         }
         std::array<Interval, 4> xp;
         if (!spine_derivative(sy, seg.m, K, xp)) return std::nullopt;
-        const Interval dcds(seg.reversed ? -seg.len * n : seg.len * n);
+        const Interval wk = Interval(brk_[static_cast<std::size_t>(k) + 1]) - Interval(brk_[static_cast<std::size_t>(k)]);
+        const Interval dcds = Interval(seg.reversed ? -seg.len : seg.len) / wk;
         for (auto& d : xp) d = d * dcds;
 
         geom::IVec3 SA, SAu, SAv, OA, OAu, OAv, SB, SBs, SBt;
@@ -600,16 +646,23 @@ class BlendCarrier final : public geom::Carrier {
 
 public:
     /// `spine` is one curve of find_spines(A, B, r) (or trace_spine's segments).
-    BlendCarrier(const PolyPatchD& A, const PolyPatchD& B, double r, std::vector<TubeSegment> spine)
-        : pa_(A), pb_(B), oa_(A, r), ob_(B, r), r_(r), segs_(std::move(spine)) {}
+    /// `side` = -1 puts the ball on the side opposite the supports' normals
+    /// (outward normals of a solid and a convex edge): the spine is then that
+    /// of OffsetCarrier(A, -r) and OffsetCarrier(B, -r).
+    BlendCarrier(const PolyPatchD& A, const PolyPatchD& B, double r, std::vector<TubeSegment> spine, int side = 1)
+        : pa_(A), pb_(B), oa_(A, side * r), ob_(B, side * r), r_(r), segs_(std::move(spine)) {
+        make_breaks();
+    }
 
     std::size_t segments() const { return segs_.size(); }
+    /// sigma is smooth on each spine segment, kinked between them.
+    std::vector<double> breaks_u() const override { return brk_; }
 
     /// Spine parameters (u, v, s, t) at sigma, in doubles.
     bool spine_at(double sigma, Pt4& x) const {
         const int k = segment_of(sigma);
         const TubeSegment& seg = segs_[static_cast<std::size_t>(k)];
-        const double c = slice(k, std::clamp(sigma * count() - k, 0.0, 1.0));
+        const double c = slice(k, local(k, sigma));
         for (int i = 0; i < 4; ++i) x[i] = seg.a[i] + c * seg.m[i];
         return newton_slice(sys(), seg.m, seg.a, c, x);
     }
@@ -629,9 +682,18 @@ public:
             return f.status == geom::BlendStatus::Ok ? f.arc.point(th) : c;
         };
         P = at(sigma, theta);
-        const double h = 1e-6;
-        Ps = (at(sigma + h, theta) - at(sigma - h, theta)) / (2 * h);
-        Pt = (at(sigma, theta + h) - at(sigma, theta - h)) / (2 * h);
+        // Differences in sigma stay inside sigma's spine segment (the speed
+        // may jump at its ends): one-sided, second order, near them.
+        const int k = segment_of(sigma);
+        const double lo = brk_[static_cast<std::size_t>(k)], hi = brk_[static_cast<std::size_t>(k) + 1];
+        const double h = std::min(1e-6, 0.25 * (hi - lo));
+        if (sigma - h < lo)
+            Ps = (at(sigma + h, theta) * 4.0 - at(sigma + 2 * h, theta) - P * 3.0) / (2 * h);
+        else if (sigma + h > hi)
+            Ps = (P * 3.0 - at(sigma - h, theta) * 4.0 + at(sigma - 2 * h, theta)) / (2 * h);
+        else
+            Ps = (at(sigma + h, theta) - at(sigma - h, theta)) / (2 * h);
+        Pt = (at(sigma, theta + 1e-6) - at(sigma, theta - 1e-6)) / 2e-6;
     }
 
     geom::IVec3 point_at(double sigma, double theta) const override {
@@ -647,8 +709,8 @@ public:
         const int k0 = segment_of(s0), k1 = segment_of(s1);
         bool first = true;
         for (int k = k0; k <= k1; ++k) {
-            const double a = std::max(s0, static_cast<double>(k) / count());
-            const double b = std::min(s1, static_cast<double>(k + 1) / count());
+            const double a = std::max(s0, brk_[static_cast<std::size_t>(k)]);
+            const double b = std::min(s1, brk_[static_cast<std::size_t>(k) + 1]);
             geom::IVec3 p, ps, pt;
             if (!segment_jet(k, a, b, Interval(t0, t1), p, ps, pt)) return false;
             if (first) { P = p; Ps = ps; Pt = pt; first = false; }

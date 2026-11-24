@@ -26,6 +26,7 @@
 
 #include <array>
 #include <memory>
+#include <vector>
 
 #include <akernel/geom/bernstein.hpp>
 #include <akernel/geom/offset_validity.hpp>
@@ -44,6 +45,10 @@ public:
     /// (a weight or |S_u x S_v| not proven positive on the box).
     virtual bool jet1_over(double u0, double u1, double v0, double v1, IVec3& P, IVec3& Pu,
                            IVec3& Pv) const = 0;
+    /// Break points 0 = b0 < ... < bn = 1 in u: the carrier is smooth on each
+    /// piece, its u-derivative may jump between them (e.g. at the segments
+    /// of a traced spine). Quadrature and sampling align with them.
+    virtual std::vector<double> breaks_u() const { return {0.0, 1.0}; }
 };
 
 namespace carrier_detail {
