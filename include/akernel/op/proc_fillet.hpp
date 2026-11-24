@@ -37,6 +37,7 @@
 #include <vector>
 
 #include <akernel/op/brep.hpp>
+#include <akernel/op/proc_edge.hpp>
 #include <akernel/solve/carrier_ssi.hpp>
 
 namespace ak::op {
@@ -63,22 +64,25 @@ inline bool invert(const PolyPatchD& P, const Vec3d& q, double& u, double& v) {
     return true;
 }
 
-/// A side of the blend's square: theta = 0 or 1 (a contact curve, tau =
-/// sigma) or sigma = 0 or 1 (an end section, tau = theta), possibly with tau
-/// reversed so that it runs from the edge's v0 to v1.
+/// A side of the blend's square, or part of one: a contact curve (theta = 0
+/// or 1, sigma from `from` to `to`) or an end section (sigma fixed, theta
+/// from `from` to `to`); tau runs from the edge's v0 to v1. On a support the
+/// contact curve is read through the spine's coordinates, divided by
+/// `scale` (a support restricted to [0, scale] in that coordinate).
 class BlendSide final : public ProcEdge {
 public:
     std::shared_ptr<const solve::BlendCarrier> blend;
     int proc = -1;
     bool contact = true;   ///< contact curve (theta fixed) or end section (sigma fixed)
     double fixed = 0.0;    ///< the fixed theta or sigma
-    bool flip = false;     ///< tau = 1 - (sigma or theta)
+    double from = 0.0, to = 1.0;
     int support = -1;      ///< contact: the carrier the spine coordinates refer to
     int coord = 0;         ///< 0: (u, v) on A, 2: (s, t) on B
+    double scale[2] = {1.0, 1.0};
     int plane = -1;        ///< end section: the end face's carrier
     PolyPatchD plane_patch;
 
-    double param(double tau) const { return flip ? 1.0 - tau : tau; }
+    double param(double tau) const { return from + tau * (to - from); }
     void st(double tau, double& s, double& t) const {
         if (contact) { s = param(tau); t = fixed; }
         else { s = fixed; t = param(tau); }
@@ -100,8 +104,8 @@ public:
             if (carrier != support) return false;
             solve::Pt4 x;
             if (!blend->spine_at(param(tau), x)) return false;
-            u = x[static_cast<std::size_t>(coord)];
-            v = x[static_cast<std::size_t>(coord + 1)];
+            u = x[static_cast<std::size_t>(coord)] / scale[0];
+            v = x[static_cast<std::size_t>(coord + 1)] / scale[1];
             return true;
         }
         if (carrier != plane) return false;
@@ -110,25 +114,17 @@ public:
     }
     bool on_carrier(int carrier, double tau, double& u, double& v, double& du, double& dv) const override {
         if (!uv(carrier, tau, u, v)) return false;
-        // Central differences inside tau's piece (one-sided at its ends).
-        const std::vector<double> bk = breaks();
-        const auto it = std::upper_bound(bk.begin() + 1, bk.end() - 1, tau);
-        const double lo = *(it - 1), hi = *it;
-        const double h = std::min(1e-6, 0.25 * (hi - lo)), ta = std::max(lo, tau - h), tb = std::min(hi, tau + h);
-        double ua, va, ub, vb;
-        if (!uv(carrier, ta, ua, va) || !uv(carrier, tb, ub, vb)) return false;
-        du = (ub - ua) / (tb - ta);
-        dv = (vb - va) / (tb - ta);
-        return true;
+        return piece_derivative(breaks(), tau, [&](double t, double& p, double& q) { return uv(carrier, t, p, q); }, du, dv);
     }
     std::vector<double> breaks() const override {
         if (!contact) return ProcEdge::breaks();
-        std::vector<double> b = blend->breaks_u();
-        if (flip) {
-            std::reverse(b.begin(), b.end());
-            for (double& x : b) x = 1.0 - x;
-        }
-        return b;
+        const double lo = std::min(from, to), hi = std::max(from, to);
+        std::vector<double> t{0.0};
+        for (double s : blend->breaks_u())
+            if (s > lo && s < hi) t.push_back((s - from) / (to - from));
+        t.push_back(1.0);
+        std::sort(t.begin(), t.end());
+        return t;
     }
 };
 
@@ -172,18 +168,30 @@ inline PatchSolid freeform_block(const PolyPatchD& top) {
 }
 
 /// Round the edge between the top and the side x = a by radius r.
-inline ProcFilletResult round_block_edge(const PolyPatchD& top, double r, const solve::SsiOptions& opt = {}) {
+///
+/// `cut` in (0, 1]: the block ends at y = cut L instead of y = L. There the
+/// top need not be flat across the end, so the ball's end section leaves the
+/// end plane: the blend (built on the whole supports) is trimmed by its
+/// intersection with the end face, a traced curve (op/proc_edge.hpp), and
+/// the procedural face is no longer its whole square. `cut` should be
+/// dyadic so that the restricted faces are exact.
+inline ProcFilletResult round_block_edge(const PolyPatchD& top, double r, const solve::SsiOptions& opt = {},
+                                         double cut = 1.0) {
     using namespace proc_fillet_detail;
     ProcFilletResult res;
     const int p = top.p, q = top.q;
+    const bool trimmed = cut < 1.0;
+    if (!(cut > 0.0 && cut <= 1.0)) { res.error = "the cut must be in (0, 1]"; return res; }
     if (q < 3) { res.error = "the top needs degree >= 3 across the ends"; return res; }
     for (int i = 0; i <= p; ++i)
-        if (top.at(i, 0).z != top.at(i, 1).z || top.at(i, q).z != top.at(i, q - 1).z) {
+        if (top.at(i, 0).z != top.at(i, 1).z || (!trimmed && top.at(i, q).z != top.at(i, q - 1).z)) {
             res.error = "the top must have zero slope across the end planes";
             return res;
         }
-    const PatchSolid block = freeform_block(top);
-    const PolyPatchD& B = block.faces[2];
+    // The supports of the blend are the whole faces; the solid's faces are
+    // the block under the top restricted to v in [0, cut].
+    const PolyPatchD B = freeform_block(top).faces[2];
+    const PatchSolid block = freeform_block(trimmed ? top.restricted(0.0, 1.0, 0.0, cut) : top);
     enum { kBottom, kX0, kB, kTop, kEnd0, kEndL };
 
     // The spine: the ball inside the material, opposite the outward normals.
@@ -200,15 +208,55 @@ inline ProcFilletResult round_block_edge(const PolyPatchD& top, double r, const 
     // Orient sigma from y = 0 to y = L (top coordinate v = x[1]).
     const bool sigma_up = x0[1] < x1[1];
     const solve::Pt4 e0 = sigma_up ? x0 : x1, eL = sigma_up ? x1 : x0;
-    if (!(std::fabs(e0[1]) < 1e-9 && std::fabs(eL[1] - 1.0) < 1e-9 && std::fabs(e0[2]) < 1e-9 &&
-          std::fabs(eL[2] - 1.0) < 1e-9)) {
-        res.error = "the spine does not end on both end planes";
+    if (!(std::fabs(e0[1]) < 1e-9 && std::fabs(e0[2]) < 1e-9)) {
+        res.error = "the spine does not end on the end plane y = 0";
+        return res;
+    }
+    if (!trimmed && !(std::fabs(eL[1] - 1.0) < 1e-9 && std::fabs(eL[2] - 1.0) < 1e-9)) {
+        res.error = "the spine does not end on the end plane y = L";
         return res;
     }
 
     Brep b;
     b.carriers = block.faces;
     b.procs.push_back(blend);
+    const double s0 = sigma_up ? 0.0 : 1.0;
+    // The far end: sigma of the contacts there (A on the top, B on the side),
+    // and, for a cut, the trimming curve.
+    double sA = 1.0 - s0, sB = 1.0 - s0;
+    std::shared_ptr<TracedEdge> end_curve;
+    if (trimmed) {
+        auto plane = std::make_shared<geom::PatchCarrier>(b.carriers[kEndL]);
+        const solve::SsiResult cr = solve::intersect_carriers(*blend, *plane, opt);
+        if (!cr.complete || cr.curves.size() != 1) {
+            res.error = "expected exactly one curve where the blend meets the end face, with a completeness proof";
+            return res;
+        }
+        end_curve = std::make_shared<TracedEdge>();
+        end_curve->a = blend;
+        end_curve->b = plane;
+        end_curve->proc[0] = 0;
+        end_curve->carrier[1] = kEndL;
+        end_curve->path.segs = cr.curves[0].segs;
+        end_curve->path.make_breaks(end_curve->sys(), *blend);
+        // Run it from theta = 0 (on the top) to theta = 1 (on the side).
+        solve::Pt4 c0, c1;
+        end_curve->from = 0.0;
+        end_curve->to = 1.0;
+        if (!end_curve->at(0.0, c0) || !end_curve->at(1.0, c1)) { res.error = "trimming curve ends"; return res; }
+        if (c0[1] > c1[1]) {
+            std::swap(c0, c1);
+            end_curve->from = 1.0;
+            end_curve->to = 0.0;
+        }
+        if (!(std::fabs(c0[1]) < 1e-9 && std::fabs(c1[1] - 1.0) < 1e-9)) {
+            res.error = "the trimming curve does not run from contact to contact";
+            return res;
+        }
+        sA = c0[0];
+        sB = c1[0];
+    }
+
     auto vertex = [&](const Vec3d& pt) {
         b.vertices.push_back({});
         b.vertices.back().point = pt;
@@ -224,16 +272,18 @@ inline ProcFilletResult round_block_edge(const PolyPatchD& top, double r, const 
     const int P000 = vertex(corner(kBottom, 0, 0)), P0L0 = vertex(corner(kBottom, 1, 0)), PaL0 = vertex(corner(kBottom, 1, 1)),
               Pa00 = vertex(corner(kBottom, 0, 1)), T00 = vertex(corner(kTop, 0, 0)), T0L = vertex(corner(kTop, 0, 1));
     Vec3d P, Ps, Pt;
-    const double s0 = sigma_up ? 0.0 : 1.0, sL = 1.0 - s0;
     blend->eval(s0, 0, P, Ps, Pt);
     const int A0 = vertex(P);
-    blend->eval(sL, 0, P, Ps, Pt);
+    blend->eval(sA, 0, P, Ps, Pt);
     const int AL = vertex(P);
     blend->eval(s0, 1, P, Ps, Pt);
     const int B0 = vertex(P);
-    blend->eval(sL, 1, P, Ps, Pt);
+    blend->eval(sB, 1, P, Ps, Pt);
     const int BL = vertex(P);
-    const double uA0 = e0[0], uAL = eL[0], vB0 = e0[3], vBL = eL[3];
+    solve::Pt4 xA, xB;
+    blend->spine_at(sA, xA);
+    blend->spine_at(sB, xB);
+    const double uA0 = e0[0], uAL = xA[0], vB0 = e0[3], vBL = xB[3];
     chart(P000, kBottom, 0, 0); chart(P000, kX0, 0, 0); chart(P000, kEnd0, 0, 0);
     chart(P0L0, kBottom, 1, 0); chart(P0L0, kX0, 0, 1); chart(P0L0, kEndL, 0, 0);
     chart(PaL0, kBottom, 1, 1); chart(PaL0, kB, 1, 0);  chart(PaL0, kEndL, 0, 1);
@@ -241,8 +291,11 @@ inline ProcFilletResult round_block_edge(const PolyPatchD& top, double r, const 
     chart(T00, kX0, 1, 0);      chart(T00, kTop, 0, 0); chart(T00, kEnd0, 0, 1);
     chart(T0L, kX0, 1, 1);      chart(T0L, kTop, 0, 1); chart(T0L, kEndL, 1, 0);
     chart(A0, kTop, uA0, 0); chart(A0, kEnd0, uA0, 1);
-    chart(AL, kTop, uAL, 1); chart(AL, kEndL, 1, uAL);
     chart(B0, kB, 0, vB0);   chart(B0, kEnd0, 1, vB0);
+    // At the far end, on the end face (u: height fraction, v: x / a): A is
+    // on its side u = 1 and B on its side v = 1; the other coordinate is
+    // that of the contact on the top or the side.
+    chart(AL, kTop, uAL, 1); chart(AL, kEndL, 1, uAL);
     chart(BL, kB, 1, vBL);   chart(BL, kEndL, vBL, 1);
 
     // Side edges: (carrier, side) pairs, edge parameter = side parameter on both.
@@ -268,29 +321,45 @@ inline ProcFilletResult round_block_edge(const PolyPatchD& top, double r, const 
     const int E9 = side_edge(Pa00, B0, kB, 3, kEnd0, 1, 0, vB0);
     const int E10 = side_edge(T00, A0, kTop, 0, kEnd0, 2, 0, uA0);
     const int E11 = side_edge(T0L, AL, kTop, 2, kEndL, 1, 0, uAL);
-    // Procedural edges: the blend's square sides.
-    auto proc_edge = [&](int v0, int v1, bool contact, double fixed, bool flip, int support, int coord, int plane) {
-        auto pe = std::make_shared<BlendSide>();
-        pe->blend = blend;
-        pe->proc = 0;
-        pe->contact = contact;
-        pe->fixed = fixed;
-        pe->flip = flip;
-        pe->support = support;
-        pe->coord = coord;
-        pe->plane = plane;
-        if (plane >= 0) pe->plane_patch = b.carriers[static_cast<std::size_t>(plane)];
+    // Procedural edges: parts of the blend's square sides, and the trimming curve.
+    auto add_edge = [&](int v0, int v1, std::shared_ptr<const ProcEdge> pe) {
         BEdge e;
         e.v0 = v0;
         e.v1 = v1;
-        e.proc = pe;
+        e.proc = std::move(pe);
         b.edges.push_back(e);
         return static_cast<int>(b.edges.size()) - 1;
     };
-    const int EcA = proc_edge(A0, AL, true, 0.0, !sigma_up, kTop, 0, -1);
-    const int EcB = proc_edge(B0, BL, true, 1.0, !sigma_up, kB, 2, -1);
-    const int Es0 = proc_edge(A0, B0, false, s0, false, -1, 0, kEnd0);
-    const int EsL = proc_edge(AL, BL, false, sL, false, -1, 0, kEndL);
+    auto contact = [&](int v0, int v1, double theta, double from, double to, int support, int coord, double sc0, double sc1) {
+        auto pe = std::make_shared<BlendSide>();
+        pe->blend = blend;
+        pe->proc = 0;
+        pe->contact = true;
+        pe->fixed = theta;
+        pe->from = from;
+        pe->to = to;
+        pe->support = support;
+        pe->coord = coord;
+        pe->scale[0] = sc0;
+        pe->scale[1] = sc1;
+        return add_edge(v0, v1, pe);
+    };
+    auto section = [&](int v0, int v1, double sigma, int plane) {
+        auto pe = std::make_shared<BlendSide>();
+        pe->blend = blend;
+        pe->proc = 0;
+        pe->contact = false;
+        pe->fixed = sigma;
+        pe->plane = plane;
+        pe->plane_patch = b.carriers[static_cast<std::size_t>(plane)];
+        return add_edge(v0, v1, pe);
+    };
+    // The supports' coordinates on the restricted faces: v / cut on the top,
+    // s / cut on the side.
+    const int EcA = contact(A0, AL, 0.0, s0, sA, kTop, 0, 1.0, cut);
+    const int EcB = contact(B0, BL, 1.0, s0, sB, kB, 2, cut, 1.0);
+    const int Es0 = section(A0, B0, s0, kEnd0);
+    const int EsL = trimmed ? add_edge(AL, BL, end_curve) : section(AL, BL, sA, kEndL);
 
     // Loops: counter-clockwise in each face's parameters; a coedge is
     // reversed when the loop meets the edge's v1 first.
@@ -311,20 +380,19 @@ inline ProcFilletResult round_block_edge(const PolyPatchD& top, double r, const 
     face(kTop, loop({{E10, T00}, {EcA, A0}, {E11, AL}, {E6, T0L}}));
     face(kEnd0, loop({{E4, P000}, {E9, Pa00}, {Es0, B0}, {E10, A0}, {E5, T00}}));
     face(kEndL, loop({{E7, P0L0}, {E11, T0L}, {EsL, AL}, {E8, BL}, {E2, PaL0}}));
-    // The blend: square sides in counter-clockwise order of (sigma, theta).
+    // The blend: counter-clockwise in (sigma, theta). With sigma rising from
+    // the end y = 0 the region lies at larger sigma than that end.
     {
-        const int sig0A = sigma_up ? A0 : AL, sig1A = sigma_up ? AL : A0;
-        const int sig1B = sigma_up ? BL : B0;
-        const int Es_at0 = sigma_up ? Es0 : EsL, Es_at1 = sigma_up ? EsL : Es0;
-        (void)sig1A;
         BFace f;
         f.proc = 0;
-        f.loops.push_back(loop({{EcA, sig0A}, {Es_at1, sigma_up ? AL : A0}, {EcB, sig1B}, {Es_at0, sigma_up ? B0 : BL}}));
+        if (sigma_up) f.loops.push_back(loop({{EcA, A0}, {EsL, AL}, {EcB, BL}, {Es0, B0}}));
+        else f.loops.push_back(loop({{EcA, AL}, {Es0, A0}, {EcB, B0}, {EsL, BL}}));
         // Outward: away from the ball centre.
+        const double sm = 0.5 * (s0 + 0.5 * (sA + sB));
         Vec3d Q, Qs, Qt;
-        blend->eval(0.5, 0.5, Q, Qs, Qt);
+        blend->eval(sm, 0.5, Q, Qs, Qt);
         solve::Pt4 x;
-        blend->spine_at(0.5, x);
+        blend->spine_at(sm, x);
         Vec3d c, cu, cv;
         geom::OffsetCarrier(top, -r).eval(x[0], x[1], c, cu, cv);
         f.flipped = dot(cross(Qs, Qt), Q - c) < 0.0;

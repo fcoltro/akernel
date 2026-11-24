@@ -196,7 +196,9 @@ Data model, added to `op::Brep` without changing the rational path:
 
 First target: a block whose top is freeform, with the edge between the top and a side rounded. The top is chosen with zero slope across the two end planes, so each end section of the blend lies in its end plane, and the end faces are trimmed by a planar arc rather than by a cap.
 
-State (2026-11-24): done for checks, volume and meshing (`op/proc_fillet.hpp`, `round_block_edge`; RESULTS §12, "A freeform fillet inside a solid"). The rounded freeform block audits closed, its volume matches the closed form on a flat top and an independent slice integration on a freeform top to 5e-12, and it meshes watertight. Booleans still refuse procedural faces; that is the next step.
+State (2026-11-24): done for checks, volume and meshing (`op/proc_fillet.hpp`, `round_block_edge`; RESULTS §12, "A freeform fillet inside a solid"). The rounded freeform block audits closed, its volume matches the closed form on a flat top and an independent slice integration on a freeform top to 5e-12, and it meshes watertight. Booleans still refuse procedural faces. Then trimmed procedural faces: a blend cut by an end face that is not flat across it, the trimming curve a traced intersection edge (`op/proc_edge.hpp`).
+
+Decision (2026-11-24, project owner): Booleans on procedural faces start with cuts by solids whose faces are flat. Procedural faces against curved faces come later. The order: trimmed procedural faces (done), a plane cut of any solid with procedural faces, then Booleans whose other operand has flat faces.
 
 ## 6. Plan
 

@@ -209,10 +209,24 @@ struct Verifier {
             unverified.push_back(box);
             return;
         }
+        // Split where the box is widest in space: parameter width times the
+        // largest speed in that direction (plain width if not bounded).
+        double speed[4] = {1.0, 1.0, 1.0, 1.0};
+        if (ok) {
+            auto mag = [](const geom::IVec3& d) {
+                const double x = num::mag(d.x), y = num::mag(d.y), z = num::mag(d.z);
+                return std::sqrt(x * x + y * y + z * z);
+            };
+            const double sp[4] = {mag(Au), mag(Av), mag(Bs), mag(Bt)};
+            bool finite = true;
+            for (double v : sp) finite = finite && std::isfinite(v) && v > 0.0;
+            if (finite)
+                for (int i = 0; i < 4; ++i) speed[i] = sp[i];
+        }
         int dim = 0;
         double wmax = 0.0;
         for (int i = 0; i < 4; ++i) {
-            const double w = box[i].hi - box[i].lo;
+            const double w = (box[i].hi - box[i].lo) * speed[i];
             if (w > wmax) { wmax = w; dim = i; }
         }
         const double midv = num::mid(box[dim]);

@@ -1425,7 +1425,7 @@ What this does not show yet: edges of solids that are not swept (faces that are 
 
 ### A freeform fillet inside a solid (F5 on freeform supports, procedural faces)
 
-From `tests/op/proc_fillet_test.cpp` (23 checks, about 45 s, most of it the mesh-deviation measurement). `op/proc_fillet.hpp` builds a block whose top is a polynomial graph over the rectangle and rounds the edge between the top and the side x = a with a rolling ball. The dihedral angle varies along the edge, so the blend is not a rational surface. It is a procedural face: `Brep::procs` holds the `BlendCarrier` and the face is that carrier over its whole parameter square (docs/FEATURES.md §5.1). The top and the side are trimmed along the contact curves, which are procedural edges read in each support's parameters through the certified spine's own coordinates. The end faces are trimmed by the blend's end sections, which lie in the end planes because the top has zero slope across them.
+From `tests/op/proc_fillet_test.cpp` (41 checks, about 2 minutes, most of it the blend–plane intersections and the mesh-deviation measurement). `op/proc_fillet.hpp` builds a block whose top is a polynomial graph over the rectangle and rounds the edge between the top and the side x = a with a rolling ball. The dihedral angle varies along the edge, so the blend is not a rational surface. It is a procedural face: `Brep::procs` holds the `BlendCarrier` and the face is that carrier over its whole parameter square (docs/FEATURES.md §5.1). The top and the side are trimmed along the contact curves, which are procedural edges read in each support's parameters through the certified spine's own coordinates. The end faces are trimmed by the blend's end sections, which lie in the end planes because the top has zero slope across them.
 
 The top is z = h + c x s(y/L), with s the smoothstep 3t² − 2t³ (degree (1, 3); a = 1, L = 2, h = 3/4, r = 1/4).
 
@@ -1443,4 +1443,14 @@ Three things had to change in the carrier for this.
 - Quadrature and sampling align with the carrier's smooth pieces (`Carrier::breaks_u`, `ProcEdge::breaks`), since the speed in sigma still has small jumps between segments.
 - The differences that give the double-precision partials stay inside a piece, one-sided at its ends. Central differences across sigma = 0 had cut the blend's flux by 2e-7.
 
-What this does not show yet: Booleans on procedural faces, blends that do not end in planes (end caps, chains meeting other blends), and freeform support pairs other than a graph top with a plane.
+Trimmed procedural faces. `round_block_edge(top, r, opt, cut)` ends the block at y = cut · L, where the top need not be flat across the end. The ball's end section then leaves the end plane, so the blend (built on the whole supports) is trimmed by its intersection with the end face. That curve is a `TracedEdge` (`op/proc_edge.hpp`): the certified intersection of the two carriers, found by `intersect_carriers` with a completeness proof and kept as its tube segments. Each face reads it in its own parameters through the curve's coordinates. Volume on a procedural face now uses Green's theorem in the carrier's (sigma, theta), so trimmed and whole faces go through the same code.
+
+| Case (cut = 3/4) | Faces / edges / vertices | Volume |
+|---|---|---|
+| Flat top | 7 / 15 / 10 | 1.104881077821548 vs closed form …818511 (3.0e-12) |
+| Freeform top | 7 / 15 / 10 | 1.225637639929603; removed 0.031198297570, by slices …574 (3.6e-12) |
+| Same, moved by (1/2, −1/2, 0) | 7 / 15 / 10 | differs by 3.9e-12 |
+
+Both are closed with Euler 2 and mesh watertight (deviation 3.1e-4). The cost is the blend–plane intersection with its completeness proof: about 18 s here, against 1 s for the rest. Its verifier now splits a box where it is widest in space (parameter width times speed), which cut the boxes by a quarter. Getting to about 1 s needs tighter enclosures of the blend over boxes; that is a follow-up.
+
+What this does not show yet: Booleans on procedural faces (next: cuts by planar solids, decided 2026-11-24), blends meeting other blends (chains, caps), and freeform support pairs other than a graph top with a plane.

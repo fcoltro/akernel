@@ -36,9 +36,9 @@ double seconds_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
-op::ProcFilletResult build(const op::PolyPatchD& top, double r, const char* name) {
+op::ProcFilletResult build(const op::PolyPatchD& top, double r, const char* name, double cut = 1.0) {
     const auto t0 = std::chrono::steady_clock::now();
-    op::ProcFilletResult res = op::round_block_edge(top, r);
+    op::ProcFilletResult res = op::round_block_edge(top, r, {}, cut);
     if (!res.solid) std::printf("%s: refused: %s\n", name, res.error.c_str());
     AK_CHECK(res.solid.has_value());
     if (res.solid) {
@@ -69,7 +69,7 @@ op::ProcFilletResult build(const op::PolyPatchD& top, double r, const char* name
 /// x there, the side x = a and the blend's section curve, found by solving
 /// P(sigma, theta).y = y0 per theta), by a shoelace on n chords with
 /// Richardson extrapolation, integrated over y by Gauss 8 on 8 cells.
-double removed_by_slices(const solve::BlendCarrier& blend, double a, double L, double h, double c) {
+double removed_by_slices(const solve::BlendCarrier& blend, double a, double L, double h, double c, double y_end) {
     auto cut_area = [&](double y0, int n) {
         const double t = y0 / L, sy = t * t * (3 - 2 * t);
         std::vector<Vec3d> poly;
@@ -118,9 +118,9 @@ double removed_by_slices(const solve::BlendCarrier& blend, double a, double L, d
     for (int k = 0; k < cells; ++k)
         for (int i = 0; i < 4; ++i)
             for (int sgn = -1; sgn <= 1; sgn += 2) {
-                const double y = L * (k + 0.5 + 0.5 * sgn * gx[i]) / cells;
+                const double y = y_end * (k + 0.5 + 0.5 * sgn * gx[i]) / cells;
                 const double a1 = cut_area(y, 300), a2 = cut_area(y, 600);
-                total += 0.5 * gw[i] * (L / cells) * (a2 + (a2 - a1) / 3);
+                total += 0.5 * gw[i] * (y_end / cells) * (a2 + (a2 - a1) / 3);
             }
     return total;
 }
@@ -154,7 +154,7 @@ int main() {
             AK_CHECK_NEAR(op::volume(unrounded), block, 1e-12);
             std::printf("  volume %.15f, block %.15f, removed %.6f\n", v_free, block, block - v_free);
             AK_CHECK(v_free < block && block - v_free < r * r * L);
-            const double slices = removed_by_slices(*res.blend, a, L, h, c);
+            const double slices = removed_by_slices(*res.blend, a, L, h, c, L);
             std::printf("  removed by slices %.12f, difference %.2e\n", slices, block - v_free - slices);
             AK_CHECK_NEAR(block - v_free, slices, 1e-9);
             // Booleans do not read procedural faces yet: they refuse.
@@ -169,6 +169,37 @@ int main() {
             const double v = op::volume(*res.solid);
             std::printf("  volume %.15f, difference %.2e\n", v, v - v_free);
             AK_CHECK_NEAR(v, v_free, 1e-10);
+        }
+    }
+    // The block cut at y = 3L/4, where the top is not flat across the end:
+    // the blend leaves the end plane and is trimmed by a traced curve.
+    const double cut = 0.75, y1 = cut * L;
+    {
+        auto res = build(top_patch(a, L, h, 0.0), r, "flat top, cut at 3L/4", cut);
+        if (res.solid) {
+            const double v = op::volume(*res.solid), exact = a * y1 * h - (1 - M_PI / 4) * r * r * y1;
+            std::printf("  volume %.15f, closed form %.15f, error %.2e\n", v, exact, v - exact);
+            AK_CHECK_NEAR(v, exact, 1e-10);
+        }
+    }
+    double v_cut = 0.0;
+    {
+        auto res = build(top_patch(a, L, h, c), r, "freeform top, cut at 3L/4", cut);
+        if (res.solid) {
+            v_cut = op::volume(*res.solid);
+            const double T = cut, block = a * y1 * h + c * a * a / 2 * L * (T * T * T - T * T * T * T / 2);
+            const double slices = removed_by_slices(*res.blend, a, L, h, c, y1);
+            std::printf("  volume %.15f, block %.15f, removed %.12f, by slices %.12f, difference %.2e\n", v_cut, block,
+                        block - v_cut, slices, block - v_cut - slices);
+            AK_CHECK_NEAR(block - v_cut, slices, 1e-9);
+        }
+    }
+    {
+        auto res = build(top_patch(a, L, h, c, 0.5, -0.5), r, "freeform top, cut at 3L/4, moved", cut);
+        if (res.solid) {
+            const double v = op::volume(*res.solid);
+            std::printf("  volume %.15f, difference %.2e\n", v, v - v_cut);
+            AK_CHECK_NEAR(v, v_cut, 1e-10);
         }
     }
     // Refusals.

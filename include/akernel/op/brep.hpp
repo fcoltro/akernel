@@ -76,6 +76,20 @@ struct ProcEdge {
     virtual std::vector<double> breaks() const { return {0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0}; }
 };
 
+/// Central differences of a curve's parameters in tau, inside tau's piece of
+/// `breaks` (one-sided at its ends): the curve may have a kink between pieces.
+template <class F>
+bool piece_derivative(const std::vector<double>& breaks, double tau, const F& uv, double& du, double& dv) {
+    const auto it = std::upper_bound(breaks.begin() + 1, breaks.end() - 1, tau);
+    const double lo = *(it - 1), hi = *it;
+    const double h = std::min(1e-6, 0.25 * (hi - lo)), ta = std::max(lo, tau - h), tb = std::min(hi, tau + h);
+    double ua, va, ub, vb;
+    if (!uv(ta, ua, va) || !uv(tb, ub, vb)) return false;
+    du = (ub - ua) / (tb - ta);
+    dv = (vb - va) / (tb - ta);
+    return true;
+}
+
 struct BEdge {
     int v0 = -1, v1 = -1;
     bool arc = false;
@@ -283,24 +297,41 @@ inline double volume(const Brep& b, bool quick = false) {
     double total = 0.0;
     for (const BFace& face : b.faces) {
         if (face.proc >= 0) {
-            // S . (Ss x St) over the whole square, Gauss 8 x 8 on a grid of
-            // cells aligned with the carrier's smooth pieces in s.
+            // Green's theorem in the carrier's (s, t): the flux of the trimmed
+            // face is the loop integral of F ds, F(s, t) = -integral from 0 to
+            // t of S . (Ss x St) (Gauss 8 on 2 cells in t). Edges are taken
+            // piece by piece of their breaks, 4 cells each.
             const geom::Carrier& C = *b.procs[static_cast<std::size_t>(face.proc)];
             const UnitRule& g = rule(8);
-            const std::vector<double> bs = C.breaks_u();
-            const int sub = 4, nt = 8;
+            auto F = [&](double s, double t) {
+                double acc = 0.0;
+                for (int c = 0; c < 2; ++c)
+                    for (std::size_t j = 0; j < g.x.size(); ++j) {
+                        const double tt = t * (c + g.x[j]) / 2;
+                        Vec3d P, Ps, Pt;
+                        C.eval(s, tt, P, Ps, Pt);
+                        acc += g.w[j] * dot(P, cross(Ps, Pt)) * t / 2;
+                    }
+                return -acc;
+            };
             double flux = 0.0;
-            for (std::size_t piece = 0; piece + 1 < bs.size(); ++piece)
-                for (int a = 0; a < sub; ++a) {
-                    const double s0 = bs[piece] + (bs[piece + 1] - bs[piece]) * a / sub;
-                    const double ds = (bs[piece + 1] - bs[piece]) / sub;
-                    for (int c = 0; c < nt; ++c)
-                        for (std::size_t i = 0; i < g.x.size(); ++i)
-                            for (std::size_t j = 0; j < g.x.size(); ++j) {
-                                Vec3d P, Ps, Pt;
-                                C.eval(s0 + g.x[i] * ds, (c + g.x[j]) / nt, P, Ps, Pt);
-                                flux += g.w[i] * g.w[j] * dot(P, cross(Ps, Pt)) * ds / nt;
+            for (const auto& loop : face.loops)
+                for (const BCoedge& ce : loop) {
+                    const BEdge& e = b.edges[static_cast<std::size_t>(ce.edge)];
+                    if (!e.proc) continue; // a procedural face is bounded by procedural edges
+                    const std::vector<double> bt = e.proc->breaks();
+                    auto st = [&](double tau, double& s, double& t) { return e.proc->on_proc(face.proc, tau, s, t); };
+                    for (std::size_t piece = 0; piece + 1 < bt.size(); ++piece)
+                        for (int k = 0; k < 4; ++k) {
+                            const double dt = (bt[piece + 1] - bt[piece]) / 4, t0 = bt[piece] + k * dt;
+                            for (std::size_t i = 0; i < outer12.x.size(); ++i) {
+                                const double tau = t0 + outer12.x[i] * dt;
+                                double s, t, ds, dtt;
+                                if (!st(tau, s, t) || !piece_derivative(bt, tau, st, ds, dtt)) continue;
+                                if (ds == 0.0) continue;
+                                flux += outer12.w[i] * F(s, t) * (ce.reversed ? -ds : ds) * dt;
                             }
+                        }
                 }
             total += face.flipped ? -flux : flux;
             continue;
