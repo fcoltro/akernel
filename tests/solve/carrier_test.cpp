@@ -8,6 +8,7 @@
 #include <akernel/geom/primitives.hpp>
 #include <akernel/solve/carrier_ssi.hpp>
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 
@@ -143,6 +144,31 @@ int main() {
             AK_CHECK(worst < 1e-12);
             AK_CHECK(arcs == 2 * static_cast<int>(sp->segs.size()));
             AK_CHECK(vmin < 1e-12 && vmax > 1 - 1e-12); // across the whole hill
+        }
+    }
+
+    // --- spines found without a guess, with the completeness proof ------------
+    {
+        struct Case { const char* name; PolyPatchD a, b; double r; std::size_t curves; };
+        const Case cases[] = {
+            {"cylinder/plane", make_cylinder_quarter(2.0, 0.0, 1.0),
+             make_plane({1, 0, -0.5}, {0, 3, 0}, {0, 0, 2}), 0.25, 1},
+            {"hill/wall", make_bump(0.25), make_plane({0.6, -0.5, -0.5}, {0, 0, 2}, {0, 2, 0}), 0.1, 1},
+            {"hill/far wall", make_bump(0.25), make_plane({3.0, -0.5, -0.5}, {0, 0, 2}, {0, 2, 0}), 0.1, 0},
+        };
+        for (const Case& c : cases) {
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto res = ak::solve::find_spines(c.a, c.b, c.r);
+            const double secs =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            std::printf("find_spines %s: %zu curve(s), complete %d, %zu verifier nodes, %.2f s\n", c.name,
+                        res.curves.size(), static_cast<int>(res.complete), res.stats.verify_nodes, secs);
+            AK_CHECK(res.complete);
+            AK_CHECK(res.curves.size() == c.curves);
+            for (const auto& cv : res.curves) {
+                AK_CHECK(cv.end_front == ak::solve::EndKind::Boundary);
+                AK_CHECK(cv.end_back == ak::solve::EndKind::Boundary);
+            }
         }
     }
 

@@ -17,11 +17,13 @@
 // blend is therefore defined by the certified spine and that arc, with no
 // fitted surface: the procedural blend carrier.
 //
-// What is not here yet: the completeness proof of ssi.hpp's intersect()
-// (which subdivides Bezier patches) for carriers, so the spine is traced
-// from given seeds and is complete only along the traced branch.
+// intersect_carriers() finds the curves without a guess and proves that no
+// intersection point in the domain is missed (or reports the boxes it could
+// not resolve), like ssi.hpp's intersect() for patches; find_spines()
+// applies it to two offsets. trace_spine() follows one branch from a guess.
 #pragma once
 
+#include <algorithm>
 #include <optional>
 #include <vector>
 
@@ -103,6 +105,212 @@ public:
         return true;
     }
 };
+
+namespace carrier_detail {
+
+inline bool disjoint3(const geom::IVec3& a, const geom::IVec3& b) {
+    return num::disjoint(a.x, b.x) || num::disjoint(a.y, b.y) || num::disjoint(a.z, b.z);
+}
+
+/// Rigorous enclosure of a carrier's points over a parameter box.
+inline bool point_over(const geom::Carrier& c, const Interval& u, const Interval& v, geom::IVec3& P,
+                       geom::IVec3& Pu, geom::IVec3& Pv) {
+    return c.jet1_over(u.lo, u.hi, v.lo, v.hi, P, Pu, Pv);
+}
+
+/// Range of dir . P over the box, from the enclosures of P (rigorous).
+inline Interval along(const geom::IVec3& P, const Vec3d& dir) {
+    return Interval(dir.x) * P.x + Interval(dir.y) * P.y + Interval(dir.z) * P.z;
+}
+
+/// Separation along an approximate normal of either piece: the mean-value
+/// form gives dir . P over the box as dir . P(c) + (dir . P_u) du + ..., and
+/// near a normal direction dir . P_u and dir . P_v are small, so thin pieces
+/// separate at a coarse level (the analogue of ssi.hpp's
+/// separated_along_normals).
+inline bool separated_along_normals(const geom::Carrier& a, const Box4& X, const geom::Carrier& b) {
+    const double uc = num::mid(X[0]), vc = num::mid(X[1]), sc = num::mid(X[2]), tc = num::mid(X[3]);
+    Vec3d pa, pau, pav, pb, pbs, pbt;
+    a.eval(uc, vc, pa, pau, pav);
+    b.eval(sc, tc, pb, pbs, pbt);
+    geom::IVec3 A, Au, Av, B, Bs, Bt;
+    if (!a.jet1_over(X[0].lo, X[0].hi, X[1].lo, X[1].hi, A, Au, Av)) return false;
+    if (!b.jet1_over(X[2].lo, X[2].hi, X[3].lo, X[3].hi, B, Bs, Bt)) return false;
+    for (const Vec3d& n : {cross(pau, pav), cross(pbs, pbt)}) {
+        const double len = geom::norm(n);
+        if (!(len > 0.0) || !std::isfinite(len)) continue;
+        const Vec3d dir = n / len;
+        // Mean-value ranges of dir . A and dir . B around the box centres.
+        auto mv = [&](const geom::Carrier& c, double uu, double vv, const geom::IVec3& Du,
+                      const geom::IVec3& Dv, const Interval& U, const Interval& V) {
+            const Interval c0 = along(c.point_at(uu, vv), dir);
+            const Interval eu = U - Interval(uu), ev = V - Interval(vv);
+            return c0 + along(Du, dir) * eu + along(Dv, dir) * ev;
+        };
+        const Interval ra = mv(a, uc, vc, Au, Av, X[0], X[1]);
+        const Interval rb = mv(b, sc, tc, Bs, Bt, X[2], X[3]);
+        if (num::is_finite(ra) && num::is_finite(rb) && num::disjoint(ra, rb)) return true;
+    }
+    return false;
+}
+
+inline void collect_seeds(const geom::Carrier& a, const geom::Carrier& b, const Box4& X, int depth,
+                          std::vector<Pt4>& seeds) {
+    geom::IVec3 A, Au, Av, B, Bs, Bt;
+    if (a.jet1_over(X[0].lo, X[0].hi, X[1].lo, X[1].hi, A, Au, Av) &&
+        b.jet1_over(X[2].lo, X[2].hi, X[3].lo, X[3].hi, B, Bs, Bt) && disjoint3(A, B))
+        return;
+    if (depth == 0) {
+        seeds.push_back({num::mid(X[0]), num::mid(X[1]), num::mid(X[2]), num::mid(X[3])});
+        return;
+    }
+    for (int m = 0; m < 16; ++m) {
+        Box4 Y = X;
+        for (int i = 0; i < 4; ++i) {
+            const double mid = num::mid(X[i]);
+            Y[i] = (m >> i) & 1 ? Interval(mid, X[i].hi) : Interval(X[i].lo, mid);
+        }
+        collect_seeds(a, b, Y, depth - 1, seeds);
+    }
+}
+
+struct Verifier {
+    const geom::Carrier& a;
+    const geom::Carrier& b;
+    const std::vector<const TubeSegment*>& all;
+    const SsiOptions& opt;
+    SsiResult& res;
+    std::vector<Box4> unverified;
+
+    void run(const Box4& box, const std::vector<int>& cand, int depth) {
+        ++res.stats.verify_nodes;
+        geom::IVec3 A, Au, Av, B, Bs, Bt;
+        const bool ok = a.jet1_over(box[0].lo, box[0].hi, box[1].lo, box[1].hi, A, Au, Av) &&
+                        b.jet1_over(box[2].lo, box[2].hi, box[3].lo, box[3].hi, B, Bs, Bt);
+        if (ok && disjoint3(A, B)) { ++res.stats.excluded; return; }
+
+        std::vector<int> near;
+        near.reserve(cand.size());
+        for (int k : cand) {
+            const TubeSegment& s = *all[static_cast<std::size_t>(k)];
+            bool overlap = true;
+            for (int i = 0; i < 4 && overlap; ++i) overlap = !num::disjoint(box[i], s.X[i]);
+            if (!overlap) continue;
+            if (in_region(box, s)) { ++res.stats.covered; return; }
+            near.push_back(k);
+        }
+        if (ok && separated_along_normals(a, box, b)) { ++res.stats.excluded; return; }
+
+        if (depth >= opt.verify_depth || res.stats.verify_nodes >= opt.verify_node_limit) {
+            unverified.push_back(box);
+            return;
+        }
+        int dim = 0;
+        double wmax = 0.0;
+        for (int i = 0; i < 4; ++i) {
+            const double w = box[i].hi - box[i].lo;
+            if (w > wmax) { wmax = w; dim = i; }
+        }
+        const double midv = num::mid(box[dim]);
+        Box4 lo = box, hi = box;
+        lo[dim].hi = midv;
+        hi[dim].lo = midv;
+        run(lo, near, depth + 1);
+        run(hi, near, depth + 1);
+    }
+};
+
+} // namespace carrier_detail
+
+/// Intersect two carriers over the domain of `opt` (default [0,1]^4): seeds
+/// from a subdivision of the parameter box, certified tracing (as in
+/// ssi.hpp), then a completeness pass that proves every intersection point
+/// in the domain lies on a returned curve, or reports the boxes it could not
+/// resolve. Same result type and guarantees as intersect() for patches.
+inline SsiResult intersect_carriers(const geom::Carrier& a, const geom::Carrier& b,
+                                    const SsiOptions& opt = {}) {
+    const CarrierPairSystem sys(a, b);
+    SsiResult res;
+    auto already_traced = [&](const Box4& enc) {
+        for (const auto& c : res.curves)
+            for (const auto& s : c.segs)
+                if (in_region(enc, s)) return true;
+        return false;
+    };
+    auto trace_from = [&](Pt4 x) {
+        if (!detail::project_to_curve(sys, x) || !detail::inside_domain(x, 0.0, opt)) return;
+        Pt4 t;
+        if (!sys.tangent(x, t)) return;
+        Box4 enc;
+        const Pt4 anchor = x;
+        if (!certify_point(sys, t, anchor, 0.0, x, enc)) return;
+        if (!detail::inside_domain(x, 0.0, opt) || already_traced(enc)) return;
+        detail::Branch fwd = detail::trace(sys, x, enc, +1.0, opt, res.stats, true);
+        SsiCurve curve;
+        curve.min_sin_angle = fwd.min_sin;
+        if (fwd.end == EndKind::Closed) {
+            curve.segs = std::move(fwd.segs);
+            curve.closed = true;
+            curve.end_front = curve.end_back = EndKind::Closed;
+        } else {
+            detail::Branch back = detail::trace(sys, x, enc, -1.0, opt, res.stats, false);
+            curve.min_sin_angle = std::min(curve.min_sin_angle, back.min_sin);
+            std::reverse(back.segs.begin(), back.segs.end());
+            curve.segs = std::move(back.segs);
+            curve.segs.insert(curve.segs.end(), fwd.segs.begin(), fwd.segs.end());
+            curve.end_front = back.end;
+            curve.end_back = fwd.end;
+        }
+        if (!curve.segs.empty()) res.curves.push_back(std::move(curve));
+    };
+
+    const Box4 domain = {Interval(opt.dom_lo[0], opt.dom_hi[0]), Interval(opt.dom_lo[1], opt.dom_hi[1]),
+                         Interval(opt.dom_lo[2], opt.dom_hi[2]), Interval(opt.dom_lo[3], opt.dom_hi[3])};
+    std::vector<Pt4> seeds;
+    carrier_detail::collect_seeds(a, b, domain, opt.seed_depth, seeds);
+    for (const Pt4& s : seeds) trace_from(s);
+
+    for (int round = 0;; ++round) {
+        std::vector<const TubeSegment*> all;
+        for (const auto& c : res.curves)
+            for (const auto& s : c.segs) all.push_back(&s);
+        std::vector<int> cand(all.size());
+        for (std::size_t i = 0; i < all.size(); ++i) cand[i] = static_cast<int>(i);
+        res.stats.verify_nodes = res.stats.excluded = res.stats.covered = 0;
+        carrier_detail::Verifier ver{a, b, all, opt, res, {}};
+        ver.run(domain, cand, 0);
+        res.unverified_boxes = ver.unverified.size();
+        res.unverified_volume = 0.0;
+        for (std::size_t i = 0; i < ver.unverified.size(); ++i) {
+            const Box4& bx = ver.unverified[i];
+            double vol = 1.0;
+            for (int k = 0; k < 4; ++k) vol *= bx[k].hi - bx[k].lo;
+            res.unverified_volume += vol;
+            if (i == 0) res.unverified_hull = bx;
+            else
+                for (int k = 0; k < 4; ++k) res.unverified_hull[k] = num::hull(res.unverified_hull[k], bx[k]);
+        }
+        res.complete = ver.unverified.empty();
+        if (res.complete || round >= opt.reseed_rounds) break;
+        const std::size_t before = res.curves.size();
+        const std::size_t stride = std::max<std::size_t>(1, ver.unverified.size() / 64);
+        for (std::size_t i = 0; i < ver.unverified.size(); i += stride) {
+            const Box4& bx = ver.unverified[i];
+            trace_from({num::mid(bx[0]), num::mid(bx[1]), num::mid(bx[2]), num::mid(bx[3])});
+        }
+        if (res.curves.size() == before) break;
+    }
+    return res;
+}
+
+/// Every spine of a ball of radius r between patches A and B (normals
+/// pointing to the ball's side), found without a guess, with the
+/// completeness proof of intersect_carriers.
+inline SsiResult find_spines(const PolyPatchD& A, const PolyPatchD& B, double r,
+                             const SsiOptions& opt = {}) {
+    const geom::OffsetCarrier oa(A, r), ob(B, r);
+    return intersect_carriers(oa, ob, opt);
+}
 
 /// A certified piece of a rolling-ball spine.
 struct Spine {
