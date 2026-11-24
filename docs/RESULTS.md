@@ -1400,7 +1400,7 @@ The whole carrier test runs in about 5 s.
 
 ### Fillets and chamfers applied to solids (F5, F4: swept solids)
 
-From `tests/op/fillet_test.cpp` (426 checks, 6.7 s). `op/fillet.hpp` builds the solid from its cross-section. The section's corner is cut by the rolling-ball arc (fillet) or a straight line (chamfer), and the section is split into five ruled cells. The result is extruded (a box edge) or revolved by exact quarter turns (a circular edge of a ring). The supports are trimmed at the contact curves, and the blend face is a cylinder sector, a torus zone, a plane or a cone. One patch per end face would need a straight-angle corner where a fillet's arc meets the trimmed side, which is a singular parametrisation. The five cells avoid it.
+From `tests/op/fillet_test.cpp` (486 checks, 12 s). `op/fillet.hpp` builds the solid from its cross-section. The section's corner is cut by the rolling-ball arc (fillet) or a straight line (chamfer), and the section is split into five ruled cells. The result is extruded (a box edge) or revolved by exact quarter turns (a circular edge of a ring). The supports are trimmed at the contact curves, and the blend face is a cylinder sector, a torus zone, a plane or a cone. One patch per end face would need a straight-angle corner where a fillet's arc meets the trimmed side, which is a singular parametrisation. The five cells avoid it.
 
 | Solid | Faces | Euler | Volume against the closed form |
 |---|---|---|---|
@@ -1410,9 +1410,12 @@ From `tests/op/fillet_test.cpp` (426 checks, 6.7 s). `op/fillet.hpp` builds the 
 | Same, one quarter; outer bottom edge, half turn | 18; 26 | 2 | to 6e-15 |
 | Inner top edge rounded (r = 1/2), three quarters | 34 | 2 | to 2.4e-14 |
 | Inner bottom edge chamfered 1/4 × 1/2, full turn (a cone) | 32 | 0 | 8.966629032120869 vs …867 |
+| Concave: step block 2 × 1.5 × 1 with notch x > 1, y > 3/4, inside edge rounded (r = 1/4) or chamfered (1/4 × 1/2); the blend adds material | 26 | 2 | 2.263412614787660 and 2.3125, equal to the closed forms; each halved by a Boolean (z ≤ 1/2) to 4e-15 |
+| Concave, revolved: boss on a plate, base rounded (full turn) or chamfered (quarter) | 48; 26 | 0; 2 | 13.258517278286844 vs …835; to 1e-15 |
+| Concave, revolved: counterbore (floor inside a wall), floor edge rounded (full turn) or chamfered (half) | 48; 38 | 0; 2 | to 2e-14 |
 
 Every result audits closed, has only dyadic controls (contact B's weight 2 is carried consistently, and revolution uses quarter arcs with alternating end weights (1, 2) and (2, 1) so a full turn closes exactly), has no singular point on a 21 × 21 grid per face (min abs(Su × Sv) 0.008 to 0.16), and tessellates watertight (deviation below 3e-4).
 
 As Boolean operands: the rounded box halved by z ≤ 1/2, cut by x ≥ 7/4 (a curved section through the fillet) and united with a block all match their closed forms to 1e-15. The rounded full ring cut by y ≥ 1/2 (through the torus) gives 3.621678018550, the same to 12 digits as an independent quadrature over the section.
 
-What this does not show yet: edges of solids that are not swept (faces that are themselves trimmed, edges between two curved faces, varying dihedral angle), corners where several blends meet (vertex blends), concave edges (where the blend adds material), and freeform supports, where the blend face is the `BlendCarrier` and the contact curves are procedural.
+What this does not show yet: edges of solids that are not swept (faces that are themselves trimmed, edges between two curved faces, varying dihedral angle), and corners where several blends meet (vertex blends), and freeform supports, where the blend face is the `BlendCarrier` and the contact curves are procedural.

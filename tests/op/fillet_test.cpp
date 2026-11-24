@@ -1,6 +1,8 @@
 // Fillets and chamfers applied to solids (op/fillet.hpp): an edge of a box,
-// and circular edges of rings (plane meeting cylinder, the blend a torus zone
-// or a cone; a full turn is a closed chain of four edges), with the supports
+// circular edges of rings (plane meeting cylinder, the blend a torus zone or
+// a cone; a full turn is a closed chain of four edges), and concave edges
+// where the blend adds material (a step, a boss on a plate, a counterbore),
+// with the supports
 // trimmed along the contact curves. Every result must be a closed, regular
 // shell with exact (dyadic) controls and the closed-form volume, tessellate
 // watertight, and work as an operand of the Booleans.
@@ -64,6 +66,28 @@ SectionMoments section(double a, double b, const op::EdgeCut& cut) {
     m.area -= ar;
     m.mx -= ar * cx;
     m.my -= ar * cy;
+    return m;
+}
+
+/// The same for the step section [0, a] x [0, b1] + [0, a1] x [b1, b] with
+/// its inside corner (a1, b1) filled by `cut`.
+SectionMoments step_section(double a, double b, double a1, double b1, const op::EdgeCut& cut) {
+    SectionMoments m{a * b1 + a1 * (b - b1), a * b1 * a / 2 + a1 * (b - b1) * a1 / 2,
+                     a * b1 * b1 / 2 + a1 * (b - b1) * (b1 + b) / 2};
+    double ar, cx, cy; // the added corner piece and its centroid
+    if (cut.kind == op::EdgeCut::Round) {
+        const double r = cut.dA, q = M_PI * r * r / 4, e = 4 * r / (3 * M_PI);
+        ar = r * r - q;
+        cx = (r * r * (a1 + r / 2) - q * (a1 + r - e)) / ar;
+        cy = (r * r * (b1 + r / 2) - q * (b1 + r - e)) / ar;
+    } else {
+        ar = cut.dA * cut.dB / 2;
+        cx = a1 + cut.dB / 3;
+        cy = b1 + cut.dA / 3;
+    }
+    m.area += ar;
+    m.mx += ar * cx;
+    m.my += ar * cy;
     return m;
 }
 
@@ -223,6 +247,57 @@ int main() {
             } else {
                 std::printf("FAIL rounded ring cut: %s\n", res.error.c_str());
             }
+        }
+    }
+
+    // --- concave edges: the blend adds material ---------------------------------
+    {
+        // Step block 2 x 1.5 x 1 without the notch x > 1, y > 3/4.
+        const double A = 2.0, Bh = 1.5, a1 = 1.0, b1 = 0.75;
+        for (const op::EdgeCut cut : {op::EdgeCut::round(0.25), op::EdgeCut::flat(0.25, 0.5)}) {
+            const auto st = op::blend_step_edge({0, 0, 0}, {A, 0, 0}, {0, Bh, 0}, {0, 0, c}, a1, b1, cut);
+            AK_CHECK(st.solid.has_value());
+            if (!st.solid) continue;
+            const char* name = cut.kind == op::EdgeCut::Round ? "step, inside edge rounded" : "step, inside edge chamfered";
+            check_faces(name, *st.solid);
+            const double vol = c * step_section(A, Bh, a1, b1, cut).area;
+            const op::Brep sb = op::to_brep(*st.solid);
+            check_solid(name, sb, vol);
+            // Halved across the blend by z <= 1/2.
+            const auto res = op::boolean_op(sb, op::to_brep(op::make_box({-1, -1, -1}, {3, 3, 0.5})),
+                                            op::Op::Intersection);
+            AK_CHECK(res.ok);
+            if (res.ok) check_solid("   halved by z <= 1/2", res.solid, vol / 2);
+            else std::printf("FAIL halving: %s\n", res.error.c_str());
+        }
+        // A boss on a plate and a counterbore, revolved: torus and cone blends
+        // that add material; full turns are closed chains (genus 1).
+        struct Stepped {
+            const char* name;
+            bool tall_inside;
+            op::EdgeCut cut;
+            int quarters;
+        };
+        const double r0 = 1.0, r1 = 1.75, r2 = 2.5, z0 = 0.0, z1 = 0.5, z2 = 1.25;
+        const Stepped cases[] = {
+            {"boss on a plate, base rounded, full turn", true, op::EdgeCut::round(0.25), 4},
+            {"boss on a plate, base chamfered, one quarter", true, op::EdgeCut::flat(0.25, 0.5), 1},
+            {"counterbore, floor edge rounded, full turn", false, op::EdgeCut::round(0.25), 4},
+            {"counterbore, floor edge chamfered, half", false, op::EdgeCut::flat(0.375, 0.5), 2},
+        };
+        for (const Stepped& k : cases) {
+            const auto res = op::blend_stepped_ring_edge(r0, r1, r2, z0, z1, z2, k.tall_inside, k.cut, k.quarters);
+            AK_CHECK(res.solid.has_value());
+            if (!res.solid) {
+                std::printf("FAIL %s: %s\n", k.name, res.error.c_str());
+                continue;
+            }
+            const double a = r2 - r0, b = z2 - z0, a1 = k.tall_inside ? r1 - r0 : r2 - r1;
+            const SectionMoments m = step_section(a, b, a1, z1 - z0, k.cut);
+            const double rho_moment = k.tall_inside ? r0 * m.area + m.mx : r2 * m.area - m.mx;
+            check_faces(k.name, *res.solid);
+            check_solid(k.name, op::to_brep(*res.solid), k.quarters * (M_PI / 2) * rho_moment,
+                        k.quarters == 4 ? 0 : 2);
         }
     }
 
