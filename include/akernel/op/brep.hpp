@@ -23,6 +23,7 @@
 #include <cmath>
 #include <map>
 #include <memory>
+#include <numbers>
 #include <string>
 #include <utility>
 #include <vector>
@@ -459,6 +460,41 @@ inline double edge_gap_bound(const Brep& b) {
     return worst;
 }
 
+namespace fan_detail {
+
+using IVec3 = geom::Vec3<Interval>;
+
+/// +1 or -1 when the interval proves the sign, 0 when it does not.
+inline int fan_sign(const Interval& x) noexcept { return x.lo > 0.0 ? 1 : x.hi < 0.0 ? -1 : 0; }
+
+inline IVec3 to_iv(const Vec3d& a) { return {Interval(a.x), Interval(a.y), Interval(a.z)}; }
+inline Vec3d mid(const IVec3& a) { return {num::mid(a.x), num::mid(a.y), num::mid(a.z)}; }
+
+/// Enclosures of w^2 S_u and w^2 S_v (S the rational surface, w its weight)
+/// over a box of parameters: X_u w - X w_u and X_v w - X w_v. They are
+/// positive multiples of the true partials, which is all a direction needs.
+inline void partials(const PolyPatchD& P, const Interval& u, const Interval& v, IVec3& Su, IVec3& Sv) {
+    const geom::PolyPatchI I = geom::to_interval(P);
+    const geom::Vec4<Interval> H = I.eval(u, v), Hu = I.deriv_u().eval(u, v), Hv = I.deriv_v().eval(u, v);
+    auto d = [&](const geom::Vec4<Interval>& D) {
+        return IVec3{D.x * H.w - H.x * D.w, D.y * H.w - H.y * D.w, D.z * H.w - H.z * D.w};
+    };
+    Su = d(Hu);
+    Sv = d(Hv);
+}
+
+inline IVec3 normal(const PolyPatchD& P, const Interval& u, const Interval& v) {
+    IVec3 Su, Sv;
+    partials(P, u, v, Su, Sv);
+    return cross(Su, Sv);
+}
+
+/// Sign of the turn from x to y about the axis T: +1 when y lies
+/// counterclockwise of x by less than a half turn, -1 clockwise, 0 undecided.
+inline int orient(const IVec3& x, const IVec3& y, const IVec3& T) { return fan_sign(dot(cross(x, y), T)); }
+
+} // namespace fan_detail
+
 /// Geometry of the faces around every edge used by more than two faces (a
 /// solid whose parts touch along an edge). At a point of the edge, each face
 /// that uses it has an interior direction perpendicular to the edge:
@@ -466,56 +502,78 @@ inline double edge_gap_bound(const Brep& b) {
 /// face lies on the left of its loops). Sorted by angle around the edge,
 /// consecutive faces must bound material and empty space alternately, so
 /// the effective orientations of the uses (coedge direction times the face's
-/// flip) must alternate. Faces at the same angle touch tangentially along the
-/// edge: a curved face and a flat one are ordered by the side of the plane on
-/// which the curved face lies (proven exactly, op/contact.hpp); any other
-/// such pair is refused. Doubles with a margin of 1e-9 rad: a check that can
-/// refuse a valid solid, not one that decides a topology.
+/// flip) must alternate.
+///
+/// The order is certified. The point of the edge, the tangent and every
+/// direction are interval enclosures (for an edge along a patch side the
+/// point is exact; for an intersection edge it is the certified enclosure of
+/// the arc, and the tangent is the cross product of the two carriers'
+/// normals). A cut direction is placed in the widest gap between the faces,
+/// every direction is proven off it, and each pair of neighbours is proven
+/// in order by the sign of an interval orientation predicate. The faces are
+/// the same at every point of the edge, so one point decides for the edge.
+/// Neighbours whose order the predicate cannot decide touch tangentially
+/// along the edge (or lie within rounding of it): a curved face and a flat
+/// one are then ordered by the side of the plane on which the curved face
+/// lies (proven exactly, op/contact.hpp), and any other such pair is refused.
+/// A refusal never accepts an invalid solid; it may refuse a valid one.
 inline bool check_edge_fans(const Brep& b, std::string& why) {
+    using namespace fan_detail;
     std::vector<std::vector<std::pair<int, bool>>> uses(b.edges.size()); // (face, coedge reversed)
     for (std::size_t f = 0; f < b.faces.size(); ++f)
         for (const auto& loop : b.faces[f].loops)
             for (const BCoedge& ce : loop) uses[static_cast<std::size_t>(ce.edge)].push_back({static_cast<int>(f), ce.reversed});
     const std::size_t iu = static_cast<std::size_t>(geom::jet_index(1, 0)), iv = static_cast<std::size_t>(geom::jet_index(0, 1));
+    const char* unordered = "the faces around an edge with more than two faces could not be ordered";
     for (std::size_t ei = 0; ei < b.edges.size(); ++ei) {
         const auto& U = uses[ei];
         if (U.size() <= 2) continue;
         const BEdge& e = b.edges[ei];
-        // Tangent line of the edge at one point, and that point's parameters
-        // on the carriers that contain the edge.
-        Vec3d T{};
-        std::map<int, std::pair<double, double>> uv_on;
+        // One point of the edge: its parameters on the carriers that contain
+        // the edge, and the edge's tangent there, as enclosures.
+        IVec3 T{};
+        std::map<int, std::pair<Interval, Interval>> uv_on;
         if (!e.arc) {
             const double t = 0.5 * (num::mid(e.t0) + num::mid(e.t1));
             for (int k = 0; k < 2; ++k) {
                 double u, v;
                 side_uv(e.on[k].side, e.on[k].reversed ? 1.0 - t : t, u, v);
-                uv_on[e.on[k].carrier] = {u, v};
+                uv_on[e.on[k].carrier] = {Interval(u), Interval(v)};
             }
             const auto& p = uv_on[e.on[0].carrier];
-            const geom::Jet3 J = geom::BezierSurface(b.carriers[static_cast<std::size_t>(e.on[0].carrier)]).jet(p.first, p.second);
-            T = (e.on[0].side == 0 || e.on[0].side == 2) ? J[iu] : J[iv];
+            IVec3 Su, Sv;
+            partials(b.carriers[static_cast<std::size_t>(e.on[0].carrier)], p.first, p.second, Su, Sv);
+            T = (e.on[0].side == 0 || e.on[0].side == 2) ? Su : Sv;
         } else {
             Box4 mid;
             if (!arc_point(*e.geom, mid)) { why = "no point could be placed on an edge with more than two faces"; return false; }
             Pt4 x{num::mid(mid[0]), num::mid(mid[1]), num::mid(mid[2]), num::mid(mid[3])}, t4;
             if (!e.geom->base->sys->tangent(x, t4)) { why = "no tangent on an edge with more than two faces"; return false; }
-            uv_on[e.carrier[0]] = {x[0], x[1]};
-            uv_on[e.carrier[1]] = {x[2], x[3]};
+            uv_on[e.carrier[0]] = {mid[0], mid[1]};
+            uv_on[e.carrier[1]] = {mid[2], mid[3]};
+            // The tangent of a transversal intersection is along n0 x n1; its
+            // sense is the curve's, taken from the traced tangent.
+            T = cross(normal(b.carriers[static_cast<std::size_t>(e.carrier[0])], mid[0], mid[1]),
+                      normal(b.carriers[static_cast<std::size_t>(e.carrier[1])], mid[2], mid[3]));
             const geom::Jet3 J = geom::BezierSurface(b.carriers[static_cast<std::size_t>(e.carrier[0])]).jet(x[0], x[1]);
-            T = J[iu] * t4[0] + J[iv] * t4[1];
+            const int sense = fan_sign(dot(T, to_iv(J[iu] * t4[0] + J[iv] * t4[1])));
+            if (sense == 0) { why = "an edge with more than two faces has no certified tangent"; return false; }
+            if (sense < 0) T = -T;
         }
-        const double tl = norm(T);
+        // A frame for the double-precision guess of the order.
+        Vec3d Tm = mid(T);
+        const double tl = norm(Tm);
         if (!(tl > 0.0)) { why = "an edge with more than two faces has no tangent"; return false; }
-        T = T / tl;
-        Vec3d A = std::fabs(T.x) < 0.9 ? cross(T, Vec3d{1, 0, 0}) : cross(T, Vec3d{0, 1, 0});
+        Tm = Tm / tl;
+        Vec3d A = std::fabs(Tm.x) < 0.9 ? cross(Tm, Vec3d{1, 0, 0}) : cross(Tm, Vec3d{0, 1, 0});
         A = A / norm(A);
-        const Vec3d B = cross(T, A);
+        const Vec3d B = cross(Tm, A);
         struct Use {
-            double angle;
+            IVec3 d;      ///< interior direction, enclosed
+            double angle; ///< of its midpoint, in the frame (A, B): the guess
             int orient;
             int carrier = -1;
-            int tie = 0; ///< second-order offset at an equal angle: -1, 0 or +1
+            int tie = 0; ///< second-order offset where the order is undecided: -1, 0 or +1
         };
         std::vector<Use> around;
         for (const auto& [f, rev] : U) {
@@ -524,7 +582,7 @@ inline bool check_edge_fans(const Brep& b, std::string& why) {
             // carrier of the same surface: map the point's parameters (for a
             // plane any point will do; its normal is the same everywhere).
             auto it = uv_on.find(face.carrier);
-            double u = 0.5, v = 0.5;
+            Interval u(0.5), v(0.5);
             if (it != uv_on.end()) {
                 u = it->second.first;
                 v = it->second.second;
@@ -533,27 +591,59 @@ inline bool check_edge_fans(const Brep& b, std::string& why) {
                     Affine m;
                     if (!same_surface_map(b.carriers[static_cast<std::size_t>(c)], b.carriers[static_cast<std::size_t>(face.carrier)], m))
                         continue;
-                    Interval mu, mv;
-                    m.apply(Interval(p.first), Interval(p.second), mu, mv);
-                    u = num::mid(mu);
-                    v = num::mid(mv);
+                    m.apply(p.first, p.second, u, v);
                     break;
                 }
             }
-            const geom::Jet3 J = geom::BezierSurface(b.carriers[static_cast<std::size_t>(face.carrier)]).jet(u, v);
-            const Vec3d n = cross(J[iu], J[iv]);
-            const Vec3d d = cross(n, rev ? -T : T);
-            around.push_back({num::det::atan2(dot(d, B), dot(d, A)), (rev ? -1 : 1) * (face.flipped ? -1 : 1), face.carrier, 0});
+            const IVec3 n = normal(b.carriers[static_cast<std::size_t>(face.carrier)], u, v);
+            const IVec3 d = cross(n, rev ? -T : T);
+            const Vec3d dm = mid(d);
+            around.push_back({d, num::det::atan2(dot(dm, B), dot(dm, A)), (rev ? -1 : 1) * (face.flipped ? -1 : 1), face.carrier, 0});
         }
-        // Faces at one angle touch tangentially along the edge. A curved face
-        // whose side along this edge lies in the plane of a flat face there,
-        // and that meets that plane nowhere else (decided exactly,
-        // op/contact.hpp), lies strictly on one side of it: it leaves the edge
-        // turned that way to second order, which orders the two.
+        // The guess: sorted by angle, starting after the widest gap.
+        std::sort(around.begin(), around.end(), [](const Use& a, const Use& c) { return a.angle < c.angle; });
+        const std::size_t m = around.size();
+        std::size_t widest = m - 1;
+        double widest_gap = around[0].angle + 2.0 * std::numbers::pi - around[m - 1].angle;
+        for (std::size_t i = 0; i + 1 < m; ++i)
+            if (around[i + 1].angle - around[i].angle > widest_gap) {
+                widest_gap = around[i + 1].angle - around[i].angle;
+                widest = i;
+            }
+        const double cut_angle = around[widest].angle + 0.5 * widest_gap;
+        std::rotate(around.begin(), around.begin() + static_cast<std::ptrdiff_t>((widest + 1) % m), around.end());
+        const IVec3 cut = to_iv(A * num::det::cos(cut_angle) + B * num::det::sin(cut_angle));
+        // Every direction proven off the cut: on one side of it, or opposite.
+        std::vector<int> half(m);
+        for (std::size_t i = 0; i < m; ++i) {
+            half[i] = orient(cut, around[i].d, T); // +1: angle in (0, pi) from the cut; -1: (pi, 2 pi)
+            if (half[i] == 0 && fan_sign(dot(cut, around[i].d)) >= 0) { why = unordered; return false; }
+        }
+        // Each pair of neighbours proven in order, or undecided (0). The
+        // angles from the cut lie in (0, 2 pi); two of them in the same half,
+        // or one within rounding of pi, differ by less than a half turn, so
+        // the orientation predicate orders them.
+        std::vector<int> step(m - 1);
+        for (std::size_t i = 0; i + 1 < m; ++i) {
+            if (half[i] > 0 && half[i + 1] < 0) { step[i] = 1; continue; }
+            if (half[i] < 0 && half[i + 1] > 0) { why = unordered; return false; }
+            step[i] = orient(around[i].d, around[i + 1].d, T);
+            if (step[i] < 0) { why = unordered; return false; }
+        }
+        // Undecided neighbours: a curved face whose side along this edge lies
+        // in the plane of a flat face there, and that meets that plane nowhere
+        // else (decided exactly, op/contact.hpp), lies strictly on one side of
+        // it: it leaves the edge turned that way to second order, which orders
+        // the two.
         if (!e.arc)
-            for (Use& cu : around)
-                for (const Use& pu : around) {
-                    if (&cu == &pu || std::fabs(cu.angle - pu.angle) >= 1e-9 || cu.tie != 0) continue;
+            for (std::size_t i = 0; i < m; ++i)
+                for (std::size_t j = 0; j < m; ++j) {
+                    if (i == j || around[i].tie != 0) continue;
+                    bool tied = true; // no proven step between them
+                    for (std::size_t k = std::min(i, j); k < std::max(i, j); ++k) tied = tied && step[k] == 0;
+                    if (!tied) continue;
+                    Use& cu = around[i];
+                    const Use& pu = around[j];
                     const PolyPatchD& P = b.carriers[static_cast<std::size_t>(pu.carrier)];
                     const PolyPatchD& C = b.carriers[static_cast<std::size_t>(cu.carrier)];
                     if (!planar_affine(P) || planar_affine(C)) continue;
@@ -566,28 +656,29 @@ inline bool check_edge_fans(const Brep& b, std::string& why) {
                     const Vec3d nP = cross(Vec3d{c10.x - c00.x, c10.y - c00.y, c10.z - c00.z}, Vec3d{c01.x - c00.x, c01.y - c00.y, c01.z - c00.z});
                     const Vec4d h = C.eval(0.5, 0.5);
                     const double off = dot(nP, Vec3d{h.x / h.w - c00.x, h.y / h.w - c00.y, h.z / h.w - c00.z});
-                    // Direction of increasing angle at this angle.
-                    const Vec3d up = A * -num::det::sin(cu.angle) + B * num::det::cos(cu.angle);
-                    const double turn = dot(nP, up) * (off > 0.0 ? 1.0 : -1.0);
-                    if (off != 0.0 && turn != 0.0) cu.tie = turn > 0.0 ? 1 : -1;
+                    // Direction of increasing angle at this direction: T x d.
+                    const int turn = fan_sign(dot(to_iv(nP), cross(T, cu.d)));
+                    if (off != 0.0 && turn != 0) cu.tie = (turn > 0) == (off > 0.0) ? 1 : -1;
                 }
-        std::sort(around.begin(), around.end(), [](const Use& a, const Use& c) { return a.angle < c.angle; });
-        // Within a run of equal angles, order by the second-order offset.
-        for (std::size_t i = 0; i + 1 < around.size(); ++i)
-            for (std::size_t j = i + 1; j < around.size() && around[j].angle - around[i].angle < 1e-9; ++j)
-                if (around[j].tie < around[i].tie) std::swap(around[i], around[j]);
-        const std::size_t m = around.size();
-        for (std::size_t i = 0; i < m; ++i) {
-            const Use& a = around[i];
-            const Use& c = around[(i + 1) % m];
-            double gap = c.angle - a.angle;
-            if (i + 1 == m) gap += 2.0 * 3.141592653589793;
-            if (gap < 1e-9 && a.tie == c.tie) { why = "two faces meet tangentially along an edge with more than two faces"; return false; }
-            if (a.orient == c.orient) {
+        // Within a run of undecided neighbours, order by the second-order
+        // offset; two with the same offset cannot be told apart.
+        for (std::size_t i = 0; i < m;) {
+            std::size_t j = i;
+            while (j + 1 < m && step[j] == 0) ++j;
+            std::stable_sort(around.begin() + static_cast<std::ptrdiff_t>(i), around.begin() + static_cast<std::ptrdiff_t>(j + 1),
+                             [](const Use& a, const Use& c) { return a.tie < c.tie; });
+            for (std::size_t k = i; k < j; ++k)
+                if (around[k].tie == around[k + 1].tie) {
+                    why = "two faces meet tangentially along an edge with more than two faces";
+                    return false;
+                }
+            i = j + 1;
+        }
+        for (std::size_t i = 0; i < m; ++i)
+            if (around[i].orient == around[(i + 1) % m].orient) {
                 why = "the faces around an edge with more than two faces do not alternate between material and empty space";
                 return false;
             }
-        }
     }
     return true;
 }
