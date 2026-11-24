@@ -1396,4 +1396,19 @@ Measured on 2026-11-24, same Linux/GCC setup as §11, from `tests/geom/blend_tes
 
 Making the blend intersectable at reasonable cost took two things. The first version needed 145 s for the plane cut: the direct enclosures lose the correlation between contacts and centre, so the arc's dot product u · v grew wider than 1 and boxes could not be decided. A mean-value form in sigma for every spine quantity, plus a cache of the theta-independent part per sigma range (subdivision revisits each range with many theta boxes), brought it to 0.65 s with no loss of rigour.
 
-What this does not show yet: trimming the supports along the contact curves and replacing the edge in a solid (F5). The whole carrier test runs in about 5 s.
+The whole carrier test runs in about 5 s.
+
+### A fillet applied to a solid (F5, first case)
+
+From `tests/op/fillet_test.cpp` (365 checks, 0.8 s). `fillet_box_edge` rounds the edge of a 2 × 1.5 × 1 box with r = 1/2: the two supports are trimmed at the contact lines, the exact cylinder sector replaces the edge, and each end face becomes five patches (one patch would need a straight-angle corner where the arc meets the trimmed side, a singular parametrisation).
+
+| Check | Result |
+|---|---|
+| Shell | 18 faces, 36 edges, 20 vertices; audit closed, Euler characteristic 2; edge fans consistent |
+| Exactness | every control of every face is a dyadic rational; contact B's weight 2 is carried by the patches on its side so shared sides match exactly |
+| Regularity | min of the parametric speed abs(Su × Sv) over all faces 0.031 (no singular corner) |
+| Volume | 2.946349540849361 against abc − c r²(1 − π/4) = 2.946349540849362 |
+| Tessellation | watertight, deviation 2.4e-4 |
+| As a Boolean operand: halved by z ≤ 1/2 (plane across the fillet); cut by x ≥ 7/4 (plane along the fillet's axis, a curved section); union with a block on top | volumes equal their closed forms to 1e-15 or better; each result closed and tessellated watertight |
+
+What this does not show yet: filleting an edge of a general solid (faces that are themselves trimmed, edges between curved faces, chains of edges, corners where three fillets meet), and freeform supports, where the blend face is the `BlendCarrier` and the contact curves are procedural.

@@ -27,7 +27,8 @@
 // Whether the ball fits on each curved support along the whole edge is the
 // offset-validity predicate (geom/offset_validity.hpp), applied by
 // support_fits() below. Trimming the supports and building the blend's
-// topology are later steps (FEATURES F5, F6).
+// topology: op/fillet.hpp for a box edge (FEATURES F5); the general case is
+// later work (F5, F6).
 #pragma once
 
 #include <cmath>
