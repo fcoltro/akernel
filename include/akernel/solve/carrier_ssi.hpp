@@ -24,6 +24,8 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -132,15 +134,25 @@ inline Interval along(const geom::IVec3& P, const Vec3d& dir) {
 /// near a normal direction dir . P_u and dir . P_v are small, so thin pieces
 /// separate at a coarse level (the analogue of ssi.hpp's
 /// separated_along_normals).
-inline bool separated_along_normals(const geom::Carrier& a, const Box4& X, const geom::Carrier& b) {
+/// The enclosures over X may be passed in when the caller has them. The
+/// direction between the two centre points is tried as well: where the
+/// pieces are apart but neither is flat across the gap, it is the one that
+/// separates them.
+inline bool separated_along_normals(const geom::Carrier& a, const Box4& X, const geom::Carrier& b,
+                                    const geom::IVec3* jets = nullptr) {
     const double uc = num::mid(X[0]), vc = num::mid(X[1]), sc = num::mid(X[2]), tc = num::mid(X[3]);
     Vec3d pa, pau, pav, pb, pbs, pbt;
     a.eval(uc, vc, pa, pau, pav);
     b.eval(sc, tc, pb, pbs, pbt);
-    geom::IVec3 A, Au, Av, B, Bs, Bt;
-    if (!a.jet1_over(X[0].lo, X[0].hi, X[1].lo, X[1].hi, A, Au, Av)) return false;
-    if (!b.jet1_over(X[2].lo, X[2].hi, X[3].lo, X[3].hi, B, Bs, Bt)) return false;
-    for (const Vec3d& n : {cross(pau, pav), cross(pbs, pbt)}) {
+    geom::IVec3 Au, Av, Bs, Bt;
+    if (jets) {
+        Au = jets[0]; Av = jets[1]; Bs = jets[2]; Bt = jets[3];
+    } else {
+        geom::IVec3 A, B;
+        if (!a.jet1_over(X[0].lo, X[0].hi, X[1].lo, X[1].hi, A, Au, Av)) return false;
+        if (!b.jet1_over(X[2].lo, X[2].hi, X[3].lo, X[3].hi, B, Bs, Bt)) return false;
+    }
+    for (const Vec3d& n : {cross(pau, pav), cross(pbs, pbt), pa - pb}) {
         const double len = geom::norm(n);
         if (!(len > 0.0) || !std::isfinite(len)) continue;
         const Vec3d dir = n / len;
@@ -203,7 +215,8 @@ struct Verifier {
             if (in_region(box, s)) { ++res.stats.covered; return; }
             near.push_back(k);
         }
-        if (ok && separated_along_normals(a, box, b)) { ++res.stats.excluded; return; }
+        const geom::IVec3 jets[4] = {Au, Av, Bs, Bt};
+        if (ok && separated_along_normals(a, box, b, jets)) { ++res.stats.excluded; return; }
 
         if (depth >= opt.verify_depth || res.stats.verify_nodes >= opt.verify_node_limit) {
             unverified.push_back(box);
@@ -547,6 +560,12 @@ class BlendCarrier final : public geom::Carrier {
     };
     /// Shared by copies (same geometry), so the carrier stays copyable.
     std::shared_ptr<Cache> cache_ = std::make_shared<Cache>();
+    /// Names the geometry for the per-thread section memo (never reused).
+    std::uint64_t serial_ = next_serial();
+    static std::uint64_t next_serial() {
+        static std::atomic<std::uint64_t> n{0};
+        return ++n;
+    }
 
     /// The theta-independent part of the enclosures for sigma in [s0, s1]
     /// within segment k. Subdivision revisits the same sigma ranges with many
@@ -606,10 +625,9 @@ class BlendCarrier final : public geom::Carrier {
 
         geom::IVec3 SA, SAu, SAv, OA, OAu, OAv, SB, SBs, SBt;
         geom::IVec3 OB, OBs, OBt;
-        if (!pa_.jet1_over(K[0].lo, K[0].hi, K[1].lo, K[1].hi, SA, SAu, SAv)) return std::nullopt;
-        if (!oa_.jet1_over(K[0].lo, K[0].hi, K[1].lo, K[1].hi, OA, OAu, OAv)) return std::nullopt;
-        if (!pb_.jet1_over(K[2].lo, K[2].hi, K[3].lo, K[3].hi, SB, SBs, SBt)) return std::nullopt;
-        if (!ob_.jet1_over(K[2].lo, K[2].hi, K[3].lo, K[3].hi, OB, OBs, OBt)) return std::nullopt;
+        // Each support and its offset from one restriction of the patch.
+        if (!oa_.jet1_over_with_patch(K[0].lo, K[0].hi, K[1].lo, K[1].hi, SA, SAu, SAv, OA, OAu, OAv)) return std::nullopt;
+        if (!ob_.jet1_over_with_patch(K[2].lo, K[2].hi, K[3].lo, K[3].hi, SB, SBs, SBt, OB, OBs, OBt)) return std::nullopt;
         SpineJet j;
         j.a = lift(SA, SAu * xp[0] + SAv * xp[1]);
         // The centre is on both offsets: A's enclosure meets B's.
@@ -647,12 +665,23 @@ class BlendCarrier final : public geom::Carrier {
         using namespace carrier_detail;
         const auto j = spine_jet(k, s0, s1);
         if (!j) return false;
-        bool ok = false;
-        const V2 p = arc_point(j->a, j->c, j->b, j->u, j->v, r_, D2(T, Interval(0.0), Interval(1.0)), ok);
-        if (!ok) return false;
-        P = {p.x.v, p.y.v, p.z.v};
-        Ps = {p.x.du, p.y.du, p.z.du};
-        Pt = {p.x.dv, p.y.dv, p.z.dv};
+        // The arc's rational form loses the correlation between its basis
+        // functions over a theta interval; pieces of theta, hulled, keep
+        // the derivative enclosures within a few times their true spread.
+        // (Measured on the rounded block: 40 times the box width before, 16
+        // times with 8 pieces; pieces of sigma would cost a spine jet each.)
+        const int pieces = T.hi > T.lo ? 8 : 1;
+        bool first = true;
+        for (int q = 0; q < pieces; ++q) {
+            const double t0 = T.lo + (T.hi - T.lo) * q / pieces, t1 = q + 1 == pieces ? T.hi : T.lo + (T.hi - T.lo) * (q + 1) / pieces;
+            bool ok = false;
+            const V2 p = arc_point(j->a, j->c, j->b, j->u, j->v, r_, D2(Interval(t0, t1), Interval(0.0), Interval(1.0)), ok);
+            if (!ok) return false;
+            const geom::IVec3 p0{p.x.v, p.y.v, p.z.v}, p1{p.x.du, p.y.du, p.z.du}, p2{p.x.dv, p.y.dv, p.z.dv};
+            auto h = [](geom::IVec3& x, const geom::IVec3& y) { x = {num::hull(x.x, y.x), num::hull(x.y, y.y), num::hull(x.z, y.z)}; };
+            if (first) { P = p0; Ps = p1; Pt = p2; first = false; }
+            else { h(P, p0); h(Ps, p1); h(Pt, p2); }
+        }
         return num::is_finite(P.x) && num::is_finite(Ps.x) && num::is_finite(Pt.x) &&
                num::is_finite(P.y) && num::is_finite(Ps.y) && num::is_finite(Pt.y) &&
                num::is_finite(P.z) && num::is_finite(Ps.z) && num::is_finite(Pt.z);
@@ -681,19 +710,54 @@ public:
         return newton_slice(sys(), seg.m, seg.a, c, x);
     }
 
+    /// The section arc at sigma, as the homogeneous control points of its
+    /// rational quadratic (or the centre if no ball fits). Quadrature and
+    /// sampling evaluate many theta at one sigma, so the last few sections
+    /// are kept per thread.
+    struct Section {
+        bool ok = false;
+        geom::Vec4d cp[3]{};
+        Vec3d centre{};
+    };
+    Section section(double sg) const {
+        struct Entry {
+            std::uint64_t id = 0;
+            double sigma = -1.0;
+            Section sec;
+        };
+        thread_local std::array<Entry, 16> memo{};
+        thread_local std::size_t next = 0;
+        const std::uint64_t id = serial_; // copies share geometry, and so sections
+        for (const Entry& e : memo)
+            if (e.id == id && e.sigma == sg) return e.sec;
+        Section S;
+        Pt4 x;
+        spine_at(std::clamp(sg, 0.0, 1.0), x);
+        Vec3d a, au, av, b, bs, bt, c, cu, cv;
+        pa_.eval(x[0], x[1], a, au, av);
+        pb_.eval(x[2], x[3], b, bs, bt);
+        oa_.eval(x[0], x[1], c, cu, cv);
+        S.centre = c;
+        const auto f = geom::fillet_arc(c, r_, (a - c) / r_, (b - c) / r_);
+        if (f.status == geom::BlendStatus::Ok) {
+            S.ok = true;
+            for (int i = 0; i < 3; ++i) S.cp[i] = f.arc.cp[static_cast<std::size_t>(i)];
+        }
+        memo[next] = {id, sg, S};
+        next = (next + 1) % memo.size();
+        return S;
+    }
+
     void eval(double sigma, double theta, Vec3d& P, Vec3d& Ps, Vec3d& Pt) const override {
         // Point from the section; derivatives by central differences (doubles
-        // are only guesses for Newton steps; certified values come from the
-        // enclosures).
+        // are only guesses for Newton steps and quadrature nodes; certified
+        // values come from the enclosures).
         auto at = [&](double sg, double th) {
-            Pt4 x;
-            spine_at(std::clamp(sg, 0.0, 1.0), x);
-            Vec3d a, au, av, b, bs, bt, c, cu, cv;
-            pa_.eval(x[0], x[1], a, au, av);
-            pb_.eval(x[2], x[3], b, bs, bt);
-            oa_.eval(x[0], x[1], c, cu, cv);
-            const auto f = geom::fillet_arc(c, r_, (a - c) / r_, (b - c) / r_);
-            return f.status == geom::BlendStatus::Ok ? f.arc.point(th) : c;
+            const Section S = section(sg);
+            if (!S.ok) return S.centre;
+            const double u = 1.0 - th;
+            const geom::Vec4d h = S.cp[0] * (u * u) + S.cp[1] * (2.0 * u * th) + S.cp[2] * (th * th);
+            return Vec3d{h.x / h.w, h.y / h.w, h.z / h.w};
         };
         P = at(sigma, theta);
         // Differences in sigma stay inside sigma's spine segment (the speed

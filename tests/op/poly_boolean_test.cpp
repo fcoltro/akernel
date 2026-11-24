@@ -4,6 +4,7 @@
 // match closed forms where there are some, and match the same region cut
 // out by successive plane cuts (op/plane_cut.hpp), an independent route.
 #include <akernel/op/plane_cut.hpp>
+#include <akernel/op/brep_transform.hpp>
 #include <akernel/op/poly_boolean.hpp>
 #include <akernel/op/proc_fillet.hpp>
 #include <akernel/op/surfaces.hpp>
@@ -209,6 +210,22 @@ int main() {
             const double v2 = check_result("same, moved", op::PolyOp::Intersection, m);
             std::printf("  difference %.2e\n", v2 - c1.inter);
             AK_CHECK_NEAR(v2, c1.inter, 1e-11);
+        }
+
+        // Fillet against fillet: a second rounded block turned a quarter
+        // about z and moved by (3/2, 1/2, 1/8), so that its rounded edge runs
+        // along x at y = 3/2 and crosses the first block's rounded edge. Both
+        // solids have a procedural blend face.
+        const op::Brep Q = op::transformed(*rb.solid, op::SignedPermutation::quarter_turn_z({1.5, 0.5, 0.125}));
+        std::printf("turned block: volume %.15f (same as the block: %.2e)\n", op::volume(Q), op::volume(Q) - op::volume(*rb.solid));
+        AK_CHECK_NEAR(op::volume(Q), op::volume(*rb.solid), 1e-12);
+        const Vols f1 = check_all("two rounded blocks", *rb.solid, Q, 1e-11);
+        if (rb2.solid) {
+            const op::Brep Q2 = op::transformed(*rb.solid, op::SignedPermutation::quarter_turn_z(Vec3d{1.5, 0.5, 0.125} + shift));
+            const op::PolyBooleanResult m = op::poly_boolean(*rb2.solid, Q2, op::PolyOp::Intersection);
+            const double v2 = check_result("same, moved", op::PolyOp::Intersection, m);
+            std::printf("  difference %.2e\n", v2 - f1.inter);
+            AK_CHECK_NEAR(v2, f1.inter, 1e-11);
         }
     }
     return akt::finish("poly_boolean_test");

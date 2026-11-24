@@ -50,6 +50,7 @@
 #include <vector>
 
 #include <akernel/op/brep.hpp>
+#include <akernel/op/brep_transform.hpp>
 #include <akernel/op/plane_cut.hpp>
 #include <akernel/op/proc_edge.hpp>
 #include <akernel/solve/carrier_ssi.hpp>
@@ -86,7 +87,6 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
     for (const Brep* b : {&A, &P})
         for (const BEdge& e : b->edges)
             if (e.arc) return fail("arc edges are not supported by the polyhedral Boolean yet");
-    if (!P.procs.empty()) return fail("the second operand must have polynomial (rational patch) faces only");
 
     // The merged model: A's carriers then P's, A's procs; vertices, edges and
     // faces of A then of P, with P's carrier indices shifted.
@@ -95,6 +95,8 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
     M.carriers = A.carriers;
     M.carriers.insert(M.carriers.end(), P.carriers.begin(), P.carriers.end());
     M.procs = A.procs;
+    M.procs.insert(M.procs.end(), P.procs.begin(), P.procs.end());
+    const int npA = static_cast<int>(A.procs.size());
     const int nvA = static_cast<int>(A.vertices.size()), neA = static_cast<int>(A.edges.size());
     const int nfA = static_cast<int>(A.faces.size());
     M.vertices = A.vertices;
@@ -106,12 +108,15 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
     for (BEdge e : P.edges) {
         e.v0 += nvA;
         e.v1 += nvA;
-        for (auto& r : e.on) r.carrier += ncA;
+        for (auto& r : e.on)
+            if (r.carrier >= 0) r.carrier += ncA;
+        e.proc = reindexed(e.proc, ncA, npA);
         M.edges.push_back(e);
     }
     M.faces = A.faces;
     for (BFace f : P.faces) {
-        f.carrier += ncA;
+        if (f.proc >= 0) f.proc += npA;
+        else f.carrier += ncA;
         for (auto& loop : f.loops)
             for (BCoedge& ce : loop) ce.edge += neA;
         M.faces.push_back(f);
@@ -236,7 +241,9 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
                 const BFace& FA = M.faces[static_cast<std::size_t>(fa)];
                 if (FA.proc >= 0) te->proc[0] = FA.proc;
                 else te->carrier[0] = FA.carrier;
-                te->carrier[1] = M.faces[static_cast<std::size_t>(fp)].carrier;
+                const BFace& FP = M.faces[static_cast<std::size_t>(fp)];
+                if (FP.proc >= 0) te->proc[1] = FP.proc;
+                else te->carrier[1] = FP.carrier;
                 te->path.segs = c.segs;
                 te->path.make_breaks(te->sys(), *te->a);
                 te->path.find_kinks(te->sys(), *te->a, *te->b);
@@ -387,7 +394,8 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
             curve_at(cr, sg, x, Y);
             const BFace& FA = M.faces[static_cast<std::size_t>(cr.fa)];
             if (FA.proc < 0) add_chart(vx, FA.carrier, x[0], x[1]);
-            add_chart(vx, M.faces[static_cast<std::size_t>(cr.fp)].carrier, x[2], x[3]);
+            const BFace& FP = M.faces[static_cast<std::size_t>(cr.fp)];
+            if (FP.proc < 0) add_chart(vx, FP.carrier, x[2], x[3]);
             bool seen = false;
             for (const auto& o : curve_on[ci]) seen = seen || o.second == vx;
             if (!seen) curve_on[ci].push_back({sg, vx});
@@ -680,7 +688,9 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
         }
     };
     double reach = 0.0;
-    for (int q = nfA; q < nF; ++q)
+    bool P_rational = true;
+    for (int q = nfA; q < nF; ++q) P_rational = P_rational && M.faces[static_cast<std::size_t>(q)].proc < 0;
+    for (int q = nfA; q < nF && P_rational; ++q)
         for (const geom::Vec4d& c : M.carriers[static_cast<std::size_t>(M.faces[static_cast<std::size_t>(q)].carrier)].c)
             reach = std::max(reach, std::fabs(c.x / c.w) + std::fabs(c.y / c.w) + std::fabs(c.z / c.w));
     auto inside_P = [&](const Vec3d& X, bool& inside) {
@@ -720,6 +730,7 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
         const BEdge& e0 = E[static_cast<std::size_t>(R.loops[0][0].edge)];
         const Vec3d X = e0.proc ? e0.proc->point(0.5) : edge_point(e0, 0.5);
         bool inside = false;
+        if (!P_rational) return fail("a part of the first operand meets no curve, and the second has procedural faces; not supported yet");
         if (!inside_P(X, inside)) return fail("a part of the first operand could not be placed inside or outside the second");
         R.cls = inside ? 1 : 0;
         propagate();

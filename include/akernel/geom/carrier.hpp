@@ -168,6 +168,24 @@ public:
 
     bool jet1_over(double u0, double u1, double v0, double v1, IVec3& P, IVec3& Pu,
                    IVec3& Pv) const override {
+        return jets(u0, u1, v0, v1, P, Pu, Pv, nullptr);
+    }
+    /// For an offset carrier: the enclosures of the offset and of the patch
+    /// itself over one box, from one restriction of the patch's partials
+    /// (a blend needs both for each support).
+    bool jet1_over_with_patch(double u0, double u1, double v0, double v1, IVec3& S, IVec3& Su, IVec3& Sv,
+                              IVec3& P, IVec3& Pu, IVec3& Pv) const {
+        IVec3 patch[3];
+        if (!jets(u0, u1, v0, v1, P, Pu, Pv, offset_ ? patch : nullptr)) return false;
+        if (!offset_) { S = P; Su = Pu; Sv = Pv; return true; }
+        S = patch[0];
+        Su = patch[1];
+        Sv = patch[2];
+        return true;
+    }
+
+private:
+    bool jets(double u0, double u1, double v0, double v1, IVec3& P, IVec3& Pu, IVec3& Pv, IVec3* patch) const {
         // The offset needs the patch's partials to order 2 with their own
         // derivatives (order 3); the patch itself only to order 1 (order 2).
         const int order = offset_ ? 2 : 1;
@@ -181,17 +199,22 @@ public:
                 Xd[i] = {D2(H[i].x, H[iu].x, H[iv].x), D2(H[i].y, H[iu].y, H[iv].y),
                          D2(H[i].z, H[iu].z, H[iv].z), D2(H[i].w, H[iu].w, H[iv].w)};
             }
-        const auto g = first_jet(Xd, d_, offset_);
         const double uc = 0.5 * u0 + 0.5 * u1, vc = 0.5 * v0 + 0.5 * v1;
         std::array<Vec4<Interval>, 6> Xc;
         for (int i = 0; i < (offset_ ? 6 : 3); ++i) Xc[i] = P_.d[i].eval(Interval(uc), Interval(vc));
-        const auto c = first_jet(Xc, d_, offset_);
-        if (!g.ok || !c.ok) return false;
         const Interval du = Interval(u0) - Interval(uc), dv = Interval(v0) - Interval(vc);
         const Interval eu = num::hull(du, -du), ev = num::hull(dv, -dv);
-        P = meet(values(g.p), mean_value(c.p, g.p, eu, ev));
-        Pu = meet(values(g.pu), mean_value(c.pu, g.pu, eu, ev));
-        Pv = meet(values(g.pv), mean_value(c.pv, g.pv, eu, ev));
+        auto finish = [&](double d, bool off, IVec3& Q, IVec3& Qu, IVec3& Qv) {
+            const auto g = first_jet(Xd, d, off);
+            const auto c = first_jet(Xc, d, off);
+            if (!g.ok || !c.ok) return false;
+            Q = meet(values(g.p), mean_value(c.p, g.p, eu, ev));
+            Qu = meet(values(g.pu), mean_value(c.pu, g.pu, eu, ev));
+            Qv = meet(values(g.pv), mean_value(c.pv, g.pv, eu, ev));
+            return true;
+        };
+        if (!finish(d_, offset_, P, Pu, Pv)) return false;
+        if (patch && !finish(0.0, false, patch[0], patch[1], patch[2])) return false;
         return true;
     }
 };
