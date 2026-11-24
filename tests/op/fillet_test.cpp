@@ -230,7 +230,7 @@ int main() {
                 // Reference by quadrature over the section: the angle range with
                 // rho sin(theta) >= 1/2 is pi - 2 asin(1 / (2 rho)).
                 const double rr = 0.25, A = r1 - r0, H = z1 - z0;
-                auto f = [&](double x) {
+                auto arc = [&](double x) {
                     const double rho = r0 + x;
                     return rho * (std::numbers::pi - 2 * std::asin(0.5 / rho));
                 };
@@ -239,10 +239,10 @@ int main() {
                     for (int i = 1; i < n; ++i) sum += g(lo + (hi - lo) * i / n) * (i % 2 ? 4 : 2);
                     return sum * (hi - lo) / (3 * n);
                 };
-                const double ref = simpson([&](double x) { return f(x) * H; }, 0, A - rr, 2000) +
+                const double ref = simpson([&](double x) { return arc(x) * H; }, 0, A - rr, 2000) +
                                    simpson([&](double t) {
                                        const double x = A - rr + rr * std::sin(t);
-                                       return f(x) * (H - rr + rr * std::cos(t)) * rr * std::cos(t);
+                                       return arc(x) * (H - rr + rr * std::cos(t)) * rr * std::cos(t);
                                    }, 0, std::numbers::pi / 2, 2000);
                 std::printf("   reference by quadrature %.12f\n", ref);
                 AK_CHECK_NEAR(v, ref, 1e-9);
@@ -281,21 +281,21 @@ int main() {
             int quarters;
         };
         const double r0 = 1.0, r1 = 1.75, r2 = 2.5, z0 = 0.0, z1 = 0.5, z2 = 1.25;
-        const Stepped cases[] = {
+        const Stepped stepped[] = {
             {"boss on a plate, base rounded, full turn", true, op::EdgeCut::round(0.25), 4},
             {"boss on a plate, base chamfered, one quarter", true, op::EdgeCut::flat(0.25, 0.5), 1},
             {"counterbore, floor edge rounded, full turn", false, op::EdgeCut::round(0.25), 4},
             {"counterbore, floor edge chamfered, half", false, op::EdgeCut::flat(0.375, 0.5), 2},
         };
-        for (const Stepped& k : cases) {
+        for (const Stepped& k : stepped) {
             const auto res = op::blend_stepped_ring_edge(r0, r1, r2, z0, z1, z2, k.tall_inside, k.cut, k.quarters);
             AK_CHECK(res.solid.has_value());
             if (!res.solid) {
                 std::printf("FAIL %s: %s\n", k.name, res.error.c_str());
                 continue;
             }
-            const double a = r2 - r0, b = z2 - z0, a1 = k.tall_inside ? r1 - r0 : r2 - r1;
-            const SectionMoments m = step_section(a, b, a1, z1 - z0, k.cut);
+            const double wa = r2 - r0, wb = z2 - z0, wa1 = k.tall_inside ? r1 - r0 : r2 - r1;
+            const SectionMoments m = step_section(wa, wb, wa1, z1 - z0, k.cut);
             const double rho_moment = k.tall_inside ? r0 * m.area + m.mx : r2 * m.area - m.mx;
             check_faces(k.name, *res.solid);
             check_solid(k.name, op::to_brep(*res.solid), k.quarters * (std::numbers::pi / 2) * rho_moment,
