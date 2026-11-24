@@ -233,6 +233,44 @@ int main() {
             std::printf("  difference %.2e\n", v2 - f1.inter);
             AK_CHECK_NEAR(v2, f1.inter, 1e-11);
         }
+
+        // Chains: a pocket b1 into the top leaves a hole in it, and the
+        // result is an operand again. b2 cuts across the pocket, b3 makes a
+        // second pocket and leaves the first one's hole as it was, and with
+        // the holed solid as the second operand. Each volume follows from
+        // single Booleans of the block (b1 and b2 overlap in the box b12).
+        const op::Brep b1 = op::to_brep(op::make_box({0.2, 0.6, 0.6}, {0.45, 1.0, 2.0}));
+        const op::Brep b2 = op::to_brep(op::make_box({0.35, 0.9, 0.5}, {0.7, 1.4, 2.0}));
+        const op::Brep b12 = op::to_brep(op::make_box({0.35, 0.9, 0.6}, {0.45, 1.0, 2.0}));
+        const op::Brep b3 = op::to_brep(op::make_box({0.1, 1.5, 0.4}, {0.5, 1.8, 2.0}));
+        const double vA = op::volume(*rb.solid);
+        auto inter = [&](const op::Brep& B) {
+            const op::PolyBooleanResult m = op::poly_boolean(*rb.solid, B, op::PolyOp::Intersection);
+            return m.solid ? op::volume(*m.solid) : NAN;
+        };
+        const double i1 = inter(b1), i2 = inter(b2), i12 = inter(b12), i3 = inter(b3);
+        const op::PolyBooleanResult p1 = op::poly_boolean(*rb.solid, b1, op::PolyOp::Difference);
+        const double v1 = check_result("block - pocket", op::PolyOp::Difference, p1);
+        AK_CHECK_NEAR(v1, vA - i1, 1e-12);
+        int holes = 0;
+        if (p1.solid)
+            for (const auto& f : p1.solid->faces) holes += static_cast<int>(f.loops.size()) - 1;
+        AK_CHECK(holes == 1);
+        if (p1.solid) {
+            const op::Brep& H = *p1.solid;
+            struct Case { const char* name; double v, expect, tol; };
+            const Case cases[] = {
+                {"(block - pocket) - b2", check_result("(block - pocket) - b2", op::PolyOp::Difference, op::poly_boolean(H, b2, op::PolyOp::Difference)), vA - i1 - i2 + i12, 1e-11},
+                {"(block - pocket) & b2", check_result("(block - pocket) & b2", op::PolyOp::Intersection, op::poly_boolean(H, b2, op::PolyOp::Intersection)), i2 - i12, 1e-11},
+                {"(block - pocket) - b3", check_result("(block - pocket) - b3", op::PolyOp::Difference, op::poly_boolean(H, b3, op::PolyOp::Difference)), vA - i1 - i3, 1e-11},
+                {"b2 & (block - pocket)", check_result("b2 & (block - pocket)", op::PolyOp::Intersection, op::poly_boolean(b2, H, op::PolyOp::Intersection)), i2 - i12, 1e-11},
+                {"b2 - (block - pocket)", check_result("b2 - (block - pocket)", op::PolyOp::Difference, op::poly_boolean(b2, H, op::PolyOp::Difference)), op::volume(b2) - (i2 - i12), 1e-11},
+            };
+            for (const Case& c : cases) {
+                std::printf("  %s: expected %.15f, difference %.2e\n", c.name, c.expect, c.v - c.expect);
+                AK_CHECK_NEAR(c.v, c.expect, c.tol);
+            }
+        }
     }
     return akt::finish("poly_boolean_test");
 }

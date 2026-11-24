@@ -156,14 +156,14 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
         dv = (ref->side == 1 || ref->side == 3) ? dt : 0.0;
         return true;
     };
-    // Loops of a face as polylines in its parameters.
-    std::vector<std::vector<std::array<double, 2>>> outline(static_cast<std::size_t>(nF));
+    // Loops of a face as polylines in its parameters, outer loop first. A
+    // point is inside the face when the windings of all its loops add up to
+    // a nonzero number (inner loops run the other way).
+    std::vector<std::vector<std::vector<std::array<double, 2>>>> outline(static_cast<std::size_t>(nF));
     for (int f = 0; f < nF; ++f) {
         const BFace& F = M.faces[static_cast<std::size_t>(f)];
-        auto& poly = outline[static_cast<std::size_t>(f)];
         for (const auto& loop : F.loops) {
-            // Several loops: joined into one polyline through a slit would be
-            // wrong; the winding test takes the sum over loops instead.
+            auto& poly = outline[static_cast<std::size_t>(f)].emplace_back();
             for (const BCoedge& ce : loop) {
                 const BEdge& e = M.edges[static_cast<std::size_t>(ce.edge)];
                 for (int k = 0; k < 64; ++k) {
@@ -173,10 +173,13 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
                     poly.push_back({u, v});
                 }
             }
-            if (F.loops.size() > 1) return fail("faces with inner loops are not supported by the polyhedral Boolean yet");
         }
     }
-    auto inside_face = [&](int f, double u, double v) { return winding(outline[static_cast<std::size_t>(f)], u, v) != 0; };
+    auto inside_face = [&](int f, double u, double v) {
+        int w = 0;
+        for (const auto& poly : outline[static_cast<std::size_t>(f)]) w += winding(poly, u, v);
+        return w != 0;
+    };
 
     // Faces that use each edge.
     std::vector<std::vector<int>> edge_faces(M.edges.size());
@@ -522,11 +525,14 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
             H.push_back(h);
             return true;
         };
-        for (const BCoedge& ce : F.loops[0])
-            for (const EPiece& p : pieces[static_cast<std::size_t>(ce.edge)]) {
-                if (!add_half(p.edge, ce.reversed, true, false) || !add_half(p.edge, !ce.reversed, true, true))
-                    return fail("a boundary piece cannot be read in its face's parameters");
-            }
+        // Every loop of the face, inner ones included: an inner loop runs
+        // with the face on its left like the outer one.
+        for (const auto& loop : F.loops)
+            for (const BCoedge& ce : loop)
+                for (const EPiece& p : pieces[static_cast<std::size_t>(ce.edge)]) {
+                    if (!add_half(p.edge, ce.reversed, true, false) || !add_half(p.edge, !ce.reversed, true, true))
+                        return fail("a boundary piece cannot be read in its face's parameters");
+                }
         for (int ce : face_curves[static_cast<std::size_t>(f)])
             if (!add_half(ce, false, false, false) || !add_half(ce, true, false, false))
                 return fail("an intersection curve cannot be read in its face's parameters");
@@ -589,7 +595,7 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
             }
             return poly;
         };
-        const double face_sign = signed_area(outline[static_cast<std::size_t>(f)]) > 0.0 ? 1.0 : -1.0;
+        const double face_sign = signed_area(outline[static_cast<std::size_t>(f)].front()) > 0.0 ? 1.0 : -1.0;
         std::vector<std::vector<std::array<double, 2>>> polys;
         std::vector<double> areas;
         for (const auto& cyc : cycles) {
