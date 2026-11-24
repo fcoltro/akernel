@@ -119,12 +119,35 @@ public:
     }
     bool on_carrier(int c, double tau, double& u, double& v, double& du, double& dv) const override {
         const int side = carrier[0] == c ? 0 : carrier[1] == c ? 1 : -1;
-        if (side < 0 || !coords(side, tau, u, v)) return false;
-        return piece_derivative(breaks(), tau, [&](double t, double& p, double& q) { return coords(side, t, p, q); }, du, dv);
+        if (side < 0) return false;
+        // The derivative from the curve's tangent: on the slice m . (x - a) =
+        // c, dx/dc = t / (m . t); c is linear in sigma on the segment, and
+        // sigma in tau.
+        const double sg = sigma(tau);
+        const int k = path.segment_of(sg);
+        const solve::TubeSegment& seg = path.segs[static_cast<std::size_t>(k)];
+        solve::Pt4 x, t;
+        const auto sy = sys();
+        if (!path.point(sy, sg, x) || !sy.tangent(x, t)) return false;
+        const double mt = solve::dot4(seg.m, t);
+        const double w = path.brk[static_cast<std::size_t>(k) + 1] - path.brk[static_cast<std::size_t>(k)];
+        if (!(std::fabs(mt) > 0.0) || !(w > 0.0)) return false;
+        const double dc = (seg.reversed ? -seg.len : seg.len) / w * (to - from);
+        u = x[static_cast<std::size_t>(2 * side)];
+        v = x[static_cast<std::size_t>(2 * side + 1)];
+        du = t[static_cast<std::size_t>(2 * side)] / mt * dc;
+        dv = t[static_cast<std::size_t>(2 * side + 1)] / mt * dc;
+        return true;
     }
     bool on_proc(int p, double tau, double& s, double& t) const override {
         const int side = proc[0] == p ? 0 : proc[1] == p ? 1 : -1;
         return side >= 0 && coords(side, tau, s, t);
+    }
+    std::shared_ptr<const ProcEdge> part(double t0, double t1) const override {
+        auto e = std::make_shared<TracedEdge>(*this);
+        e->from = sigma(t0);
+        e->to = sigma(t1);
+        return e;
     }
 };
 

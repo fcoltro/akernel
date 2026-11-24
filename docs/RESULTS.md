@@ -1454,3 +1454,17 @@ Trimmed procedural faces. `round_block_edge(top, r, opt, cut)` ends the block at
 Both are closed with Euler 2 and mesh watertight (deviation 3.1e-4). The cost is the blend–plane intersection with its completeness proof: about 18 s here, against 1 s for the rest. Its verifier now splits a box where it is widest in space (parameter width times speed), which cut the boxes by a quarter. Getting to about 1 s needs tighter enclosures of the blend over boxes; that is a follow-up.
 
 What this does not show yet: Booleans on procedural faces (next: cuts by planar solids, decided 2026-11-24), blends meeting other blends (chains, caps), and freeform support pairs other than a graph top with a plane.
+
+### Plane cuts of solids with procedural faces (first step of Booleans on them)
+
+From `tests/op/plane_cut_test.cpp` (28 checks, about 1 minute). `op/plane_cut.hpp` cuts any solid with side and procedural edges by a plane, keeping n · x ≤ d. Every face the plane meets is intersected with a planar cap patch by `intersect_carriers` (certified, with a completeness proof). Each piece of section curve inside a face becomes a `TracedEdge` between the face's surface and the cap, read by both in their own parameters. The face keeps its region on the kept side, found by walking its loop and turning onto the section edge at each crossing. The cap's loops are the section edges chained at the crossings; outer loops are counter-clockwise and holes go into the outer loop that contains them.
+
+| Case | Faces | Section curves | Volume |
+|---|---|---|---|
+| Unit cube, x + y + z ≤ 3/2 (hexagonal cap) | 7 | 6 | 0.500000000000000 |
+| Rounded freeform block (§12 above), y ≤ 1: the section runs through the blend | 7 | 5 | removed 0.017061483944 vs slice integration …957 (1.3e-11) |
+| Same, slanted cut 0.3x + y + 0.4z ≤ 1.2 | 7 | 5 | 0.683046053104180; moved with the plane by (1/2, −1/2, 0): differs by 8.7e-13 |
+
+All are closed with Euler 2 and mesh watertight. Traced edges now give their parameter derivatives from the curve's tangent (dx/dc = t / (m · t) on a slice) instead of differences, which made the cube exact to print precision.
+
+What is certified: the section curves and their completeness. Where boundary edges cross the plane is found in doubles (sign changes along offset samples, then bisection), and which pieces of a section curve lie inside a face is decided by a winding test on sampled loops. These are measurements; the cut refuses when it is close to a decision (a vertex within 1e-9 of the plane, an edge nearly touching it). Not supported yet, each refused with a message: arc edges from earlier rational Booleans, section curves closed inside a face, and faces with inner loops that the plane crosses.

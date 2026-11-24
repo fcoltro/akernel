@@ -116,6 +116,12 @@ public:
         if (!uv(carrier, tau, u, v)) return false;
         return piece_derivative(breaks(), tau, [&](double t, double& p, double& q) { return uv(carrier, t, p, q); }, du, dv);
     }
+    std::shared_ptr<const ProcEdge> part(double t0, double t1) const override {
+        auto e = std::make_shared<BlendSide>(*this);
+        e->from = param(t0);
+        e->to = param(t1);
+        return e;
+    }
     std::vector<double> breaks() const override {
         if (!contact) return ProcEdge::breaks();
         const double lo = std::min(from, to), hi = std::max(from, to);

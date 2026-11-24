@@ -74,6 +74,13 @@ struct ProcEdge {
     /// Break points 0 = b0 < ... < bn = 1 of tau: the edge is smooth on each
     /// piece (e.g. a spine segment). Quadrature and sampling align with them.
     virtual std::vector<double> breaks() const { return {0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0}; }
+    /// The part tau in [t0, t1] of this edge as an edge of its own (tau
+    /// rescaled to [0, 1]); null if the edge cannot be split.
+    virtual std::shared_ptr<const ProcEdge> part(double t0, double t1) const {
+        (void)t0;
+        (void)t1;
+        return nullptr;
+    }
 };
 
 /// Central differences of a curve's parameters in tau, inside tau's piece of
