@@ -400,4 +400,164 @@ inline BlendedSolid blend_stepped_ring_edge(double r0, double r1, double r2, dou
                            1.0, quarters);
 }
 
+
+// --- all edges rounded: vertex blends -----------------------------------------
+//
+// rounded_box() rounds all twelve edges of a box with one radius. Three
+// fillets meet at each corner, and the corner blend is the octant of the
+// ball that rolls into it: a sphere octant, bounded by the three cylinders'
+// end arcs. A sphere octant is a three-sided patch, which as one rational
+// patch would be degenerate; it is split into three regular quads instead.
+//
+// Exact sphere quads. Stereographic projection from the south pole maps the
+// octant to the quarter disc s, t >= 0, s^2 + t^2 <= 1 of the plane, and its
+// inverse (S, T, H) -> (2SH, 2TH, H^2 - S^2 - T^2, H^2 + S^2 + T^2) is
+// quadratic in homogeneous coordinates. A plane patch of bidegree (m, n)
+// becomes a sphere patch of bidegree (2m, 2n) with exact controls: products
+// of Bernstein polynomials, whose binomial denominators all divide 144, so
+// every patch of the solid carries the common factor 144 (a uniform factor
+// does not change a patch). The quarter disc is cut at s = 1/2, t = 1/2 and
+// at q, the midpoint in parameter of the arc (1, 0) -> (0, 1) with
+// homogeneous controls (1,0,1), (1,1,1), (0,2,2):
+//
+//      t
+//      1  .
+//         | Q3  .  q = (3/5, 4/5)
+//     1/2 +-----p   .
+//         | Q1  | Q2  .
+//      0  +-----+-------  s
+//         0    1/2     1
+//
+//   Q1 (bidegree (2, 2) in the plane, sides elevated lines) and Q2, Q3
+//   (ruled between half the arc and a segment, bidegree (2, 1)). On the
+//   sphere: Q1 (4, 4), Q2 and Q3 (4, 2). The octant's boundary pieces become
+//   the cylinders' end rows; each cylinder is split lengthwise in two to
+//   match, and the two octants at its ends are mirror images, so their rows
+//   coincide after the translation along the edge (the rows lie in the
+//   mirror plane, local coordinate zero, exactly).
+namespace fillet_detail {
+
+/// G times the inverse stereographic image of the plane patch (S, T, H)
+/// stored as (x, y, -, w); bidegree doubles. Exact for dyadic input.
+inline PolyPatchD sphere_image(const PolyPatchD& P) {
+    static constexpr double G = 144.0;
+    auto C = [](int n, int k) {
+        double r = 1;
+        for (int i = 1; i <= k; ++i) r = r * (n - k + i) / i;
+        return r;
+    };
+    const int m = P.p, n = P.q;
+    PolyPatchD R(2 * m, 2 * n);
+    for (int k = 0; k <= 2 * m; ++k)
+        for (int l = 0; l <= 2 * n; ++l) {
+            double x = 0, y = 0, z = 0, w = 0;
+            for (int i = std::max(0, k - m); i <= std::min(m, k); ++i)
+                for (int j = std::max(0, l - n); j <= std::min(n, l); ++j) {
+                    const double f = C(m, i) * C(m, k - i) * C(n, j) * C(n, l - j);
+                    const Vec4d& a = P.at(i, j);
+                    const Vec4d& b = P.at(k - i, l - j);
+                    x += f * (2 * a.x * b.w);
+                    y += f * (2 * a.y * b.w);
+                    z += f * (a.w * b.w - a.x * b.x - a.y * b.y);
+                    w += f * (a.w * b.w + a.x * b.x + a.y * b.y);
+                }
+            const double s = G / (C(2 * m, k) * C(2 * n, l)); // an integer: C(4, .) C(4, .) divides 144
+            R.at(k, l) = {s * x, s * y, s * z, s * w};
+        }
+    return R;
+}
+
+/// The unit octant x, y, z >= 0 as three exact sphere patches Q1, Q2, Q3.
+inline std::array<PolyPatchD, 3> octant_patches() {
+    auto pt = [](double s, double t, double h) { return Vec4d{s, t, 0, h}; };
+    PolyPatchD q1(2, 2);
+    for (int i = 0; i <= 2; ++i)
+        for (int j = 0; j <= 2; ++j) q1.at(i, j) = pt(i / 4.0, j / 4.0, 1);
+    const Vec4d a0 = pt(1, 0, 1), am = pt(1, 0.5, 1), q = pt(0.75, 1, 1.25), bm = pt(0.5, 1.5, 1.5),
+                b2 = pt(0, 2, 2);
+    const PolyPatchD q2 = ruled({a0, am, q}, {pt(0.5, 0, 1), pt(0.5, 0.25, 1), pt(0.5, 0.5, 1)});
+    const PolyPatchD q3 = ruled({q, bm, b2}, {pt(0.5, 0.5, 1), pt(0.25, 0.5, 1), pt(0, 0.5, 1)});
+    return {sphere_image(q1), sphere_image(q2), sphere_image(q3)};
+}
+
+} // namespace fillet_detail
+
+/// The box o + [0, a] x [0, b] x [0, c] (axis-aligned) with all twelve edges
+/// rounded by radius r < min(a, b, c) / 2: six trimmed faces, twelve
+/// cylinders (each in two pieces) and eight sphere-octant corners (each in
+/// three pieces), 54 exact patches.
+inline BlendedSolid rounded_box(const Vec3d& o, double a, double b, double c, double r) {
+    using namespace fillet_detail;
+    BlendedSolid res;
+    if (!(r > 0.0) || !(2 * r < a) || !(2 * r < b) || !(2 * r < c)) {
+        res.error = "radius out of range for this box";
+        return res;
+    }
+    const auto Q = octant_patches();
+    // Boundary rows of the octant (as side indices of Q1, Q2, Q3) and the
+    // axis of the cylinder each one starts: 0 = x, 1 = y, 2 = z.
+    struct Piece {
+        int patch, side, axis;
+    };
+    static constexpr Piece pieces[6] = {{0, 0, 1}, {1, 3, 1},  // meridian y = 0: cylinder along y
+                                        {0, 3, 0}, {2, 1, 0},  // meridian x = 0: cylinder along x
+                                        {1, 0, 2}, {2, 0, 2}}; // equator: cylinder along z
+    const double len[3] = {a - 2 * r, b - 2 * r, c - 2 * r};
+    auto centre = [&](int sx, int sy, int sz) {
+        return Vec3d{o.x + (sx > 0 ? a - r : r), o.y + (sy > 0 ? b - r : r), o.z + (sz > 0 ? c - r : r)};
+    };
+    auto place = [&](const Vec4d& h, int sx, int sy, int sz) {
+        const Vec3d ce = centre(sx, sy, sz);
+        return Vec4d{sx * r * h.x + ce.x * h.w, sy * r * h.y + ce.y * h.w, sz * r * h.z + ce.z * h.w, h.w};
+    };
+    auto place_patch = [&](const PolyPatchD& P, int sx, int sy, int sz) {
+        PolyPatchD R(P.p, P.q);
+        for (int i = 0; i <= P.p; ++i)
+            for (int j = 0; j <= P.q; ++j) R.at(i, j) = place(P.at(i, j), sx, sy, sz);
+        return R;
+    };
+    PatchSolid S;
+    for (int sx : {-1, 1})
+        for (int sy : {-1, 1})
+            for (int sz : {-1, 1}) {
+                const Vec3d out{double(sx), double(sy), double(sz)};
+                std::array<PolyPatchD, 3> P;
+                for (int k = 0; k < 3; ++k) {
+                    P[static_cast<std::size_t>(k)] = place_patch(Q[static_cast<std::size_t>(k)], sx, sy, sz);
+                    S.faces.push_back(outward(P[static_cast<std::size_t>(k)], out));
+                }
+                // Cylinders start at the octants on the + side of their axis.
+                const int sgn[3] = {sx, sy, sz};
+                for (const Piece& pc : pieces) {
+                    if (sgn[pc.axis] < 0) continue;
+                    const auto row = side_control(P[static_cast<std::size_t>(pc.patch)], pc.side);
+                    std::vector<Vec4d> far = row;
+                    for (Vec4d& h : far) {
+                        double* coord[3] = {&h.x, &h.y, &h.z};
+                        *coord[pc.axis] -= len[pc.axis] * h.w;
+                    }
+                    Vec3d dir = out;
+                    (pc.axis == 0 ? dir.x : pc.axis == 1 ? dir.y : dir.z) = 0.0;
+                    S.faces.push_back(outward(ruled(row, far), dir));
+                }
+            }
+    // Faces: rectangles through the octants' vertices on them.
+    const Vec4d vx = Q[1].at(0, 0), vy = Q[2].at(Q[2].p, 0), vz = Q[0].at(0, 0); // local (1,0,0), (0,1,0), (0,0,1)
+    for (int axis = 0; axis < 3; ++axis)
+        for (int sgn : {-1, 1}) {
+            const Vec4d v = axis == 0 ? vx : axis == 1 ? vy : vz;
+            auto corner = [&](int i, int j) {
+                int s3[3];
+                s3[axis] = sgn;
+                s3[(axis + 1) % 3] = i ? 1 : -1;
+                s3[(axis + 2) % 3] = j ? 1 : -1;
+                return place(v, s3[0], s3[1], s3[2]);
+            };
+            Vec3d out{0, 0, 0};
+            (axis == 0 ? out.x : axis == 1 ? out.y : out.z) = sgn;
+            S.faces.push_back(outward(ruled({corner(0, 0), corner(1, 0)}, {corner(0, 1), corner(1, 1)}), out));
+        }
+    return finish(std::move(S));
+}
+
 } // namespace ak::op

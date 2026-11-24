@@ -2,6 +2,7 @@
 // circular edges of rings (plane meeting cylinder, the blend a torus zone or
 // a cone; a full turn is a closed chain of four edges), and concave edges
 // where the blend adds material (a step, a boss on a plate, a counterbore),
+// and a box with every edge rounded (sphere-octant vertex blends),
 // with the supports
 // trimmed along the contact curves. Every result must be a closed, regular
 // shell with exact (dyadic) controls and the closed-form volume, tessellate
@@ -299,6 +300,47 @@ int main() {
             check_solid(k.name, op::to_brep(*res.solid), k.quarters * (M_PI / 2) * rho_moment,
                         k.quarters == 4 ? 0 : 2);
         }
+    }
+
+    // --- all edges rounded: three fillets meet at every corner ----------------
+    {
+        const double A = 2.0, Bh = 1.5, Ch = 1.0, rr = 0.25;
+        const auto rb = op::rounded_box({0, 0, 0}, A, Bh, Ch, rr);
+        AK_CHECK(rb.solid.has_value());
+        if (rb.solid) {
+            // The corner patches lie on the unit sphere exactly in exact
+            // arithmetic; in doubles to rounding.
+            double worst = 0.0;
+            for (const auto& P : op::fillet_detail::octant_patches()) {
+                const geom::BezierSurface S(P);
+                for (int i = 0; i <= 20; ++i)
+                    for (int j = 0; j <= 20; ++j) {
+                        const Vec3d p = S.point(i / 20.0, j / 20.0);
+                        worst = std::max(worst, std::fabs(geom::norm(p) - 1.0));
+                        AK_CHECK(p.x > -1e-15 && p.y > -1e-15 && p.z > -1e-15);
+                    }
+            }
+            std::printf("sphere octant patches: off the unit sphere by %.2e\n", worst);
+            AK_CHECK(worst < 1e-14);
+            check_faces("rounded box", *rb.solid);
+            // Core box plus face slabs, quarter cylinders and the ball.
+            const double a0 = A - 2 * rr, b0 = Bh - 2 * rr, c0 = Ch - 2 * rr;
+            const double vol = a0 * b0 * c0 + 2 * rr * (a0 * b0 + b0 * c0 + a0 * c0) +
+                               M_PI * rr * rr * (a0 + b0 + c0) + 4.0 / 3.0 * M_PI * rr * rr * rr;
+            const op::Brep rbb = op::to_brep(*rb.solid);
+            check_solid("rounded box (all 12 edges)", rbb, vol);
+            // Cut through four corners: keep x <= a - r/2. The removed slab
+            // is the half-ball sweep of the core's x face from depth r/2 to r.
+            const double cut_vol = b0 * c0 * rr / 2 +
+                                   2 * (b0 + c0) * (M_PI * rr * rr / 6 - std::sqrt(3.0) * rr * rr / 8) +
+                                   M_PI * 5 * rr * rr * rr / 24;
+            const auto res = op::boolean_op(rbb, op::to_brep(op::make_box({-1, -1, -1}, {A - rr / 2, 3, 3})),
+                                            op::Op::Intersection);
+            AK_CHECK(res.ok);
+            if (res.ok) check_solid("   cut x <= a - r/2 through the corners", res.solid, vol - cut_vol);
+            else std::printf("FAIL rounded box cut: %s\n", res.error.c_str());
+        }
+        AK_CHECK(!op::rounded_box({0, 0, 0}, 1, 1, 1, 0.5).solid);
     }
 
     // Refusals.
