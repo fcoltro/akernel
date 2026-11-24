@@ -1,6 +1,8 @@
 // Topology audit: valid solids pass, each kind of defect is named.
 #include <akernel/topo/complex.hpp>
 
+#include <algorithm>
+
 #include "check.hpp"
 
 using namespace ak::topo;
