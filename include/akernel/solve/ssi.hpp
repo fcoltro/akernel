@@ -135,12 +135,12 @@ public:
     void J_over(const Box4& X, Interval J[3][4]) const {
         const double u0 = X[0].lo, u1 = X[0].hi, v0 = X[1].lo, v1 = X[1].hi;
         const double s0 = X[2].lo, s1 = X[2].hi, t0 = X[3].lo, t1 = X[3].hi;
-        const auto A = geom::hull(ai_.restricted(u0, u1, v0, v1));
-        const auto Au = geom::hull(aui_.restricted(u0, u1, v0, v1));
-        const auto Av = geom::hull(avi_.restricted(u0, u1, v0, v1));
-        const auto B = geom::hull(bi_.restricted(s0, s1, t0, t1));
-        const auto Bs = geom::hull(bsi_.restricted(s0, s1, t0, t1));
-        const auto Bt = geom::hull(bti_.restricted(s0, s1, t0, t1));
+        const auto A = geom::hull_restricted(ai_, u0, u1, v0, v1);
+        const auto Au = geom::hull_restricted(aui_, u0, u1, v0, v1);
+        const auto Av = geom::hull_restricted(avi_, u0, u1, v0, v1);
+        const auto B = geom::hull_restricted(bi_, s0, s1, t0, t1);
+        const auto Bs = geom::hull_restricted(bsi_, s0, s1, t0, t1);
+        const auto Bt = geom::hull_restricted(bti_, s0, s1, t0, t1);
         const Interval a[3] = {A.x, A.y, A.z}, au[3] = {Au.x, Au.y, Au.z}, av[3] = {Av.x, Av.y, Av.z};
         const Interval b[3] = {B.x, B.y, B.z}, bs[3] = {Bs.x, Bs.y, Bs.z}, bt[3] = {Bt.x, Bt.y, Bt.z};
         for (int k = 0; k < 3; ++k) {

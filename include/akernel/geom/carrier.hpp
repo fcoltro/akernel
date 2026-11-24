@@ -139,7 +139,7 @@ protected:
 public:
     void eval(double u, double v, Vec3d& P, Vec3d& Pu, Vec3d& Pv) const override {
         std::array<Vec4d, 6> X;
-        for (int i = 0; i < 6; ++i) X[i] = D_[i].eval(u, v);
+        jet2(u, v, offset_ ? 2 : 1, X);
         // Same formula in doubles (Interval-free instantiation through point intervals
         // would be slower; doubles are only guesses here).
         const Vec3d s = xyz(X[0]) / X[0].w;
@@ -185,13 +185,52 @@ public:
     }
 
 private:
+    /// Value and first two derivatives of the Bezier curve b[0..n] at t, by
+    /// stopping de Casteljau two levels early (order = how many to fill).
+    static void curve_jet(const Vec4d* b, int n, double t, int order, Vec4d& f, Vec4d& f1, Vec4d& f2) {
+        std::array<Vec4d, kMaxDegree + 1> w;
+        for (int i = 0; i <= n; ++i) w[i] = b[i];
+        const double s = 1.0 - t;
+        const int stop = std::max(0, n - order);
+        for (int r = 1; r <= stop; ++r)
+            for (int i = 0; i <= n - r; ++i) w[i] = w[i] * s + w[i + 1] * t;
+        const int m = n - stop; // points left: m + 1 (m <= order)
+        f1 = f2 = Vec4d{0, 0, 0, 0};
+        if (m == 0) { f = w[0]; return; }
+        if (m == 1) {
+            f = w[0] * s + w[1] * t;
+            f1 = (w[1] - w[0]) * static_cast<double>(n);
+            return;
+        }
+        const Vec4d a = w[0] * s + w[1] * t, c = w[1] * s + w[2] * t;
+        f = a * s + c * t;
+        f1 = (c - a) * static_cast<double>(n);
+        f2 = (w[2] - w[1] * 2.0 + w[0]) * static_cast<double>(n * (n - 1));
+    }
+    /// The homogeneous partials (0,0) (1,0) (0,1) and, for order 2, (2,0)
+    /// (1,1) (0,2) at (u, v) in one pass over the control points: the same
+    /// values as evaluating the derivative patches D_, up to rounding.
+    void jet2(double u, double v, int order, std::array<Vec4d, 6>& X) const {
+        const PolyPatchD& S = D_[0];
+        const int p = S.p, q = S.q;
+        std::array<Vec4d, kMaxDegree + 1> c0, c1, c2;
+        for (int i = 0; i <= p; ++i) curve_jet(&S.c[static_cast<std::size_t>(i * (q + 1))], q, v, order, c0[i], c1[i], c2[i]);
+        Vec4d f, fu, fuu, g, gu, gx, h, hx, hy;
+        curve_jet(c0.data(), p, u, order, f, fu, fuu);
+        curve_jet(c1.data(), p, u, order - 1, g, gu, gx);
+        X[0] = f; X[1] = fu; X[2] = g;
+        if (order < 2) return;
+        curve_jet(c2.data(), p, u, 0, h, hx, hy);
+        X[3] = fuu; X[4] = gu; X[5] = h;
+    }
+
     bool jets(double u0, double u1, double v0, double v1, IVec3& P, IVec3& Pu, IVec3& Pv, IVec3* patch) const {
         // The offset needs the patch's partials to order 2 with their own
         // derivatives (order 3); the patch itself only to order 1 (order 2).
         const int order = offset_ ? 2 : 1;
         const int count = (order + 2) * (order + 3) / 2;
         std::array<Vec4<Interval>, kJetSize> H;
-        for (int i = 0; i < count; ++i) H[i] = hull(P_.d[i].restricted(u0, u1, v0, v1));
+        for (int i = 0; i < count; ++i) H[i] = hull_restricted(P_.d[i], u0, u1, v0, v1);
         std::array<Vec4<D2>, 6> Xd;
         for (int k = 0; k <= order; ++k)
             for (int l = 0; l <= order - k; ++l) {

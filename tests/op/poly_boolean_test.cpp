@@ -218,7 +218,10 @@ int main() {
         // solids have a procedural blend face.
         const op::Brep Q = op::transformed(*rb.solid, op::SignedPermutation::quarter_turn_z({1.5, 0.5, 0.125}));
         std::printf("turned block: volume %.15f (same as the block: %.2e)\n", op::volume(Q), op::volume(Q) - op::volume(*rb.solid));
-        AK_CHECK_NEAR(op::volume(Q), op::volume(*rb.solid), 1e-12);
+        // The map is exact, but the quadrature's sums run in another order
+        // (the spine's Newton points agree to about 1e-12): the same
+        // tolerance as the identities.
+        AK_CHECK_NEAR(op::volume(Q), op::volume(*rb.solid), 1e-11);
         const Vols f1 = check_all("two rounded blocks", *rb.solid, Q, 1e-11);
         if (rb2.solid) {
             const op::Brep Q2 = op::transformed(*rb.solid, op::SignedPermutation::quarter_turn_z(Vec3d{1.5, 0.5, 0.125} + shift));
