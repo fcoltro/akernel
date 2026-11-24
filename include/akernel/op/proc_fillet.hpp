@@ -245,6 +245,7 @@ inline ProcFilletResult round_block_edge(const PolyPatchD& top, double r, const 
         end_curve->carrier[1] = kEndL;
         end_curve->path.segs = cr.curves[0].segs;
         end_curve->path.make_breaks(end_curve->sys(), *blend);
+        end_curve->path.find_kinks(end_curve->sys(), *end_curve->a, *end_curve->b);
         // Run it from theta = 0 (on the top) to theta = 1 (on the side).
         solve::Pt4 c0, c1;
         end_curve->from = 0.0;

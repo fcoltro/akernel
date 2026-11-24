@@ -338,6 +338,7 @@ inline PlaneCutResult cut_by_plane(const Brep& in, Vec3d n, double d, const solv
             te->carrier[1] = kCap;
             te->path.segs = curve.segs;
             te->path.make_breaks(te->sys(), *te->a);
+            te->path.find_kinks(te->sys(), *te->a, *te->b);
             auto coords = [&](double sg, double& u, double& v) {
                 solve::Pt4 x;
                 if (!te->path.point(te->sys(), sg, x)) return false;

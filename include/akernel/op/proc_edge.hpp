@@ -24,6 +24,10 @@ namespace ak::op {
 struct CurvePath {
     std::vector<solve::TubeSegment> segs; ///< in curve order
     std::vector<double> brk;              ///< sigma at the segments' ends
+    /// sigma where the curve crosses a piece break of either carrier (inside
+    /// a segment): the carrier's parametrisation may have a kink there, so
+    /// quadrature and differences along the curve stop at these too.
+    std::vector<double> kinks;
 
     int segment_of(double sigma) const {
         const auto it = std::upper_bound(brk.begin() + 1, brk.end() - 1, sigma);
@@ -76,6 +80,52 @@ struct CurvePath {
         }
         brk.back() = 1.0;
     }
+    /// Kinks: where the curve's u on carrier a or on carrier b crosses one of
+    /// that carrier's interior breaks_u (call after make_breaks).
+    template <class Sys>
+    void find_kinks(const Sys& sys, const geom::Carrier& a, const geom::Carrier& b) {
+        kinks.clear();
+        for (std::size_t k = 0; k < segs.size(); ++k) {
+            const solve::TubeSegment& seg = segs[k];
+            auto x_at = [&](double f, solve::Pt4& x) {
+                const double c = (seg.reversed ? 1.0 - f : f) * seg.len;
+                for (int d = 0; d < 4; ++d) x[d] = seg.a[d] + c * seg.m[d];
+                return solve::newton_slice(sys, seg.m, seg.a, c, x);
+            };
+            for (int side = 0; side < 2; ++side) {
+                std::vector<double> bu = (side == 0 ? a : b).breaks_u();
+                if (bu.size() <= 2) continue;
+                const int n = 32;
+                std::vector<double> u(n + 1);
+                bool ok = true;
+                for (int i = 0; i <= n && ok; ++i) {
+                    solve::Pt4 x;
+                    ok = x_at(static_cast<double>(i) / n, x);
+                    u[static_cast<std::size_t>(i)] = x[static_cast<std::size_t>(2 * side)];
+                }
+                if (!ok) continue;
+                for (std::size_t j = 1; j + 1 < bu.size(); ++j) {
+                    const double beta = bu[j];
+                    for (int i = 0; i < n; ++i) {
+                        const double g0 = u[static_cast<std::size_t>(i)] - beta, g1 = u[static_cast<std::size_t>(i) + 1] - beta;
+                        if ((g0 < 0) == (g1 < 0)) continue;
+                        double lo = static_cast<double>(i) / n, hi = static_cast<double>(i + 1) / n, glo = g0;
+                        for (int it = 0; it < 60 && hi - lo > 1e-16; ++it) {
+                            const double m = 0.5 * (lo + hi);
+                            solve::Pt4 x;
+                            if (!x_at(m, x)) break;
+                            const double gm = x[static_cast<std::size_t>(2 * side)] - beta;
+                            if ((gm < 0) == (glo < 0)) { lo = m; glo = gm; }
+                            else hi = m;
+                        }
+                        const double f = 0.5 * (lo + hi);
+                        kinks.push_back(brk[k] + f * (brk[k + 1] - brk[k]));
+                    }
+                }
+            }
+        }
+        std::sort(kinks.begin(), kinks.end());
+    }
 };
 
 /// An edge on the intersection of two carriers: the part sigma in [from, to]
@@ -104,8 +154,9 @@ public:
     std::vector<double> breaks() const override {
         const double lo = std::min(from, to), hi = std::max(from, to);
         std::vector<double> t{0.0};
-        for (double s : path.brk)
-            if (s > lo && s < hi) t.push_back((s - from) / (to - from));
+        for (const auto* list : {&path.brk, &path.kinks})
+            for (double s : *list)
+                if (s > lo && s < hi) t.push_back((s - from) / (to - from));
         t.push_back(1.0);
         std::sort(t.begin(), t.end());
         return t;

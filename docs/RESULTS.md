@@ -1468,3 +1468,22 @@ From `tests/op/plane_cut_test.cpp` (28 checks, about 1 minute). `op/plane_cut.hp
 All are closed with Euler 2 and mesh watertight. Traced edges now give their parameter derivatives from the curve's tangent (dx/dc = t / (m · t) on a slice) instead of differences, which made the cube exact to print precision.
 
 What is certified: the section curves and their completeness. Where boundary edges cross the plane is found in doubles (sign changes along offset samples, then bisection), and which pieces of a section curve lie inside a face is decided by a winding test on sampled loops. These are measurements; the cut refuses when it is close to a decision (a vertex within 1e-9 of the plane, an edge nearly touching it). Not supported yet, each refused with a message: arc edges from earlier rational Booleans, section curves closed inside a face, and faces with inner loops that the plane crosses.
+
+### Booleans with flat-faced solids (union, intersection, difference)
+
+From `tests/op/poly_boolean_test.cpp` (39 checks, about 3 minutes). `op/poly_boolean.hpp` combines a solid that may have procedural faces with a solid whose faces are all flat, so every new curve is one of the first solid's surfaces against a plane. Where the first solid's edges cross the other's faces, and where the other's edges pierce the first's faces, become vertices. Every pair of faces whose enclosures meet is intersected by `intersect_carriers` (certified, complete), and the pieces of each curve inside both faces become traced edges. Each face is then split by the curves on it: an arrangement in its own parameters, with the edges at each vertex sorted by angle. Regions next to a curve are classified by the other face's outward normal; the rest inherit across shared edges, and the first solid's untouched regions take a ray test against the planes.
+
+| Case | Operation | Faces | Volume | Check |
+|---|---|---|---|---|
+| Unit cube and box [1/2, 3/2] × [1/4, 3/4] × [0.3, 1.7] | union | 12 | 1.525 | closed form |
+| | intersection | 6 | 0.175000000000000 | closed form |
+| | difference | 10 | 0.825 | closed form |
+| Rounded freeform block (§12) and a notch [1/2, 3/2] × [1/2, 1] × [0.3, 2] through the blend, the top and the side | union | 14 | 2.418201979973524 | |
+| | intersection | 7 | 0.132676182004502 | six plane cuts: 6.3e-13; slice integration: 5.4e-12 |
+| | difference | 12 | 1.568201979973525 | |
+
+In both cases union + intersection = A + P and difference + intersection = A to 1.3e-12, every result is closed with Euler 2, and every result meshes watertight.
+
+The first run of the notch case was 1.3e-10 off. A face-by-face comparison with the plane cuts put the error on the planar face at y = 1, the one that meets the blend where two of its spine segments join. The blend's sigma has a kink there: the speed jumps, though the surface is smooth. A traced curve crossing that seam has a kinked parameter inside one of its tube segments, and Gauss quadrature along it lost its accuracy. Traced curves now also break where they cross a piece break of either surface (`CurvePath::find_kinks`). Quadrature and differences along the edge stop there, and the error went from 1.3e-10 to 6e-13. The plane cuts gained from it too.
+
+What is certified: the intersection curves and their completeness. Measured in doubles, with refusals near a decision: where edges cross planes, which curve pieces lie inside faces, and the order of edges around a vertex. Refused with a message for now: arc edges, faces with inner loops, a face of the first solid lying in a plane of the second, tangent contact, curves closed inside a face, and parts of the second solid that never meet the first's boundary. The notch case takes about 10 s per operation, most of it in the blend-against-plane intersections. Tighter blend enclosures are the next speed step.
