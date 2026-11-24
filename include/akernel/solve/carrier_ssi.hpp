@@ -24,7 +24,11 @@
 #pragma once
 
 #include <algorithm>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
+#include <tuple>
 #include <vector>
 
 #include <akernel/geom/blend.hpp>
@@ -358,5 +362,321 @@ inline geom::FilletArc spine_section(const PolyPatchD& A, const PolyPatchD& B, d
     const Vec3d c = a + na * r;
     return geom::fillet_arc(c, r, -na, -nb);
 }
+
+// --- the rolling-ball blend as a carrier ----------------------------------------
+//
+// BlendCarrier is the blend surface of one certified spine: sigma in [0, 1]
+// runs along the spine (segment k of n covers [k/n, (k+1)/n], its slice
+// value linear in sigma), theta in [0, 1] across the section, from the
+// contact on A (theta = 0) to the contact on B (theta = 1). A point is the
+// section arc of spine_section() at theta. Nothing is fitted: the surface is
+// defined by the two supports, the radius and the spine's certificate.
+//
+// Enclosures over a (sigma, theta) box, per spine segment it overlaps:
+//  1. Spine parameters. The Krawczyk operator of the segment over its box
+//     for the slice values of the sigma range gives K, holding the spine
+//     points of those slices (ssi.hpp, krawczyk_operator).
+//  2. Spine derivative. x' = dx/dc solves M x' = e4, M = [J(x); m]. With C
+//     approximately inv(mid M(K)) and E = I - C M(K), if q = |E|_inf < 1 then
+//     |x'|_inf <= b = |C e4|_inf / (1 - q) and x' lies in C e4 + E [-b, b]^4.
+//  3. Contacts, centre and their sigma-derivatives from the patch and offset
+//     carriers' enclosures over K by the chain rule; the arc in forward-mode
+//     interval arithmetic (value, d/dsigma, d/dtheta).
+//  4. Tightening. Each quantity q of step 3 also lies in q(sigma_mid) +
+//     q' [-h, h] (mean-value form in sigma); the box result likewise around
+//     the box centre in (sigma, theta). This keeps the correlation between
+//     contacts and centre that the direct form loses.
+// The theta-independent part (steps 1 to 4) is cached per sigma range, since
+// subdivision revisits each range with many theta boxes.
+namespace carrier_detail {
+
+using geom::carrier_detail::meet;
+using D2 = geom::offset_detail::D2;
+using V2 = Vec3<D2>;
+
+inline V2 lift(const geom::IVec3& v, const geom::IVec3& dv_dsigma) {
+    return {D2(v.x, dv_dsigma.x, Interval(0.0)), D2(v.y, dv_dsigma.y, Interval(0.0)),
+            D2(v.z, dv_dsigma.z, Interval(0.0))};
+}
+
+/// Rigorous enclosure of dx/dc over K for the sliced system (see above).
+inline bool spine_derivative(const CarrierPairSystem& sys, const Pt4& m, const Box4& K,
+                             std::array<Interval, 4>& xp) {
+    Interval M[4][4];
+    sys.J_over(K, M);
+    for (int k = 0; k < 4; ++k) M[3][k] = Interval(m[k]);
+    double Mm[4][4], C[4][4];
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) {
+            if (!num::is_finite(M[i][j])) return false;
+            Mm[i][j] = num::mid(M[i][j]);
+        }
+    if (!invert4(Mm, C)) return false;
+    Interval E[4][4];
+    Interval q(0.0);
+    double qmax = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        Interval row(0.0);
+        for (int j = 0; j < 4; ++j) {
+            Interval e(i == j ? 1.0 : 0.0);
+            for (int k = 0; k < 4; ++k) e -= Interval(C[i][k]) * M[k][j];
+            E[i][j] = e;
+            row += Interval(num::mag(e));
+        }
+        qmax = std::max(qmax, row.hi);
+    }
+    (void)q;
+    if (!(qmax < 1.0)) return false;
+    double ce = 0.0;
+    for (int i = 0; i < 4; ++i) ce = std::max(ce, std::fabs(C[i][3]));
+    const double b = (Interval(ce) / (Interval(1.0) - Interval(qmax))).hi;
+    const Interval Y(-b, b);
+    for (int i = 0; i < 4; ++i) {
+        Interval v(C[i][3]);
+        for (int j = 0; j < 4; ++j) v += E[i][j] * Y;
+        xp[static_cast<std::size_t>(i)] = v;
+    }
+    return true;
+}
+
+/// The arc point and its derivatives from lifted contacts, centre and the
+/// unit directions uu = (a - c) / r, vv = (b - c) / r (passed separately so
+/// that their enclosures can be tighter than the difference's).
+inline V2 arc_point(const V2& a, const V2& c, const V2& b, const V2& uu, const V2& vv, double r,
+                    const D2& theta, bool& ok) {
+    const D2 R(r), one(1.0), two(2.0);
+    const D2 k = dot(uu, vv);
+    const D2 onek = one + k;
+    ok = onek.v.lo > 0.0;
+    if (!ok) return {};
+    const V2 corner = c + (uu + vv) * (R / onek);
+    const D2 w2 = two / onek;
+    const D2 s = one - theta;
+    const D2 B0 = s * s, B1 = two * s * theta, B2 = theta * theta * w2;
+    return (a * B0 + corner * B1 + b * B2) / (B0 + B1 + B2);
+}
+
+} // namespace carrier_detail
+
+class BlendCarrier final : public geom::Carrier {
+    geom::PatchCarrier pa_, pb_;
+    geom::OffsetCarrier oa_, ob_;
+    double r_;
+    std::vector<TubeSegment> segs_; ///< in curve order
+
+    CarrierPairSystem sys() const { return CarrierPairSystem(oa_, ob_); }
+    int count() const { return static_cast<int>(segs_.size()); }
+    /// Slice value of segment k at local fraction f in [0, 1] along the curve.
+    double slice(int k, double f) const {
+        const TubeSegment& s = segs_[static_cast<std::size_t>(k)];
+        return (s.reversed ? 1.0 - f : f) * s.len;
+    }
+    int segment_of(double sigma) const {
+        return std::clamp(static_cast<int>(std::floor(sigma * count())), 0, count() - 1);
+    }
+
+    /// Contacts and centre over a sigma range, lifted with their sigma-derivatives.
+    struct SpineJet {
+        carrier_detail::V2 a, c, b; ///< contacts and centre
+        carrier_detail::V2 u, v;    ///< (a - c) / r and (b - c) / r
+    };
+    struct Cache {
+        std::mutex mutex;
+        std::map<std::tuple<int, double, double>, std::optional<SpineJet>> map;
+    };
+    /// Shared by copies (same geometry), so the carrier stays copyable.
+    std::shared_ptr<Cache> cache_ = std::make_shared<Cache>();
+
+    /// The theta-independent part of the enclosures for sigma in [s0, s1]
+    /// within segment k. Subdivision revisits the same sigma ranges with many
+    /// theta (and other-carrier) boxes, so results are cached.
+    std::optional<SpineJet> spine_jet(int k, double s0, double s1) const {
+        const auto key = std::make_tuple(k, s0, s1);
+        {
+            std::lock_guard<std::mutex> lock(cache_->mutex);
+            if (auto it = cache_->map.find(key); it != cache_->map.end()) return it->second;
+        }
+        auto res = compute_spine_jet(k, s0, s1);
+        std::lock_guard<std::mutex> lock(cache_->mutex);
+        if (cache_->map.size() > 200000) cache_->map.clear();
+        cache_->map.emplace(key, res);
+        return res;
+    }
+
+    std::optional<SpineJet> compute_spine_jet(int k, double s0, double s1) const {
+        using namespace carrier_detail;
+        const TubeSegment& seg = segs_[static_cast<std::size_t>(k)];
+        const double n = count();
+        const double f0 = s0 * n - k, f1 = s1 * n - k;
+        const double c0 = slice(k, std::clamp(f0, 0.0, 1.0)), c1 = slice(k, std::clamp(f1, 0.0, 1.0));
+        const Interval Cs(std::min(c0, c1), std::max(c0, c1));
+        const auto sy = sys();
+        Pt4 xhat;
+        const double cm = num::mid(Cs);
+        for (int i = 0; i < 4; ++i) xhat[i] = seg.a[i] + cm * seg.m[i];
+        if (!newton_slice(sy, seg.m, seg.a, cm, xhat)) return std::nullopt;
+        // K(X) for the segment's certified box X holds the spine points of the
+        // slices Cs; iterating K <- K(K) ∩ K keeps that and contracts towards
+        // them (tight for a single slice, as point_at needs).
+        Box4 K = seg.X;
+        for (int it = 0; it < 8; ++it) {
+            // The mean-value step behind K needs xhat in the box.
+            bool in = true;
+            for (int i = 0; i < 4; ++i) in = in && K[i].lo <= xhat[i] && xhat[i] <= K[i].hi;
+            if (!in) break;
+            Box4 Kn;
+            if (!krawczyk_operator(sy, seg.m, seg.a, Cs, xhat, K, Kn)) {
+                if (it == 0) return std::nullopt;
+                break;
+            }
+            double before = 0.0, after = 0.0;
+            for (int i = 0; i < 4; ++i) {
+                const Interval m = meet(Kn[i], K[i]);
+                before = std::max(before, K[i].hi - K[i].lo);
+                after = std::max(after, m.hi - m.lo);
+                K[i] = m;
+                if (!num::is_finite(K[i])) return std::nullopt;
+            }
+            if (after > 0.5 * before || after < 1e-15) break; // stalled or tight
+        }
+        std::array<Interval, 4> xp;
+        if (!spine_derivative(sy, seg.m, K, xp)) return std::nullopt;
+        const Interval dcds(seg.reversed ? -seg.len * n : seg.len * n);
+        for (auto& d : xp) d = d * dcds;
+
+        geom::IVec3 SA, SAu, SAv, OA, OAu, OAv, SB, SBs, SBt;
+        geom::IVec3 OB, OBs, OBt;
+        if (!pa_.jet1_over(K[0].lo, K[0].hi, K[1].lo, K[1].hi, SA, SAu, SAv)) return std::nullopt;
+        if (!oa_.jet1_over(K[0].lo, K[0].hi, K[1].lo, K[1].hi, OA, OAu, OAv)) return std::nullopt;
+        if (!pb_.jet1_over(K[2].lo, K[2].hi, K[3].lo, K[3].hi, SB, SBs, SBt)) return std::nullopt;
+        if (!ob_.jet1_over(K[2].lo, K[2].hi, K[3].lo, K[3].hi, OB, OBs, OBt)) return std::nullopt;
+        SpineJet j;
+        j.a = lift(SA, SAu * xp[0] + SAv * xp[1]);
+        // The centre is on both offsets: A's enclosure meets B's.
+        j.c = lift(geom::carrier_detail::meet(OA, OB), OAu * xp[0] + OAv * xp[1]);
+        j.b = lift(SB, SBs * xp[2] + SBt * xp[3]);
+        const D2 R(r_);
+        j.u = (j.a - j.c) / R;
+        j.v = (j.b - j.c) / R;
+        // Mean-value form in sigma around the range's middle: a quantity q
+        // lies in q(mid) + q' [-h, h]. The direct values lose the correlation
+        // between contacts and centre (dependency); this keeps it, so
+        // u . v stays tight and the section arc stays defined on wide ranges.
+        if (s1 > s0) {
+            const double sm = 0.5 * s0 + 0.5 * s1;
+            if (const auto m = spine_jet(k, sm, sm)) {
+                const Interval h = Interval(s1) - Interval(sm);
+                const Interval e = num::hull(h, -h);
+                auto tighten = [&](V2& q, const V2& qm) {
+                    auto one = [&](D2& x, const D2& xm) {
+                        const Interval mv = xm.v + x.du * e;
+                        if (num::is_finite(mv)) x.v = meet(x.v, mv);
+                    };
+                    one(q.x, qm.x); one(q.y, qm.y); one(q.z, qm.z);
+                };
+                tighten(j.a, m->a); tighten(j.c, m->c); tighten(j.b, m->b);
+                tighten(j.u, m->u); tighten(j.v, m->v);
+            }
+        }
+        return j;
+    }
+
+    /// Enclosures for sigma in [s0, s1] within segment k and theta in T.
+    bool segment_jet(int k, double s0, double s1, const Interval& T, geom::IVec3& P,
+                     geom::IVec3& Ps, geom::IVec3& Pt) const {
+        using namespace carrier_detail;
+        const auto j = spine_jet(k, s0, s1);
+        if (!j) return false;
+        bool ok = false;
+        const V2 p = arc_point(j->a, j->c, j->b, j->u, j->v, r_, D2(T, Interval(0.0), Interval(1.0)), ok);
+        if (!ok) return false;
+        P = {p.x.v, p.y.v, p.z.v};
+        Ps = {p.x.du, p.y.du, p.z.du};
+        Pt = {p.x.dv, p.y.dv, p.z.dv};
+        return num::is_finite(P.x) && num::is_finite(Ps.x) && num::is_finite(Pt.x) &&
+               num::is_finite(P.y) && num::is_finite(Ps.y) && num::is_finite(Pt.y) &&
+               num::is_finite(P.z) && num::is_finite(Ps.z) && num::is_finite(Pt.z);
+    }
+
+public:
+    /// `spine` is one curve of find_spines(A, B, r) (or trace_spine's segments).
+    BlendCarrier(const PolyPatchD& A, const PolyPatchD& B, double r, std::vector<TubeSegment> spine)
+        : pa_(A), pb_(B), oa_(A, r), ob_(B, r), r_(r), segs_(std::move(spine)) {}
+
+    std::size_t segments() const { return segs_.size(); }
+
+    /// Spine parameters (u, v, s, t) at sigma, in doubles.
+    bool spine_at(double sigma, Pt4& x) const {
+        const int k = segment_of(sigma);
+        const TubeSegment& seg = segs_[static_cast<std::size_t>(k)];
+        const double c = slice(k, std::clamp(sigma * count() - k, 0.0, 1.0));
+        for (int i = 0; i < 4; ++i) x[i] = seg.a[i] + c * seg.m[i];
+        return newton_slice(sys(), seg.m, seg.a, c, x);
+    }
+
+    void eval(double sigma, double theta, Vec3d& P, Vec3d& Ps, Vec3d& Pt) const override {
+        // Point from the section; derivatives by central differences (doubles
+        // are only guesses for Newton steps; certified values come from the
+        // enclosures).
+        auto at = [&](double sg, double th) {
+            Pt4 x;
+            spine_at(std::clamp(sg, 0.0, 1.0), x);
+            Vec3d a, au, av, b, bs, bt, c, cu, cv;
+            pa_.eval(x[0], x[1], a, au, av);
+            pb_.eval(x[2], x[3], b, bs, bt);
+            oa_.eval(x[0], x[1], c, cu, cv);
+            const auto f = geom::fillet_arc(c, r_, (a - c) / r_, (b - c) / r_);
+            return f.status == geom::BlendStatus::Ok ? f.arc.point(th) : c;
+        };
+        P = at(sigma, theta);
+        const double h = 1e-6;
+        Ps = (at(sigma + h, theta) - at(sigma - h, theta)) / (2 * h);
+        Pt = (at(sigma, theta + h) - at(sigma, theta - h)) / (2 * h);
+    }
+
+    geom::IVec3 point_at(double sigma, double theta) const override {
+        geom::IVec3 P, Ps, Pt;
+        const int k = segment_of(sigma);
+        if (!segment_jet(k, sigma, sigma, Interval(theta), P, Ps, Pt))
+            return {Interval::entire(), Interval::entire(), Interval::entire()};
+        return P;
+    }
+
+    bool jet1_over(double s0, double s1, double t0, double t1, geom::IVec3& P, geom::IVec3& Ps,
+                   geom::IVec3& Pt) const override {
+        const int k0 = segment_of(s0), k1 = segment_of(s1);
+        bool first = true;
+        for (int k = k0; k <= k1; ++k) {
+            const double a = std::max(s0, static_cast<double>(k) / count());
+            const double b = std::min(s1, static_cast<double>(k + 1) / count());
+            geom::IVec3 p, ps, pt;
+            if (!segment_jet(k, a, b, Interval(t0, t1), p, ps, pt)) return false;
+            if (first) { P = p; Ps = ps; Pt = pt; first = false; }
+            else {
+                auto h = [](geom::IVec3& x, const geom::IVec3& y) {
+                    x = {num::hull(x.x, y.x), num::hull(x.y, y.y), num::hull(x.z, y.z)};
+                };
+                h(P, p); h(Ps, ps); h(Pt, pt);
+            }
+        }
+        if (first) return false;
+        // Mean-value form around the box centre, intersected with the direct
+        // enclosure: P(s, t) in P(sc, tc) + Ps [s - sc] + Pt [t - tc] since the
+        // segment from the centre stays in the box. It converges where the
+        // direct form does not tighten.
+        const double sc = 0.5 * s0 + 0.5 * s1, tc = 0.5 * t0 + 0.5 * t1;
+        geom::IVec3 C, Cs_, Ct_;
+        if (segment_jet(segment_of(sc), sc, sc, Interval(tc), C, Cs_, Ct_)) {
+            const Interval ds = Interval(s0) - Interval(sc), dt = Interval(t0) - Interval(tc);
+            const Interval es = num::hull(ds, -ds), et = num::hull(dt, -dt);
+            auto mv = [&](const Interval& c, const Interval& gs, const Interval& gt) {
+                return c + gs * es + gt * et;
+            };
+            const geom::IVec3 M{mv(C.x, Ps.x, Pt.x), mv(C.y, Ps.y, Pt.y), mv(C.z, Ps.z, Pt.z)};
+            P = geom::carrier_detail::meet(P, M);
+        }
+        return true;
+    }
+};
 
 } // namespace ak::solve

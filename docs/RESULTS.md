@@ -1357,7 +1357,7 @@ What this shows and does not show:
 
 ## 12. Rolling-ball fillets and procedural carriers (features track, steps F3a and F3b)
 
-Measured on 2026-11-24, same Linux/GCC setup as §11, from `tests/geom/blend_test.cpp` (6,244 checks) and `tests/solve/carrier_test.cpp` (4,222 checks).
+Measured on 2026-11-24, same Linux/GCC setup as §11, from `tests/geom/blend_test.cpp` (6,244 checks) and `tests/solve/carrier_test.cpp` (6,165 checks).
 
 ### Exact fillets (F3a)
 
@@ -1380,5 +1380,20 @@ Measured on 2026-11-24, same Linux/GCC setup as §11, from `tests/geom/blend_tes
 | Box enclosures of point and first partials (offset cylinder, rational bicubic-by-quadratic offset, plain patches), 30 random boxes at two sizes, 10 samples each | every sample inside its enclosure; enclosure of S_u 10.8 wide on 1/8 boxes, 0.16 on 1/64 boxes |
 | Spine of a ball (r = 1/4) between a cylinder of radius 2 and the plane x = 1 | 14 certified tube segments across the cylinder's full height, both ends on the domain boundary; every segment end within 2.2e-16 of the exact spine line |
 | Spine of a ball (r = 0.1) between the freeform hill and a wall x = 0.6 | the certified offset test first proves the ball fits on the hill; 14 certified segments across the whole hill; at every segment end the centre is r from the wall and from the hill to 1.1e-16, and the section arc builds |
+| Spines found without a guess (`find_spines`): cylinder/plane, hill/wall, hill and a wall out of reach | 1, 1 and 0 curves, each with the completeness proof (every spine point in the domain lies on a returned curve); 1,685, 2,515 and 7 verifier nodes; 0.8 s, 1.0 s and 0.01 s |
 
-What this does not show yet: spines found without a seed and proven complete (the completeness pass of `solve/ssi.hpp` subdivides Bézier patches and has not been generalised to carriers), the blend as a surface other code can intersect or tessellate, and trimming of the supports along the contact curves. Timing: the whole carrier test runs in 0.06 s.
+### The blend as a carrier (F3b)
+
+`BlendCarrier` is the fillet surface of one certified spine, parametrised by sigma along the spine and theta across the section. It implements the carrier interface, so it can be sampled for meshing and intersected with any other carrier with the same certificates.
+
+| Case | Result |
+|---|---|
+| Cylinder of radius 2 and plane x = 1, r = 1/4 (the blend is a round tube about the spine line), 300 random points | within 6.1e-16 of the tube; every point enclosure contains the sampled point, is proven to meet the tube and is narrower than 1e-9 |
+| Box enclosures, 20 random boxes at two sizes, 10 samples each | every sample inside (points to 1e-12, finite-difference partials to 1e-6); point enclosure 0.64 wide on 1/8 boxes, 0.032 on 1/64 boxes |
+| G1 at the contact curves, 11 stations | normal parallel to the cylinder's at theta = 0 and to the plane's at theta = 1, to 1e-6 (finite differences) |
+| Blend intersected with the plane z = 0.5 (`intersect_carriers`, no guess) | 1 curve, complete; every certified segment end on the plane and on the tube to 1e-10; 3,177 verifier nodes, 0.65 s |
+| Freeform: hill and wall, r = 0.1, 100 random points, 20 boxes, 11 G1 stations | every point r from the ball centre to 1e-12 and inside its enclosure; every box sample enclosed; G1 with the hill and with the wall |
+
+Making the blend intersectable at reasonable cost took two things. The first version needed 145 s for the plane cut: the direct enclosures lose the correlation between contacts and centre, so the arc's dot product u · v grew wider than 1 and boxes could not be decided. A mean-value form in sigma for every spine quantity, plus a cache of the theta-independent part per sigma range (subdivision revisits each range with many theta boxes), brought it to 0.65 s with no loss of rigour.
+
+What this does not show yet: trimming the supports along the contact curves and replacing the edge in a solid (F5). The whole carrier test runs in about 5 s.

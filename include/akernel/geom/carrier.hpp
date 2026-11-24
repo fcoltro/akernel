@@ -155,7 +155,7 @@ public:
 
     IVec3 point_at(double u, double v) const override {
         std::array<Vec4<Interval>, 6> X;
-        for (int i = 0; i < 6; ++i) X[i] = P_.d[i].eval(Interval(u), Interval(v));
+        for (int i = 0; i < (offset_ ? 6 : 3); ++i) X[i] = P_.d[i].eval(Interval(u), Interval(v));
         const auto j = first_jet(X, d_, offset_);
         if (!j.ok) return {Interval::entire(), Interval::entire(), Interval::entire()};
         return j.p;
@@ -163,11 +163,15 @@ public:
 
     bool jet1_over(double u0, double u1, double v0, double v1, IVec3& P, IVec3& Pu,
                    IVec3& Pv) const override {
+        // The offset needs the patch's partials to order 2 with their own
+        // derivatives (order 3); the patch itself only to order 1 (order 2).
+        const int order = offset_ ? 2 : 1;
+        const int count = (order + 2) * (order + 3) / 2;
         std::array<Vec4<Interval>, kJetSize> H;
-        for (int i = 0; i < kJetSize; ++i) H[i] = hull(P_.d[i].restricted(u0, u1, v0, v1));
+        for (int i = 0; i < count; ++i) H[i] = hull(P_.d[i].restricted(u0, u1, v0, v1));
         std::array<Vec4<D2>, 6> Xd;
-        for (int k = 0; k <= 2; ++k)
-            for (int l = 0; l <= 2 - k; ++l) {
+        for (int k = 0; k <= order; ++k)
+            for (int l = 0; l <= order - k; ++l) {
                 const int i = jet_index(k, l), iu = jet_index(k + 1, l), iv = jet_index(k, l + 1);
                 Xd[i] = {D2(H[i].x, H[iu].x, H[iv].x), D2(H[i].y, H[iu].y, H[iv].y),
                          D2(H[i].z, H[iu].z, H[iv].z), D2(H[i].w, H[iu].w, H[iv].w)};
@@ -175,7 +179,7 @@ public:
         const auto g = first_jet(Xd, d_, offset_);
         const double uc = 0.5 * u0 + 0.5 * u1, vc = 0.5 * v0 + 0.5 * v1;
         std::array<Vec4<Interval>, 6> Xc;
-        for (int i = 0; i < 6; ++i) Xc[i] = P_.d[i].eval(Interval(uc), Interval(vc));
+        for (int i = 0; i < (offset_ ? 6 : 3); ++i) Xc[i] = P_.d[i].eval(Interval(uc), Interval(vc));
         const auto c = first_jet(Xc, d_, offset_);
         if (!g.ok || !c.ok) return false;
         const Interval du = Interval(u0) - Interval(uc), dv = Interval(v0) - Interval(vc);

@@ -172,5 +172,136 @@ int main() {
         }
     }
 
+    // --- the blend carrier: a surface other code can intersect and mesh -----
+    {
+        // Cylinder of radius 2 and the plane x = 1, r = 0.25: the ball centre
+        // runs along the line x = 1.25, y = yc, so the blend is a piece of the
+        // cylinder of radius r about that line.
+        const PolyPatchD cyl = make_cylinder_quarter(2.0, 0.0, 1.0);
+        const PolyPatchD wall = make_plane({1, 0, -0.5}, {0, 3, 0}, {0, 0, 2});
+        const double r = 0.25;
+        const double yc = std::sqrt(2.25 * 2.25 - 1.25 * 1.25);
+        const auto sp = ak::solve::find_spines(cyl, wall, r);
+        AK_CHECK(sp.complete && sp.curves.size() == 1);
+        if (sp.curves.size() == 1) {
+            const ak::solve::BlendCarrier bl(cyl, wall, r, sp.curves[0].segs);
+            // On the round tube about the spine line, in doubles and certified.
+            double worst = 0.0;
+            for (int n = 0; n < 300; ++n) {
+                const double s = rng.unit(), t = rng.unit();
+                Vec3d p, ps, pt;
+                bl.eval(s, t, p, ps, pt);
+                worst = std::max(worst, std::fabs(std::hypot(p.x - 1.25, p.y - yc) - r));
+                const IVec3 P = bl.point_at(s, t);
+                AK_CHECK(inside(P, p, 1e-12));
+                const Interval d2 = ak::num::sqr(P.x - Interval(1.25)) + ak::num::sqr(P.y - Interval(yc));
+                AK_CHECK(d2.lo <= r * r + 1e-9 && d2.hi >= r * r - 1e-9);
+                AK_CHECK(width(P) < 1e-9);
+            }
+            std::printf("blend carrier (cylinder/plane): %zu spine segments, off the tube by %.2e\n",
+                        bl.segments(), worst);
+            AK_CHECK(worst < 1e-12);
+            // Box enclosures hold the sampled points and derivatives (the
+            // doubles' derivatives are central differences: slack 1e-6), and
+            // shrink with the box.
+            double wc = 0.0, wf = 0.0;
+            for (int trial = 0; trial < 20; ++trial)
+                for (double h : {1.0 / 8, 1.0 / 64}) {
+                    const double s0 = rng.range(0, 1 - h), t0 = rng.range(0, 1 - h);
+                    IVec3 P, Ps, Pt;
+                    AK_CHECK(bl.jet1_over(s0, s0 + h, t0, t0 + h, P, Ps, Pt));
+                    for (int n = 0; n < 10; ++n) {
+                        Vec3d p, ps, pt;
+                        bl.eval(s0 + h * rng.unit(), t0 + h * rng.unit(), p, ps, pt);
+                        AK_CHECK(inside(P, p, 1e-12) && inside(Ps, ps, 1e-6) && inside(Pt, pt, 1e-6));
+                    }
+                    (h > 0.1 ? wc : wf) = std::max(h > 0.1 ? wc : wf, width(P));
+                }
+            std::printf("blend carrier: max width of the point enclosure %.3g (h = 1/8), %.3g (h = 1/64)\n",
+                        wc, wf);
+            AK_CHECK(wf < wc / 4);
+            // G1 with the supports along the contact curves.
+            for (int n = 0; n <= 10; ++n) {
+                const double s = n / 10.0;
+                Vec3d p, ps, pt;
+                bl.eval(s, 0.0, p, ps, pt);
+                const Vec3d nb = cross(ps, pt);
+                AK_CHECK(std::fabs(std::hypot(p.x, p.y) - 2.0) < 1e-12);
+                AK_CHECK(norm(cross(normalized(nb), normalized(Vec3d{p.x, p.y, 0}))) < 1e-6);
+                bl.eval(s, 1.0, p, ps, pt);
+                AK_CHECK(std::fabs(p.x - 1.0) < 1e-12);
+                AK_CHECK(norm(cross(normalized(cross(ps, pt)), Vec3d{1, 0, 0})) < 1e-6);
+            }
+            // Intersected with the plane z = 0.5 like any other carrier: one
+            // section arc, found without a guess, with the completeness proof.
+            const PatchCarrier cut(make_plane({0, 0, 0.5}, {3, 0, 0}, {0, 3, 0}));
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto res = ak::solve::intersect_carriers(bl, cut);
+            const double secs =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            std::printf("blend x plane: %zu curve(s), complete %d, %zu verifier nodes, %.2f s\n",
+                        res.curves.size(), static_cast<int>(res.complete), res.stats.verify_nodes, secs);
+            AK_CHECK(res.complete);
+            AK_CHECK(res.curves.size() == 1);
+            double off = 0.0;
+            for (const auto& cv : res.curves)
+                for (const auto& sg : cv.segs)
+                    for (const Pt4& q : {sg.a, sg.b}) {
+                        Vec3d p, ps, pt;
+                        bl.eval(q[0], q[1], p, ps, pt);
+                        off = std::max({off, std::fabs(p.z - 0.5),
+                                        std::fabs(std::hypot(p.x - 1.25, p.y - yc) - r)});
+                    }
+            AK_CHECK(off < 1e-10);
+        }
+    }
+
+    // --- a freeform blend: hill and wall ---------------------------------------
+    {
+        const PolyPatchD hill = make_bump(0.25);
+        const PolyPatchD wall = make_plane({0.6, -0.5, -0.5}, {0, 0, 2}, {0, 2, 0});
+        const double r = 0.1;
+        const auto sp = ak::solve::find_spines(hill, wall, r);
+        AK_CHECK(sp.complete && sp.curves.size() == 1);
+        if (sp.curves.size() == 1) {
+            const ak::solve::BlendCarrier bl(hill, wall, r, sp.curves[0].segs);
+            const BezierSurface hb(hill);
+            for (int n = 0; n < 100; ++n) {
+                const double s = rng.unit(), t = rng.unit();
+                Vec3d p, ps, pt;
+                bl.eval(s, t, p, ps, pt);
+                AK_CHECK(inside(bl.point_at(s, t), p, 1e-12));
+                // Every blend point is at distance r from the ball centre.
+                Pt4 x;
+                AK_CHECK(bl.spine_at(s, x));
+                const auto sec = ak::solve::spine_section(hill, wall, r, x);
+                AK_CHECK_NEAR(norm(p - sec.centre), r, 1e-12);
+            }
+            for (int trial = 0; trial < 20; ++trial) {
+                const double h = 1.0 / 32, s0 = rng.range(0, 1 - h), t0 = rng.range(0, 1 - h);
+                IVec3 P, Ps, Pt;
+                AK_CHECK(bl.jet1_over(s0, s0 + h, t0, t0 + h, P, Ps, Pt));
+                for (int n = 0; n < 10; ++n) {
+                    Vec3d p, ps, pt;
+                    bl.eval(s0 + h * rng.unit(), t0 + h * rng.unit(), p, ps, pt);
+                    AK_CHECK(inside(P, p, 1e-12) && inside(Ps, ps, 1e-6) && inside(Pt, pt, 1e-6));
+                }
+            }
+            // G1: tangent to the wall at theta = 1, to the hill at theta = 0.
+            for (int n = 0; n <= 10; ++n) {
+                Vec3d p, ps, pt;
+                Pt4 x;
+                bl.spine_at(n / 10.0, x);
+                bl.eval(n / 10.0, 0.0, p, ps, pt);
+                const Jet3 J = BezierSurface(hill).jet(x[0], x[1]);
+                AK_CHECK(norm(cross(normalized(cross(ps, pt)), normalized(cross(J[1], J[2])))) < 1e-6);
+                bl.eval(n / 10.0, 1.0, p, ps, pt);
+                AK_CHECK(norm(cross(normalized(cross(ps, pt)), Vec3d{1, 0, 0})) < 1e-6);
+            }
+            std::printf("blend carrier (hill/wall): %zu spine segments, sampled and enclosed\n",
+                        bl.segments());
+        }
+    }
+
     return akt::finish("carrier_test");
 }
