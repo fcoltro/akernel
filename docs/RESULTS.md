@@ -1464,6 +1464,25 @@ Each also matches its copy moved by (2, 1.5, 0) to 1e-10, is closed with Euler 2
 
 What this does not show yet: Booleans on procedural faces (next: cuts by planar solids, decided 2026-11-24), blends meeting other blends (chains, caps), and freeform support pairs other than a graph top with a plane.
 
+### Fillets on general solids: any convex edge
+
+From `tests/op/round_edge_test.cpp` (68 checks, about 20 s). `op::round_edge(S, edge, r)` rounds a convex side edge of any Brep, not just the block's one edge. The two faces at the edge must each be a whole carrier bounded by side edges, and each end vertex must have three faces: the two supports and one end face. The supports are the faces' carriers, turned so that Su × Sv is outward (a flipped face is reversed in u), and continued a quarter of their length past both ends along the edge. The spine is their certified −r offset intersection. At each end, the blend is trimmed by its certified curve with the end face's carrier, so the end face may be curved and meet the edge at any angle. The old edge becomes the contact curve on the first face. The end vertices move to the contacts, and the edges along the end faces are shortened to them. Before building, the function checks that the edge is convex at its midpoint. Afterwards it checks that every loop closes and that the contact curves stay inside their faces (on samples).
+
+| Case | Faces / edges / vertices | Volume |
+|---|---|---|
+| Box, vertical edge | 7 / 15 / 10 | error −5.2e-13 against a b h − (1 − π/4) r² h |
+| Box, top edge along x | 7 / 15 / 10 | error 2.8e-13 |
+| Box, top edge along y | 7 / 15 / 10 | error 3.5e-12 |
+| Box, side reversed in u and flipped | 7 / 15 / 10 | error 4.0e-13 |
+| Box, two vertical edges in turn | 8 / 18 / 12 | error 7.5e-13 (the second rounding reads the first result) |
+| Freeform top, edge x = a | 7 / 15 / 10 | matches `round_block_edge` to 3.4e-13 |
+| Freeform top, edge x = 0 | 7 / 15 / 10 | matches the mirrored block's `round_block_edge` to 2.7e-13 |
+| Sloped top, edge with the end y = L | 7 / 15 / 10 | matches its moved copy to 4.8e-12 |
+
+Each result is closed with Euler characteristic 2 and meshes watertight (deviation about 2.5e-4). A radius too large for the faces is refused.
+
+What this does not check yet: whether the ball meets faces other than the three at each end, which happens when the radius is too large for the solid. Edges that meet at a rounded vertex (chains, and vertex blends where three rounded edges meet) are not covered yet.
+
 ### Plane cuts of solids with procedural faces (first step of Booleans on them)
 
 From `tests/op/plane_cut_test.cpp` (28 checks, about 1 minute). `op/plane_cut.hpp` cuts any solid with side and procedural edges by a plane, keeping n · x ≤ d. Every face the plane meets is intersected with a planar cap patch by `intersect_carriers` (certified, with a completeness proof). Each piece of section curve inside a face becomes a `TracedEdge` between the face's surface and the cap, read by both in their own parameters. The face keeps its region on the kept side, found by walking its loop and turning onto the section edge at each crossing. The cap's loops are the section edges chained at the crossings; outer loops are counter-clockwise and holes go into the outer loop that contains them.

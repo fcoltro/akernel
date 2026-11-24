@@ -426,4 +426,302 @@ inline ProcFilletResult round_block_edge(const PolyPatchD& top, double r, const 
     return res;
 }
 
+/// Round a convex side edge of any Brep by radius r (docs/FEATURES.md §5.1,
+/// fillets on general solids).
+///
+/// The edge must be a side edge between two faces whose loops are made of
+/// side edges only (each face is its whole carrier), and each end vertex must
+/// have exactly three faces: the two supports and one end face, met through
+/// two side edges. The supports are the two faces' carriers, turned so that
+/// Su x Sv is outward and continued a quarter of their length past both ends
+/// along the edge; the spine is their certified -r offset intersection. At
+/// each end the blend is trimmed by its certified curve with the end face's
+/// carrier, so the end face may be curved and meet the edge at any angle.
+///
+/// The edge becomes the contact curve on the first face, the end vertex
+/// becomes the contact point there, and the edges along the end faces are
+/// shortened to the contacts. Checked: convexity at the edge's midpoint, one
+/// spine and one trimming curve per end with completeness proofs, the
+/// contacts inside the edges they split and (on samples) the contact curves
+/// inside their faces. Not checked yet: the ball meeting faces other than
+/// the three at each end (a radius too large for the solid).
+inline ProcFilletResult round_edge(const Brep& S, int edge, double r, const solve::SsiOptions& opt = {}) {
+    using namespace proc_fillet_detail;
+    ProcFilletResult res;
+    auto fail = [&](const char* m) { res.error = m; return res; };
+    if (edge < 0 || edge >= static_cast<int>(S.edges.size())) return fail("no such edge");
+    if (!(r > 0.0)) return fail("the radius must be positive");
+    const BEdge E = S.edges[static_cast<std::size_t>(edge)];
+    if (E.proc || E.arc) return fail("the edge must be a side edge");
+    auto face_of = [&](int carrier) {
+        int f = -1, n = 0;
+        for (std::size_t i = 0; i < S.faces.size(); ++i)
+            if (S.faces[i].proc < 0 && S.faces[i].carrier == carrier) { f = static_cast<int>(i); ++n; }
+        return n == 1 ? f : -1;
+    };
+    auto whole = [&](int f) {
+        const BFace& F = S.faces[static_cast<std::size_t>(f)];
+        if (F.loops.size() != 1) return false;
+        for (const BCoedge& c : F.loops[0]) {
+            const BEdge& e = S.edges[static_cast<std::size_t>(c.edge)];
+            if (e.proc || e.arc) return false;
+        }
+        return true;
+    };
+    const int CA = E.on[0].carrier, CB = E.on[1].carrier, FA = face_of(CA), FB = face_of(CB);
+    if (FA < 0 || FB < 0 || !whole(FA) || !whole(FB))
+        return fail("both faces at the edge must be whole carriers bounded by side edges");
+
+    // A support: the face's carrier turned outward and continued along the
+    // edge; face coordinate k = alpha[k] w + beta[k] of support coordinate w.
+    struct Support {
+        PolyPatchD P;
+        double alpha[2] = {1.0, 1.0}, beta[2] = {0.0, 0.0};
+    };
+    const double ext = 0.25, span = 1.0 + 2.0 * ext;
+    auto support = [&](int f, int side) {
+        Support s;
+        const BFace& F = S.faces[static_cast<std::size_t>(f)];
+        const PolyPatchD& C = S.carriers[static_cast<std::size_t>(F.carrier)];
+        s.P = C;
+        if (F.flipped) {
+            for (int i = 0; i <= C.p; ++i)
+                for (int j = 0; j <= C.q; ++j) s.P.at(i, j) = C.at(C.p - i, j);
+            s.alpha[0] = -1.0;
+            s.beta[0] = 1.0;
+        }
+        const int along = (side == 0 || side == 2) ? 0 : 1;
+        s.P = along == 0 ? s.P.restricted(-ext, 1.0 + ext, 0.0, 1.0) : s.P.restricted(0.0, 1.0, -ext, 1.0 + ext);
+        s.beta[along] -= s.alpha[along] * ext;
+        s.alpha[along] *= span;
+        return s;
+    };
+    const Support SA = support(FA, E.on[0].side), SB = support(FB, E.on[1].side);
+
+    // Convex: at the edge's midpoint, the direction into the first face
+    // points against the second face's outward normal.
+    {
+        const double tm = 0.5 * (E.t0.lo + E.t1.hi);
+        auto frame = [&](int f, const BEdge::SideRef& ref, Vec3d& n, Vec3d& in) {
+            double u, v;
+            side_uv(ref.side, ref.reversed ? 1.0 - tm : tm, u, v);
+            const BFace& F = S.faces[static_cast<std::size_t>(f)];
+            const geom::Jet3 J = geom::BezierSurface(S.carriers[static_cast<std::size_t>(F.carrier)]).jet(u, v);
+            n = cross(J[1], J[2]) * (F.flipped ? -1.0 : 1.0);
+            const int sd = ref.side;
+            in = sd == 0 ? J[2] : sd == 1 ? J[1] * -1.0 : sd == 2 ? J[2] * -1.0 : J[1];
+        };
+        Vec3d nA, inA, nB, inB;
+        frame(FA, E.on[0], nA, inA);
+        frame(FB, E.on[1], nB, inB);
+        if (!(dot(inA, nB) < 0.0 && dot(inB, nA) < 0.0)) return fail("the edge is not convex");
+    }
+
+    // The spine: the ball inside the material.
+    const geom::OffsetCarrier oa(SA.P, -r), ob(SB.P, -r);
+    const solve::SsiResult sp = solve::intersect_carriers(oa, ob, opt);
+    if (!sp.complete || sp.curves.size() != 1) return fail("expected exactly one spine with a completeness proof");
+    auto blend = std::make_shared<solve::BlendCarrier>(SA.P, SB.P, r, sp.curves[0].segs, -1);
+    res.blend = blend;
+
+    Brep b = S;
+    b.outward_known = false;
+    const int pi = static_cast<int>(b.procs.size());
+    b.procs.push_back(blend);
+
+    // The ends.
+    struct End {
+        int V = -1, eA = -1, eB = -1, CE = -1, FE = -1, B = -1;
+        double sA = 0.0, sB = 0.0;
+        std::shared_ptr<TracedEdge> curve;
+    };
+    End end[2];
+    auto other_edge = [&](int f, int V) {
+        int found = -1, n = 0;
+        for (const BCoedge& c : S.faces[static_cast<std::size_t>(f)].loops[0]) {
+            const BEdge& e = S.edges[static_cast<std::size_t>(c.edge)];
+            if (c.edge != edge && (e.v0 == V || e.v1 == V)) { found = c.edge; ++n; }
+        }
+        return n == 1 ? found : -1;
+    };
+    auto other_carrier = [&](int e, int c) {
+        const BEdge& x = S.edges[static_cast<std::size_t>(e)];
+        return x.on[0].carrier == c ? x.on[1].carrier : x.on[0].carrier;
+    };
+    for (int k = 0; k < 2; ++k) {
+        End& en = end[k];
+        en.V = k == 0 ? E.v0 : E.v1;
+        en.eA = other_edge(FA, en.V);
+        en.eB = other_edge(FB, en.V);
+        if (en.eA < 0 || en.eB < 0) return fail("an end vertex needs one more edge on each face");
+        en.CE = other_carrier(en.eA, CA);
+        if (other_carrier(en.eB, CB) != en.CE) return fail("an end vertex must have exactly three faces");
+        en.FE = face_of(en.CE);
+        if (en.FE < 0) return fail("the end face must be one carrier");
+        auto plane = std::make_shared<geom::PatchCarrier>(b.carriers[static_cast<std::size_t>(en.CE)]);
+        const solve::SsiResult cr = solve::intersect_carriers(*blend, *plane, opt);
+        if (!cr.complete || cr.curves.size() != 1)
+            return fail("expected exactly one curve where the blend meets an end face, with a completeness proof");
+        auto curve = std::make_shared<TracedEdge>();
+        curve->a = blend;
+        curve->b = plane;
+        curve->proc[0] = pi;
+        curve->carrier[1] = en.CE;
+        curve->path.segs = cr.curves[0].segs;
+        curve->path.make_breaks(curve->sys(), *blend);
+        curve->path.find_kinks(curve->sys(), *curve->a, *curve->b);
+        solve::Pt4 q0, q1;
+        if (!curve->at(0.0, q0) || !curve->at(1.0, q1)) return fail("trimming curve ends");
+        if (q0[1] > q1[1]) {
+            std::swap(q0, q1);
+            curve->from = 1.0;
+            curve->to = 0.0;
+        }
+        if (!(std::fabs(q0[1]) < 1e-9 && std::fabs(q1[1] - 1.0) < 1e-9))
+            return fail("the trimming curve does not run from contact to contact");
+        en.sA = q0[0];
+        en.sB = q1[0];
+        en.curve = curve;
+    }
+    const bool sigma_up = end[0].sA < end[1].sA;
+    if (sigma_up != (end[0].sB < end[1].sB)) return fail("the trimming curves cross");
+
+    // Contacts: face coordinates, split parameters, vertices.
+    auto face_uv = [&](const Support& s, int coord, double sigma, double& u, double& v) {
+        solve::Pt4 x;
+        if (!blend->spine_at(sigma, x)) return false;
+        u = s.alpha[0] * x[static_cast<std::size_t>(coord)] + s.beta[0];
+        v = s.alpha[1] * x[static_cast<std::size_t>(coord + 1)] + s.beta[1];
+        return true;
+    };
+    // Split side edge e (one end at V) at the contact, which is at (u, v) on
+    // carrier c; the end at V becomes vertex W.
+    auto split = [&](int e, int V, int c, double u, double v, int W, int CE) {
+        BEdge& x = b.edges[static_cast<std::size_t>(e)];
+        const BEdge::SideRef* ref = side_on(x, c);
+        const double sp_ = (ref->side == 0 || ref->side == 2) ? u : v;
+        const double t = ref->reversed ? 1.0 - sp_ : sp_;
+        if (!(t > std::min(x.t0.hi, x.t1.hi) && t < std::max(x.t0.lo, x.t1.lo))) return false; // strictly inside
+        if (x.v0 == V) { x.v0 = W; x.t0 = Interval(t); }
+        else { x.v1 = W; x.t1 = Interval(t); }
+        const BEdge::SideRef* re = side_on(x, CE);
+        double ue, ve;
+        side_uv(re->side, re->reversed ? 1.0 - t : t, ue, ve);
+        BVertex& w = b.vertices[static_cast<std::size_t>(W)];
+        w.charts.push_back({c, Interval(u), Interval(v)});
+        w.charts.push_back({CE, Interval(ue), Interval(ve)});
+        return true;
+    };
+    for (End& en : end) {
+        Vec3d P, Ps, Pt;
+        double u, v;
+        // A: the end vertex itself, moved to the contact on the first face.
+        BVertex& a = b.vertices[static_cast<std::size_t>(en.V)];
+        blend->eval(en.sA, 0.0, P, Ps, Pt);
+        a = BVertex{};
+        a.point = P;
+        if (!face_uv(SA, 0, en.sA, u, v) || !split(en.eA, en.V, CA, u, v, en.V, en.CE))
+            return fail("a contact is not inside the edge it splits");
+        blend->eval(en.sB, 1.0, P, Ps, Pt);
+        b.vertices.push_back({});
+        b.vertices.back().point = P;
+        en.B = static_cast<int>(b.vertices.size()) - 1;
+        if (!face_uv(SB, 2, en.sB, u, v) || !split(en.eB, en.V, CB, u, v, en.B, en.CE))
+            return fail("a contact is not inside the edge it splits");
+    }
+    // The contact curves inside their faces (samples).
+    for (int side = 0; side < 2; ++side) {
+        const Support& s = side == 0 ? SA : SB;
+        const double s0 = side == 0 ? end[0].sA : end[0].sB, s1 = side == 0 ? end[1].sA : end[1].sB;
+        for (int i = 0; i <= 64; ++i) {
+            double u, v;
+            if (!face_uv(s, 2 * side, s0 + (s1 - s0) * i / 64.0, u, v) || !(u > -1e-12 && u < 1 + 1e-12 && v > -1e-12 && v < 1 + 1e-12))
+                return fail("a contact curve leaves its face: the radius is too large");
+        }
+    }
+
+    // Edges: the old edge becomes the contact on the first face; a new one
+    // on the second face; the trimming curves.
+    auto contact = [&](double theta, double from, double to, int carrier, int coord, const Support& s) {
+        auto pe = std::make_shared<BlendSide>();
+        pe->blend = blend;
+        pe->proc = pi;
+        pe->contact = true;
+        pe->fixed = theta;
+        pe->from = from;
+        pe->to = to;
+        pe->support = carrier;
+        pe->coord = coord;
+        for (int k = 0; k < 2; ++k) {
+            pe->scale[k] = 1.0 / s.alpha[k];
+            pe->shift[k] = -s.beta[k] / s.alpha[k];
+        }
+        return pe;
+    };
+    {
+        BEdge e;
+        e.v0 = E.v0;
+        e.v1 = E.v1;
+        e.proc = contact(0.0, end[0].sA, end[1].sA, CA, 0, SA);
+        b.edges[static_cast<std::size_t>(edge)] = e;
+    }
+    BEdge eb;
+    eb.v0 = end[0].B;
+    eb.v1 = end[1].B;
+    eb.proc = contact(1.0, end[0].sB, end[1].sB, CB, 2, SB);
+    b.edges.push_back(eb);
+    const int EcB = static_cast<int>(b.edges.size()) - 1;
+    for (BCoedge& c : b.faces[static_cast<std::size_t>(FB)].loops[0])
+        if (c.edge == edge) c.edge = EcB;
+    int Ec[2];
+    for (int k = 0; k < 2; ++k) {
+        End& en = end[k];
+        BEdge e;
+        e.v0 = en.V;
+        e.v1 = en.B;
+        e.proc = en.curve;
+        b.edges.push_back(e);
+        Ec[k] = static_cast<int>(b.edges.size()) - 1;
+        // In the end face's loop, between the two edges it shortened.
+        std::vector<BCoedge>& L = b.faces[static_cast<std::size_t>(en.FE)].loops[0];
+        const int n = static_cast<int>(L.size());
+        int iA = -1, iB = -1;
+        for (int i = 0; i < n; ++i) {
+            if (L[static_cast<std::size_t>(i)].edge == en.eA) iA = i;
+            if (L[static_cast<std::size_t>(i)].edge == en.eB) iB = i;
+        }
+        if (iA < 0 || iB < 0) return fail("the end face does not hold both edges at the vertex");
+        if ((iA + 1) % n == iB) L.insert(L.begin() + iA + 1, BCoedge{Ec[k], false});
+        else if ((iB + 1) % n == iA) L.insert(L.begin() + iB + 1, BCoedge{Ec[k], true});
+        else return fail("the end face's edges at the vertex are not consecutive");
+    }
+    // The blend: counter-clockwise in (sigma, theta).
+    {
+        BFace f;
+        f.proc = pi;
+        if (sigma_up) f.loops.push_back({{edge, false}, {Ec[1], false}, {EcB, true}, {Ec[0], true}});
+        else f.loops.push_back({{edge, true}, {Ec[0], false}, {EcB, false}, {Ec[1], true}});
+        const double sm = 0.25 * (end[0].sA + end[0].sB + end[1].sA + end[1].sB);
+        Vec3d Q, Qs, Qt;
+        blend->eval(sm, 0.5, Q, Qs, Qt);
+        solve::Pt4 x;
+        blend->spine_at(sm, x);
+        Vec3d c, cu, cv;
+        oa.eval(x[0], x[1], c, cu, cv);
+        f.flipped = dot(cross(Qs, Qt), Q - c) < 0.0;
+        b.faces.push_back(std::move(f));
+    }
+    // Every loop closes: each coedge ends where the next begins.
+    for (const BFace& F : b.faces)
+        for (const auto& L : F.loops)
+            for (std::size_t i = 0; i < L.size(); ++i) {
+                const BEdge& x = b.edges[static_cast<std::size_t>(L[i].edge)];
+                const BEdge& y = b.edges[static_cast<std::size_t>(L[(i + 1) % L.size()].edge)];
+                const int xe = L[i].reversed ? x.v0 : x.v1, ys = L[(i + 1) % L.size()].reversed ? y.v1 : y.v0;
+                if (xe != ys) return fail("internal: a loop does not close");
+            }
+    res.solid = std::move(b);
+    return res;
+}
+
 } // namespace ak::op
