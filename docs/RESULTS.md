@@ -1425,7 +1425,7 @@ What this does not show yet: edges of solids that are not swept (faces that are 
 
 ### A freeform fillet inside a solid (F5 on freeform supports, procedural faces)
 
-From `tests/op/proc_fillet_test.cpp` (41 checks, about 2 minutes, most of it the blend–plane intersections and the mesh-deviation measurement). `op/proc_fillet.hpp` builds a block whose top is a polynomial graph over the rectangle and rounds the edge between the top and the side x = a with a rolling ball. The dihedral angle varies along the edge, so the blend is not a rational surface. It is a procedural face: `Brep::procs` holds the `BlendCarrier` and the face is that carrier over its whole parameter square (docs/FEATURES.md §5.1). The top and the side are trimmed along the contact curves, which are procedural edges read in each support's parameters through the certified spine's own coordinates. The end faces are trimmed by the blend's end sections, which lie in the end planes because the top has zero slope across them.
+From `tests/op/proc_fillet_test.cpp` (70 checks, about 36 s, most of it the mesh-deviation measurement). `op/proc_fillet.hpp` builds a block whose top is a polynomial graph over the rectangle and rounds the edge between the top and the side x = a with a rolling ball. The dihedral angle varies along the edge, so the blend is not a rational surface. It is a procedural face: `Brep::procs` holds the `BlendCarrier` and the face is that carrier over its whole parameter square (docs/FEATURES.md §5.1). The top and the side are trimmed along the contact curves, which are procedural edges read in each support's parameters through the certified spine's own coordinates. The end faces are trimmed by the blend's end sections, which lie in the end planes because the top has zero slope across them.
 
 The top is z = h + c x s(y/L), with s the smoothstep 3t² − 2t³ (degree (1, 3); a = 1, L = 2, h = 3/4, r = 1/4).
 
@@ -1452,6 +1452,15 @@ Trimmed procedural faces. `round_block_edge(top, r, opt, cut)` ends the block at
 | Same, moved by (1/2, −1/2, 0) | 7 / 15 / 10 | differs by 3.9e-12 |
 
 Both are closed with Euler 2 and mesh watertight (deviation 3.1e-4). The cost is the blend–plane intersection with its completeness proof: about 18 s here, against 1 s for the rest. Its verifier now splits a box where it is widest in space (parameter width times speed), which cut the boxes by a quarter. Getting to about 1 s needs tighter enclosures of the blend over boxes; that is a follow-up.
+
+Sloped ends (2026-11-24). The zero-slope restriction at the ends is gone. At any end where the top is not flat across the end plane, `round_block_edge` extends both supports a quarter of their length past the end (the polynomial continued), traces the spine over the extended supports, and trims the blend there by its certified curve with the end face, as for a cut. The test top is z = h + c x y / L (profile s = t), which crosses both end planes at an angle, so both ends are trimmed:
+
+| Case (top z = 0.75 + 0.5 x y / 2) | Faces / edges / vertices | Volume |
+|---|---|---|
+| Whole length | 7 / 15 / 10 | 1.701606293429266; removed 0.048393706571, by slices …572 (1.2e-12) |
+| Cut at 3L/4 | 7 / 15 / 10 | 1.234092371646494; removed 0.031532628354, by slices …353 (1.5e-13) |
+
+Each also matches its copy moved by (2, 1.5, 0) to 1e-10, is closed with Euler 2, and meshes watertight (deviation 2.5e-4). Each builds in under 1.2 s.
 
 What this does not show yet: Booleans on procedural faces (next: cuts by planar solids, decided 2026-11-24), blends meeting other blends (chains, caps), and freeform support pairs other than a graph top with a plane.
 

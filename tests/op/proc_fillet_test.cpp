@@ -21,12 +21,15 @@ using geom::Vec3d;
 
 namespace {
 
-/// Top over [x0, x0 + a] x [y0, y0 + L], degree (1, 3): z = h + c (x - x0) s(y)
-/// with s the smoothstep 3t^2 - 2t^3 (Bernstein coefficients 0, 0, 1, 1),
-/// so the slope across the end planes is zero.
-op::PolyPatchD top_patch(double a, double L, double h, double c, double x0 = 0, double y0 = 0) {
+/// Bernstein coefficients of the profile s along y: the smoothstep 3t^2 - 2t^3
+/// (zero slope across the end planes) and the line s = t (nonzero slope).
+constexpr double kSmooth[4] = {0, 0, 1, 1};
+constexpr double kLinear[4] = {0, 1.0 / 3, 2.0 / 3, 1};
+
+/// Top over [x0, x0 + a] x [y0, y0 + L], degree (1, 3): z = h + c (x - x0) s(y).
+op::PolyPatchD top_patch(double a, double L, double h, double c, double x0 = 0, double y0 = 0,
+                         const double (&s)[4] = kSmooth) {
     op::PolyPatchD T(1, 3);
-    static constexpr double s[4] = {0, 0, 1, 1};
     for (int i = 0; i <= 1; ++i)
         for (int j = 0; j <= 3; ++j) T.at(i, j) = {x0 + a * i, y0 + L * j / 3.0, h + c * a * i * s[j], 1.0};
     return T;
@@ -69,9 +72,10 @@ op::ProcFilletResult build(const op::PolyPatchD& top, double r, const char* name
 /// x there, the side x = a and the blend's section curve, found by solving
 /// P(sigma, theta).y = y0 per theta), by a shoelace on n chords with
 /// Richardson extrapolation, integrated over y by Gauss 8 on 8 cells.
-double removed_by_slices(const solve::BlendCarrier& blend, double a, double L, double h, double c, double y_end) {
+double removed_by_slices(const solve::BlendCarrier& blend, double a, double L, double h, double c, double y_end,
+                         bool linear = false) {
     auto cut_area = [&](double y0, int n) {
-        const double t = y0 / L, sy = t * t * (3 - 2 * t);
+        const double t = y0 / L, sy = linear ? t : t * t * (3 - 2 * t);
         std::vector<Vec3d> poly;
         for (int i = 0; i <= n; ++i) {
             const double th = static_cast<double>(i) / n;
@@ -250,11 +254,24 @@ int main() {
             AK_CHECK(worst_ratio < 10.0);
         }
     }
-    // Refusals.
-    {
-        op::PolyPatchD T = top_patch(a, L, h, c);
-        T.at(1, 1).z += 0.1; // slope across y = 0
-        AK_CHECK(!op::round_block_edge(T, r).solid);
+    // Sloped ends: the top z = h + c x y / L crosses both end planes at an
+    // angle, so the fillet does not meet them along a section. The supports
+    // are extended past the ends and the blend is trimmed by traced curves at
+    // both ends (the integral of s = t over [0, T] is T^2 / 2).
+    for (const double T : {1.0, cut}) {
+        const double yT = T * L;
+        auto res = build(top_patch(a, L, h, c, 0, 0, kLinear), r,
+                         T == 1.0 ? "sloped ends" : "sloped ends, cut at 3L/4", T);
+        if (res.solid) {
+            const double v = op::volume(*res.solid), block = a * yT * h + c * a * a / 2 * L * T * T / 2;
+            const double slices = removed_by_slices(*res.blend, a, L, h, c, yT, true);
+            std::printf("  volume %.15f, block %.15f, removed %.12f, by slices %.12f, difference %.2e\n", v, block,
+                        block - v, slices, block - v - slices);
+            AK_CHECK(v < block);
+            AK_CHECK_NEAR(block - v, slices, 1e-9);
+            auto moved = build(top_patch(a, L, h, c, 2.0, 1.5, kLinear), r, "  moved", T);
+            if (moved.solid) AK_CHECK_NEAR(op::volume(*moved.solid), v, 1e-10);
+        }
     }
     return akt::finish("proc_fillet_test");
 }
