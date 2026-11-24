@@ -135,12 +135,12 @@ public:
     void J_over(const Box4& X, Interval J[3][4]) const {
         const double u0 = X[0].lo, u1 = X[0].hi, v0 = X[1].lo, v1 = X[1].hi;
         const double s0 = X[2].lo, s1 = X[2].hi, t0 = X[3].lo, t1 = X[3].hi;
-        const auto A = geom::hull(ai_.restricted(u0, u1, v0, v1));
-        const auto Au = geom::hull(aui_.restricted(u0, u1, v0, v1));
-        const auto Av = geom::hull(avi_.restricted(u0, u1, v0, v1));
-        const auto B = geom::hull(bi_.restricted(s0, s1, t0, t1));
-        const auto Bs = geom::hull(bsi_.restricted(s0, s1, t0, t1));
-        const auto Bt = geom::hull(bti_.restricted(s0, s1, t0, t1));
+        const auto A = geom::hull_restricted(ai_, u0, u1, v0, v1);
+        const auto Au = geom::hull_restricted(aui_, u0, u1, v0, v1);
+        const auto Av = geom::hull_restricted(avi_, u0, u1, v0, v1);
+        const auto B = geom::hull_restricted(bi_, s0, s1, t0, t1);
+        const auto Bs = geom::hull_restricted(bsi_, s0, s1, t0, t1);
+        const auto Bt = geom::hull_restricted(bti_, s0, s1, t0, t1);
         const Interval a[3] = {A.x, A.y, A.z}, au[3] = {Au.x, Au.y, Au.z}, av[3] = {Av.x, Av.y, Av.z};
         const Interval b[3] = {B.x, B.y, B.z}, bs[3] = {Bs.x, Bs.y, Bs.z}, bt[3] = {Bt.x, Bt.y, Bt.z};
         for (int k = 0; k < 3; ++k) {
@@ -214,13 +214,20 @@ public:
 
 // --- Newton and Krawczyk on the sliced system ---------------------------------
 //
+// These are templates over the system type: SsiSystem above (two rational
+// patches) or solve/carrier_ssi.hpp's CarrierPairSystem (procedural
+// carriers such as offsets). A system provides eval (F and J in doubles at
+// a point), F_at (enclosure of F at a point), J_over (enclosure of J over a
+// box), tangent and sin_angle.
+//
 // G(x) = ( F(x), m.(x - a) - c ).  With c an interval the Krawczyk test
 // proves existence and uniqueness for every slice value in c at once.
 
 inline double dot4(const Pt4& a, const Pt4& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]; }
 
 /// Newton iteration in doubles for G(x) = 0. Returns false if it does not settle.
-inline bool newton_slice(const SsiSystem& sys, const Pt4& m, const Pt4& a, double c, Pt4& x) {
+template <class Sys>
+inline bool newton_slice(const Sys& sys, const Pt4& m, const Pt4& a, double c, Pt4& x) {
     double last = std::numeric_limits<double>::infinity();
     for (int it = 0; it < 25; ++it) {
         double F[3], J[3][4], A[4][4], inv[4][4];
@@ -253,7 +260,8 @@ inline bool newton_slice(const SsiSystem& sys, const Pt4& m, const Pt4& a, doubl
 /// lie in X). K encloses every zero of G in X for every slice value in c,
 /// whether or not K itself lies inside X, so it can be used as a contractor.
 /// Returns false only if the preconditioner could not be formed.
-inline bool krawczyk_operator(const SsiSystem& sys, const Pt4& m, const Pt4& a, const Interval& c,
+template <class Sys>
+inline bool krawczyk_operator(const Sys& sys, const Pt4& m, const Pt4& a, const Interval& c,
                               const Pt4& xhat, const Box4& X, Box4& K) {
     double F[3], J[3][4], A[4][4], C[4][4];
     sys.eval(xhat, F, J);
@@ -287,7 +295,8 @@ inline bool krawczyk_operator(const SsiSystem& sys, const Pt4& m, const Pt4& a, 
 
 /// Krawczyk test. On success K is strictly inside X and encloses the unique
 /// zero of G in X for every slice value in c.
-inline bool krawczyk(const SsiSystem& sys, const Pt4& m, const Pt4& a, const Interval& c,
+template <class Sys>
+inline bool krawczyk(const Sys& sys, const Pt4& m, const Pt4& a, const Interval& c,
                      const Pt4& xhat, const Box4& X, Box4& K) {
     if (!krawczyk_operator(sys, m, a, c, xhat, X, K)) return false;
     for (int i = 0; i < 4; ++i)
@@ -297,7 +306,8 @@ inline bool krawczyk(const SsiSystem& sys, const Pt4& m, const Pt4& a, const Int
 
 /// Refine x onto the slice m.(x-a) = c and return a certified enclosure of
 /// the exact intersection point.
-inline bool certify_point(const SsiSystem& sys, const Pt4& m, const Pt4& a, double c, Pt4& x, Box4& enc) {
+template <class Sys>
+inline bool certify_point(const Sys& sys, const Pt4& m, const Pt4& a, double c, Pt4& x, Box4& enc) {
     if (!newton_slice(sys, m, a, c, x)) return false;
     for (double r = 1e-13; r <= 1e-7; r *= 10.0) {
         Box4 X;
@@ -413,7 +423,8 @@ inline TubeSegment make_segment(const Pt4& a, const Pt4& b, const SsiOptions& op
     return s;
 }
 
-inline bool certify_segment(const SsiSystem& sys, const TubeSegment& s) {
+template <class Sys>
+inline bool certify_segment(const Sys& sys, const TubeSegment& s) {
     Pt4 mid;
     for (int i = 0; i < 4; ++i) mid[i] = 0.5 * (s.a[i] + s.b[i]);
     Box4 K;
@@ -431,7 +442,8 @@ struct Branch {
 /// `detect_closure` the branch stops when it has left its first segment's
 /// region and a certified point of it lies in that region again: by
 /// uniqueness of the arc there, the curve has closed.
-inline Branch trace(const SsiSystem& sys, const Pt4& start, const Box4& start_enc, double dir,
+template <class Sys>
+inline Branch trace(const Sys& sys, const Pt4& start, const Box4& start_enc, double dir,
                     const SsiOptions& opt, SsiStats& stats, bool detect_closure) {
     Branch br;
     Pt4 x = start;
@@ -528,7 +540,8 @@ inline Branch trace(const SsiSystem& sys, const Pt4& start, const Box4& start_en
 }
 
 /// Gauss-Newton projection of a guess onto E (minimum-norm steps), in doubles.
-inline bool project_to_curve(const SsiSystem& sys, Pt4& x) {
+template <class Sys>
+inline bool project_to_curve(const Sys& sys, Pt4& x) {
     for (int it = 0; it < 40; ++it) {
         double F[3], J[3][4];
         sys.eval(x, F, J);

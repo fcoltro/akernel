@@ -164,5 +164,36 @@ int main() {
         }
     }
 
+    // hull_restricted (doubles with an error bound) against the interval
+    // restriction: it must hold every point of the patch over the box and be
+    // no wider, up to rounding. Interval control points (as derivative
+    // patches have) are included.
+    {
+        int bad = 0;
+        double worst = 0.0;
+        for (int n = 0; n < 300; ++n) {
+            const int p = 1 + n % 4, q = 1 + (n / 4) % 4;
+            PolyPatchI P = to_interval(random_rational(rng, p, q));
+            if (n % 3 == 0) P = P.deriv_u();
+            double u0 = rng.unit(), u1 = rng.unit(), v0 = rng.unit(), v1 = rng.unit();
+            if (u0 > u1) std::swap(u0, u1);
+            if (v0 > v1) std::swap(v0, v1);
+            if (n % 5 == 0) u1 = u0; // a single u
+            const Vec4<Interval> H = hull_restricted(P, u0, u1, v0, v1);
+            const Vec4<Interval> G = hull(P.restricted(u0, u1, v0, v1));
+            for (int k = 0; k < 20; ++k) {
+                const double u = u0 + (u1 - u0) * rng.unit(), v = v0 + (v1 - v0) * rng.unit();
+                const Vec4<Interval> e = P.eval(Interval(u), Interval(v));
+                for (const auto& [h, x] : {std::pair{H.x, e.x}, {H.y, e.y}, {H.z, e.z}, {H.w, e.w}})
+                    if (!(h.lo <= x.hi && x.lo <= h.hi)) ++bad;
+            }
+            for (const auto& [h, g] : {std::pair{H.x, G.x}, {H.y, G.y}, {H.z, G.z}, {H.w, G.w}})
+                worst = std::max(worst, (h.hi - h.lo) - (g.hi - g.lo));
+        }
+        std::printf("  hull_restricted: %d points outside, widest excess %.2e\n", bad, worst);
+        AK_CHECK(bad == 0);
+        AK_CHECK(worst < 1e-12); // the bound grows with degree and size
+    }
+
     return akt::finish("bernstein_test");
 }

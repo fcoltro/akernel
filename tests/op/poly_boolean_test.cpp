@@ -1,0 +1,300 @@
+// Booleans between a solid with procedural faces and a solid with rational
+// faces, flat or curved (op/poly_boolean.hpp). Every result must be a closed shell that meshes
+// watertight; the volumes must satisfy the inclusion-exclusion identities,
+// match closed forms where there are some, and match the same region cut
+// out by successive plane cuts (op/plane_cut.hpp), an independent route.
+#include <akernel/op/plane_cut.hpp>
+#include <akernel/op/brep_transform.hpp>
+#include <akernel/op/poly_boolean.hpp>
+#include <akernel/op/proc_fillet.hpp>
+#include <akernel/op/surfaces.hpp>
+#include <akernel/op/tessellate.hpp>
+
+#include <cmath>
+#include <cstdio>
+
+#include "check.hpp"
+
+using namespace ak;
+using geom::Vec3d;
+
+namespace {
+
+op::PolyPatchD top_patch(double a, double L, double h, double c, double x0 = 0, double y0 = 0) {
+    op::PolyPatchD T(1, 3);
+    static constexpr double s[4] = {0, 0, 1, 1};
+    for (int i = 0; i <= 1; ++i)
+        for (int j = 0; j <= 3; ++j) T.at(i, j) = {x0 + a * i, y0 + L * j / 3.0, h + c * a * i * s[j], 1.0};
+    return T;
+}
+
+const char* op_name(op::PolyOp o) {
+    return o == op::PolyOp::Union ? "union" : o == op::PolyOp::Intersection ? "intersection" : "difference";
+}
+
+/// Check a result: closed, watertight; the volume returned.
+double check_result(const char* name, op::PolyOp o, const op::PolyBooleanResult& r) {
+    if (!r.solid) std::printf("%s %s: refused: %s\n", name, op_name(o), r.error.c_str());
+    AK_CHECK(r.solid.has_value());
+    if (!r.solid) return 0.0;
+    const auto rep = op::audit(*r.solid);
+    AK_CHECK(rep.closed());
+    const double v = op::volume(*r.solid);
+    const op::TessResult t = op::tessellate(*r.solid);
+    if (!t.ok) std::printf("  tessellation failed: %s\n", t.error.c_str());
+    AK_CHECK(t.ok);
+    double dev = -1.0;
+    if (t.ok) {
+        AK_CHECK(op::audit(t.mesh).watertight());
+        dev = op::mesh_deviation(t.mesh, *r.solid);
+        AK_CHECK(dev < 2e-3);
+    }
+    std::printf("%s %s: %zu faces, %d curves, closed %d, euler %d, volume %.15f, mesh deviation %.2e, %.2f s\n", name,
+                op_name(o), r.solid->faces.size(), r.curves, static_cast<int>(rep.closed()), rep.euler, v, dev, r.seconds);
+    return v;
+}
+
+/// The three operations, and their volume identities.
+struct Vols {
+    double uni, inter, diff;
+};
+Vols check_all(const char* name, const op::Brep& A, const op::Brep& P, double tol) {
+    const double vA = op::volume(A), vP = op::volume(P);
+    Vols w{};
+    w.uni = check_result(name, op::PolyOp::Union, op::poly_boolean(A, P, op::PolyOp::Union));
+    w.inter = check_result(name, op::PolyOp::Intersection, op::poly_boolean(A, P, op::PolyOp::Intersection));
+    w.diff = check_result(name, op::PolyOp::Difference, op::poly_boolean(A, P, op::PolyOp::Difference));
+    std::printf("  identities: union + intersection - A - P = %.2e, difference + intersection - A = %.2e\n",
+                w.uni + w.inter - vA - vP, w.diff + w.inter - vA);
+    AK_CHECK_NEAR(w.uni + w.inter, vA + vP, tol);
+    AK_CHECK_NEAR(w.diff + w.inter, vA, tol);
+    return w;
+}
+
+/// A solid moved by t (exact for dyadic t and control points).
+op::Brep moved(op::Brep B, const Vec3d& t) {
+    for (op::PolyPatchD& C : B.carriers)
+        for (geom::Vec4d& c : C.c) {
+            c.x += t.x * c.w;
+            c.y += t.y * c.w;
+            c.z += t.z * c.w;
+        }
+    for (op::BVertex& v : B.vertices) v.point = v.point + t;
+    return B;
+}
+
+/// A cut to the box lo..hi by its six planes.
+double box_by_cuts(const op::Brep& A, const Vec3d& lo, const Vec3d& hi) {
+    op::Brep S = A;
+    const Vec3d n[6] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+    const double d[6] = {hi.x, -lo.x, hi.y, -lo.y, hi.z, -lo.z};
+    for (int k = 0; k < 6; ++k) {
+        // Planes that miss the solid are skipped by checking the vertices.
+        bool cuts = false;
+        for (const op::BVertex& v : S.vertices) cuts = cuts || dot(n[k], v.point) > d[k];
+        if (!cuts) continue;
+        const op::PlaneCutResult r = op::cut_by_plane(S, n[k], d[k]);
+        if (!r.solid) {
+            std::printf("  plane cut %d refused: %s\n", k, r.error.c_str());
+            AK_CHECK(false);
+            return 0.0;
+        }
+        S = *r.solid;
+    }
+    return op::volume(S);
+}
+
+/// Removed volume of the rounded block over y in [0, y_end] by slices (as in
+/// proc_fillet_test).
+double removed_by_slices(const solve::BlendCarrier& blend, double a, double L, double h, double c, double y_end) {
+    auto cut_area = [&](double y0, int n) {
+        const double t = y0 / L, sy = t * t * (3 - 2 * t);
+        std::vector<Vec3d> poly;
+        for (int i = 0; i <= n; ++i) {
+            const double th = static_cast<double>(i) / n;
+            Vec3d P, Ps, Pt;
+            auto f = [&](double sg) {
+                blend.eval(sg, th, P, Ps, Pt);
+                return P.y - y0;
+            };
+            double lo = 0.0, hi = 1.0, flo = f(lo), fhi = f(hi);
+            int side = 0;
+            for (int it = 0; it < 100 && hi - lo > 1e-15; ++it) {
+                const double m = (lo * fhi - hi * flo) / (fhi - flo), fm = f(m);
+                if (fm == 0.0) { lo = hi = m; break; }
+                if ((fm > 0.0) == (flo > 0.0)) { lo = m; flo = fm; if (side == -1) fhi /= 2; side = -1; }
+                else { hi = m; fhi = fm; if (side == 1) flo /= 2; side = 1; }
+                if (std::fabs(fm) < 1e-14) { lo = hi = m; break; }
+            }
+            f(0.5 * (lo + hi));
+            poly.push_back(P);
+        }
+        poly.push_back({a, y0, h + c * a * sy});
+        double A = 0.0;
+        for (std::size_t i = 0; i < poly.size(); ++i) {
+            const Vec3d& p = poly[i];
+            const Vec3d& q = poly[(i + 1) % poly.size()];
+            A += p.x * q.z - q.x * p.z;
+        }
+        return std::fabs(A) / 2;
+    };
+    static constexpr double gx[4] = {0.1834346424956498, 0.5255324099163290, 0.7966664774136267, 0.9602898564975363};
+    static constexpr double gw[4] = {0.3626837833783620, 0.3137066458778873, 0.2223810344533745, 0.1012285362903763};
+    const int cells = 8;
+    double total = 0.0;
+    for (int k = 0; k < cells; ++k)
+        for (int i = 0; i < 4; ++i)
+            for (int sgn = -1; sgn <= 1; sgn += 2) {
+                const double y = y_end * (k + 0.5 + 0.5 * sgn * gx[i]) / cells;
+                const double a1 = cut_area(y, 300), a2 = cut_area(y, 600);
+                total += 0.5 * gw[i] * (y_end / cells) * (a2 + (a2 - a1) / 3);
+            }
+    return total;
+}
+
+} // namespace
+
+int main() {
+    // A cube and a box through one of its corners' edges: closed forms.
+    {
+        const op::Brep A = op::to_brep(op::make_box(Vec3d{0, 0, 0}, Vec3d{1, 1, 1}));
+        const op::Brep P = op::to_brep(op::make_box(Vec3d{0.5, 0.25, 0.3}, Vec3d{1.5, 0.75, 1.7}));
+        const Vols w = check_all("cube and box", A, P, 1e-12);
+        AK_CHECK_NEAR(w.inter, 0.5 * 0.5 * 0.7, 1e-12);
+        AK_CHECK_NEAR(w.diff, 1.0 - 0.175, 1e-12);
+    }
+
+    // A cube and a sector of a thick cylinder wall (quarter turn, radii 1/8
+    // and 3/8, axis vertical through (1/4, 1/4)) standing through its top:
+    // curved faces of the second operand, closed forms.
+    {
+        const op::Brep A = op::to_brep(op::make_box(Vec3d{0, 0, 0}, Vec3d{1, 1, 1}));
+        const op::Brep P = moved(op::to_brep(op::make_cylinder_sector(0.125, 0.375, 0.0, 1.0, 0.5, 1.5)), {0.25, 0.25, 0.0});
+        const double pi = 3.14159265358979323846, area = pi / 4 * (0.375 * 0.375 - 0.125 * 0.125);
+        const Vols w = check_all("cube and cylinder sector", A, P, 1e-11);
+        AK_CHECK_NEAR(w.inter, area * 0.5, 1e-11);
+        AK_CHECK_NEAR(w.diff, 1.0 - area * 0.5, 1e-11);
+    }
+
+    // The rounded freeform block (a = 1, L = 2, h = 3/4, r = 1/4, c = 1/2)
+    // and a box notch through the blend, the top and the side: the
+    // intersection is compared with six plane cuts of the block.
+    const double a = 1.0, L = 2.0, h = 0.75, r = 0.25, c = 0.5;
+    const op::ProcFilletResult rb = op::round_block_edge(top_patch(a, L, h, c), r);
+    AK_CHECK(rb.solid.has_value());
+    if (rb.solid) {
+        const Vec3d lo{0.5, 0.5, 0.3}, hi{1.5, 1.0, 2.0};
+        const op::Brep P = op::to_brep(op::make_box(lo, hi));
+        const Vols w = check_all("rounded block and notch", *rb.solid, P, 1e-11);
+        const double cuts = box_by_cuts(*rb.solid, lo, hi);
+        std::printf("  intersection by plane cuts %.15f, difference %.2e\n", cuts, w.inter - cuts);
+        // A third route: the box part of the block minus the blend's
+        // removed volume over y in [1/2, 1], by slices.
+        auto S = [&](double y) { const double t = y / L; return L * (t * t * t - t * t * t * t / 2); };
+        const double boxpart = (hi.y - lo.y) * (a - lo.x) * (h - lo.z) + c * (a * a - lo.x * lo.x) / 2 * (S(hi.y) - S(lo.y));
+        const double removed = removed_by_slices(*rb.blend, a, L, h, c, hi.y) - removed_by_slices(*rb.blend, a, L, h, c, lo.y);
+        std::printf("  intersection by slices %.15f, difference %.2e\n", boxpart - removed, w.inter - (boxpart - removed));
+        AK_CHECK_NEAR(w.inter, boxpart - removed, 2e-11);
+        AK_CHECK_NEAR(w.inter, cuts, 1e-11);
+
+        // A cylinder sector (radii 1/16 and 1/2, from -90 to 0 degrees, axis
+        // vertical through (5/8, 11/8)) whose outer wall cuts through the
+        // blend, the top and the side: the blend against a cylinder. The
+        // same volumes when both solids move together.
+        const op::Brep Sec = moved(op::to_brep(op::make_cylinder_sector(0.0625, 0.5, -1.0, 0.0, 0.3, 2.0)), {0.625, 1.375, 0.0});
+        const Vols c1 = check_all("rounded block and cylinder sector", *rb.solid, Sec, 1e-11);
+        const Vec3d shift{0.5, -0.5, 0.0};
+        const op::ProcFilletResult rb2 = op::round_block_edge(top_patch(a, L, h, c, shift.x, shift.y), r);
+        if (rb2.solid) {
+            const op::PolyBooleanResult m = op::poly_boolean(*rb2.solid, moved(Sec, shift), op::PolyOp::Intersection);
+            const double v2 = check_result("same, moved", op::PolyOp::Intersection, m);
+            std::printf("  difference %.2e\n", v2 - c1.inter);
+            AK_CHECK_NEAR(v2, c1.inter, 1e-11);
+        }
+
+        // Fillet against fillet: a second rounded block turned a quarter
+        // about z and moved by (3/2, 1/2, 1/8), so that its rounded edge runs
+        // along x at y = 3/2 and crosses the first block's rounded edge. Both
+        // solids have a procedural blend face.
+        const op::Brep Q = op::transformed(*rb.solid, op::SignedPermutation::quarter_turn_z({1.5, 0.5, 0.125}));
+        std::printf("turned block: volume %.15f (same as the block: %.2e)\n", op::volume(Q), op::volume(Q) - op::volume(*rb.solid));
+        // The map is exact, but the quadrature's sums run in another order
+        // (the spine's Newton points agree to about 1e-12): the same
+        // tolerance as the identities.
+        AK_CHECK_NEAR(op::volume(Q), op::volume(*rb.solid), 1e-11);
+        // Four volumes enter each identity, and each moves by about 5e-12
+        // with the quadrature (the block's own volume does when the rule is
+        // refined), so the bound is twice that of the cases above.
+        const Vols f1 = check_all("two rounded blocks", *rb.solid, Q, 2e-11);
+        if (rb2.solid) {
+            const op::Brep Q2 = op::transformed(*rb.solid, op::SignedPermutation::quarter_turn_z(Vec3d{1.5, 0.5, 0.125} + shift));
+            const op::PolyBooleanResult m = op::poly_boolean(*rb2.solid, Q2, op::PolyOp::Intersection);
+            const double v2 = check_result("same, moved", op::PolyOp::Intersection, m);
+            std::printf("  difference %.2e\n", v2 - f1.inter);
+            AK_CHECK_NEAR(v2, f1.inter, 1e-11);
+        }
+
+        // Chains: a pocket b1 into the top leaves a hole in it, and the
+        // result is an operand again. b2 cuts across the pocket, b3 makes a
+        // second pocket and leaves the first one's hole as it was, and with
+        // the holed solid as the second operand. Each volume follows from
+        // single Booleans of the block (b1 and b2 overlap in the box b12).
+        const op::Brep b1 = op::to_brep(op::make_box({0.2, 0.6, 0.6}, {0.45, 1.0, 2.0}));
+        const op::Brep b2 = op::to_brep(op::make_box({0.35, 0.9, 0.5}, {0.7, 1.4, 2.0}));
+        const op::Brep b12 = op::to_brep(op::make_box({0.35, 0.9, 0.6}, {0.45, 1.0, 2.0}));
+        const op::Brep b3 = op::to_brep(op::make_box({0.1, 1.5, 0.4}, {0.5, 1.8, 2.0}));
+        const double vA = op::volume(*rb.solid);
+        auto inter = [&](const op::Brep& B) {
+            const op::PolyBooleanResult m = op::poly_boolean(*rb.solid, B, op::PolyOp::Intersection);
+            return m.solid ? op::volume(*m.solid) : NAN;
+        };
+        const double i1 = inter(b1), i2 = inter(b2), i12 = inter(b12), i3 = inter(b3);
+        const op::PolyBooleanResult p1 = op::poly_boolean(*rb.solid, b1, op::PolyOp::Difference);
+        const double v1 = check_result("block - pocket", op::PolyOp::Difference, p1);
+        AK_CHECK_NEAR(v1, vA - i1, 1e-12);
+        int holes = 0;
+        if (p1.solid)
+            for (const auto& f : p1.solid->faces) holes += static_cast<int>(f.loops.size()) - 1;
+        AK_CHECK(holes == 1);
+        if (p1.solid) {
+            const op::Brep& H = *p1.solid;
+            struct Case { const char* name; double v, expect, tol; };
+            const Case cases[] = {
+                {"(block - pocket) - b2", check_result("(block - pocket) - b2", op::PolyOp::Difference, op::poly_boolean(H, b2, op::PolyOp::Difference)), vA - i1 - i2 + i12, 1e-11},
+                {"(block - pocket) & b2", check_result("(block - pocket) & b2", op::PolyOp::Intersection, op::poly_boolean(H, b2, op::PolyOp::Intersection)), i2 - i12, 1e-11},
+                {"(block - pocket) - b3", check_result("(block - pocket) - b3", op::PolyOp::Difference, op::poly_boolean(H, b3, op::PolyOp::Difference)), vA - i1 - i3, 1e-11},
+                {"b2 & (block - pocket)", check_result("b2 & (block - pocket)", op::PolyOp::Intersection, op::poly_boolean(b2, H, op::PolyOp::Intersection)), i2 - i12, 1e-11},
+                {"b2 - (block - pocket)", check_result("b2 - (block - pocket)", op::PolyOp::Difference, op::poly_boolean(b2, H, op::PolyOp::Difference)), op::volume(b2) - (i2 - i12), 1e-11},
+            };
+            for (const Case& c : cases) {
+                std::printf("  %s: expected %.15f, difference %.2e\n", c.name, c.expect, c.v - c.expect);
+                AK_CHECK_NEAR(c.v, c.expect, c.tol);
+            }
+        }
+    }
+    // Operands whose boundaries do not meet: every part is placed by rays,
+    // against the blend too (certified ray crossings with the procedural
+    // face). A small box under the blend gives a cavity, one beside the
+    // block a second shell; with the block second, the box is kept or not.
+    if (rb.solid) {
+        const double vA = op::volume(*rb.solid);
+        const op::Brep in = op::to_brep(op::make_box({0.8, 0.9, 0.3}, {0.9, 1.0, 0.6}));
+        const op::Brep out = op::to_brep(op::make_box({1.2, 0.9, 0.3}, {1.3, 1.0, 0.6}));
+        const double vb = op::volume(in);
+        struct Case { const char* name; op::PolyOp o; const op::Brep* a; const op::Brep* b; double expect; };
+        const Case cases[] = {
+            {"block - inner box (cavity)", op::PolyOp::Difference, &*rb.solid, &in, vA - vb},
+            {"block + inner box", op::PolyOp::Union, &*rb.solid, &in, vA},
+            {"block & inner box", op::PolyOp::Intersection, &*rb.solid, &in, vb},
+            {"block + outer box (two shells)", op::PolyOp::Union, &*rb.solid, &out, vA + vb},
+            {"block - outer box", op::PolyOp::Difference, &*rb.solid, &out, vA},
+            {"inner box & block", op::PolyOp::Intersection, &in, &*rb.solid, vb},
+            {"outer box - block", op::PolyOp::Difference, &out, &*rb.solid, vb},
+        };
+        for (const Case& c : cases) {
+            const double v = check_result(c.name, c.o, op::poly_boolean(*c.a, *c.b, c.o));
+            AK_CHECK_NEAR(v, c.expect, 1e-12);
+        }
+    }
+    return akt::finish("poly_boolean_test");
+}

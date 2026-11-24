@@ -94,11 +94,11 @@ public:
     /// Rigorous enclosure of the Jacobian over a box.
     void J_over(const Box3& X, Interval J[3][3]) const {
         const double t0 = X[0].lo, t1 = X[0].hi, u0 = X[1].lo, u1 = X[1].hi, v0 = X[2].lo, v1 = X[2].hi;
-        const auto C = geom::hull(ci_.restricted(t0, t1, 0.0, 1.0));
-        const auto Ct = geom::hull(cti_.restricted(t0, t1, 0.0, 1.0));
-        const auto S = geom::hull(si_.restricted(u0, u1, v0, v1));
-        const auto Su = geom::hull(sui_.restricted(u0, u1, v0, v1));
-        const auto Sv = geom::hull(svi_.restricted(u0, u1, v0, v1));
+        const auto C = geom::hull_restricted(ci_, t0, t1, 0.0, 1.0);
+        const auto Ct = geom::hull_restricted(cti_, t0, t1, 0.0, 1.0);
+        const auto S = geom::hull_restricted(si_, u0, u1, v0, v1);
+        const auto Su = geom::hull_restricted(sui_, u0, u1, v0, v1);
+        const auto Sv = geom::hull_restricted(svi_, u0, u1, v0, v1);
         const Interval c[3] = {C.x, C.y, C.z}, ct[3] = {Ct.x, Ct.y, Ct.z};
         const Interval s[3] = {S.x, S.y, S.z}, su[3] = {Su.x, Su.y, Su.z}, sv[3] = {Sv.x, Sv.y, Sv.z};
         for (int k = 0; k < 3; ++k) {

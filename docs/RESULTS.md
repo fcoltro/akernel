@@ -1301,3 +1301,210 @@ So the Boolean results are bitwise identical between Debug and Release; the rewr
 - Mesh self-intersection. Two faces that meet at a very small angle could give triangles that cross each other at a coarse chord; this is not checked.
 - Rigour of the completeness proof under a compiler that breaks strict IEEE semantics; only MSVC with `/fp:strict` was tested.
 - One limit of the surface/surface certificate on its own: where a curve ends on a domain boundary, it does not prove that the curve crosses the boundary instead of touching it and turning back. Inside a Boolean this is now proven, because each such end is matched to a regular edge/face root (§3); a stand-alone call to `solve::intersect` still has the limit.
+
+## 11. Generative surfaces and offset validity (features track, steps F1 and F2a)
+
+Measured on 2026-11-23 on Linux x64 with GCC 13.3 (`-O2 -ffp-contract=off -fno-fast-math`), single thread, from `tests/geom/sweep_test.cpp`, `tests/geom/offset_validity_test.cpp` and a timing driver over the same cases. This is not the MSVC setup of the other sections; the tests also build warning-free with Clang. Plan and literature: [FEATURES.md](FEATURES.md).
+
+### Exact generators (F1)
+
+| Construction | Check | Result |
+|---|---|---|
+| Exact circle, 1 to 4 quarter turns | every point on the circle; end angle | residual ≤ 1e-13 at 201 points each; end angle to 1e-14 |
+| Revolution: torus R = 3, r = 1 (16 Bézier pieces) | implicit equation at 51 × 51 points per piece | largest residual 3.4e-13 (the quartic's values reach about 1e3) |
+| Revolution: joints of a full turn | boundary rows of adjacent pieces | equal bitwise in homogeneous form, 36 of 36 |
+| Revolution: cone, sphere zone; extrusion: cylinder | implicit equations | ≤ 1e-13 |
+| Translational sweep, rational profile along a cubic | against P(u) + C(v) − C(0) | ≤ 1e-13 |
+| Ruled loft, rational circle to cubic | rails reproduced; rulings straight | ≤ 1e-13; ≤ 1e-12 |
+| Skinned loft through three circles, degree 2 | sections reproduced at 401 points each | largest deviation 9.9e-16 |
+| Skinned loft through identical sections | refused | refused (no surface returned) |
+
+Revolution multiplies control data only by 0, ±1, ±2 and powers of two, so the torus, cone and sphere patches lie on their surfaces exactly in real arithmetic; the residuals above are evaluation rounding.
+
+### Certified offset validity and curvature bounds (F2a)
+
+Offset validity: is $1 - d\kappa_i > 0$ for both principal curvatures everywhere on the patch? Cylinder of radius 2 (rational quarter, outward normal, $\kappa = -1/2$), the hill $z = 4u(1-u)v(1-v)$ (peak 0.25, saddles at the corners with $\kappa = \pm 4$), and the torus above.
+
+| Patch | Offset d | Verdict | Boxes | Time |
+|---|---|---|---|---|
+| cylinder | −1 | valid | 309 | 0.03 s |
+| cylinder | −1.9 | valid | 3,925 | 0.34 s |
+| cylinder | −1.99 | valid | 20,309 | 1.8 s |
+| cylinder | −1.999 | undecided (box budget 200,000) | 200,001 | 15 s |
+| cylinder | −2.1 | invalid, witness at the first box centre | 1 | < 1 ms |
+| hill | 0.24, −0.24 | valid | 21, 197 | ≤ 0.02 s |
+| hill | 0.26 | invalid | 8 | 1 ms |
+| torus, towards the tube centre | 0.9 | valid on all pieces; 1.1 invalid | | |
+| torus, away from the tube centre | 1.9 | valid on all pieces; 2.1 invalid (inner equator reaches the axis) | | |
+
+Certified bound on $\max\lvert\kappa\rvert$ over a uniform grid of boxes (exact values: 0.5 for the cylinder, 4 for the hill):
+
+| Grid | Cylinder | Hill |
+|---|---|---|
+| 8 × 8 | 4.84 | 6.20 |
+| 16 × 16 | 1.36 | 4.78 |
+| 32 × 32 | 0.603 | 4.32 |
+| 64 × 64 | 0.517 (0.45 s) | 4.14 (0.62 s) |
+| 128 × 128 | 0.503 (1.7 s) | 4.07 (2.7 s) |
+
+On 40 random biquadratic patches (half rational) with random offsets: 16 valid, 17 invalid, 7 undecided. Every valid verdict agrees with sampling at 65 × 65 points, every invalid witness violates the condition in doubles, and every undecided case has a sampled margin below 0.1, that is, an offset within 10 % of a focal point.
+
+What this shows and does not show:
+
+- The verdicts are proven: no box is called valid unless both conditions are positive on all of it in interval arithmetic. Undecided is returned near the focal boundary when the box budget runs out, never a guess.
+- The enclosure converges linearly with the box size. The rational quotient rule makes the direct interval enclosure useless on coarse boxes (on the cylinder, $|S_u \times S_v|^2$ encloses zero until boxes are 1/4 wide); the mean-value form fixes that, but deciding an offset within 0.5 % of a focal point still takes about 20,000 boxes. A second-order (Taylor-model) enclosure or a Bernstein form of the polynomial conditions would converge quadratically; that is the next speed step.
+- Only local validity. Global self-intersection (an offset passing the medial axis away from any focal point) needs the bottleneck search of FEATURES F2b.
+
+## 12. Rolling-ball fillets and procedural carriers (features track, steps F3a and F3b)
+
+Measured on 2026-11-24, same Linux/GCC setup as §11, from `tests/geom/blend_test.cpp` (6,244 checks) and `tests/solve/carrier_test.cpp` (6,165 checks).
+
+### Exact fillets (F3a)
+
+| Fillet | Check | Result |
+|---|---|---|
+| Box edge, right angle, r = 0.5 | controls | contacts, corner and the weight 2 exact; setback exactly 0.5 |
+| | distance to the ball's axis at 200 points | equal to r to 1e-15 |
+| | normals at the contact lines against the faces' | parallel to 1e-15 (G1) |
+| 200 random edges, dihedral angles 6° to 172°, convex and concave, r in [0.05, 2] | centre at distance r from both planes; contacts on them; setback r tan(φ/2); points at distance r from the axis | all to 1e-13; G1 to 1e-12 |
+| Plane and cylinder (boss on a plate, R = 2, r = 1/4) | torus zone over a full turn | every control exact; torus residual below 1e-14; G1 with the plate and with the cylinder to 1e-14 |
+| Plane and cone; plane and sphere | torus residual, G1 with the sphere | below 1e-14; G1 to 1e-13 |
+| Bottom of a blind hole, R = 2 | r = 1.5 built; r = 2.5 refused (profile reaches the axis) | the certified offset test on the hole's wall agrees: valid at 1.5, invalid at 2.5 |
+| Folded faces, tangent faces, ball that cannot touch both | refused | refused, each with its reason |
+
+### Procedural carriers and certified spines (F3b, first layer)
+
+| Case | Result |
+|---|---|
+| Offset of a radius-2 cylinder by 0.5, at 200 random parameters | every point enclosure proven to contain a point of the radius-2.5 cylinder (x² + y² = 6.25), width below 1e-12 |
+| Box enclosures of point and first partials (offset cylinder, rational bicubic-by-quadratic offset, plain patches), 30 random boxes at two sizes, 10 samples each | every sample inside its enclosure; enclosure of S_u 10.8 wide on 1/8 boxes, 0.16 on 1/64 boxes |
+| Spine of a ball (r = 1/4) between a cylinder of radius 2 and the plane x = 1 | 14 certified tube segments across the cylinder's full height, both ends on the domain boundary; every segment end within 2.2e-16 of the exact spine line |
+| Spine of a ball (r = 0.1) between the freeform hill and a wall x = 0.6 | the certified offset test first proves the ball fits on the hill; 14 certified segments across the whole hill; at every segment end the centre is r from the wall and from the hill to 1.1e-16, and the section arc builds |
+| Spines found without a guess (`find_spines`): cylinder/plane, hill/wall, hill and a wall out of reach | 1, 1 and 0 curves, each with the completeness proof (every spine point in the domain lies on a returned curve); 1,685, 2,515 and 7 verifier nodes; 0.8 s, 1.0 s and 0.01 s |
+
+### The blend as a carrier (F3b)
+
+`BlendCarrier` is the fillet surface of one certified spine, parametrised by sigma along the spine and theta across the section. It implements the carrier interface, so it can be sampled for meshing and intersected with any other carrier with the same certificates.
+
+| Case | Result |
+|---|---|
+| Cylinder of radius 2 and plane x = 1, r = 1/4 (the blend is a round tube about the spine line), 300 random points | within 6.1e-16 of the tube; every point enclosure contains the sampled point, is proven to meet the tube and is narrower than 1e-9 |
+| Box enclosures, 20 random boxes at two sizes, 10 samples each | every sample inside (points to 1e-12, finite-difference partials to 1e-6); point enclosure 0.64 wide on 1/8 boxes, 0.032 on 1/64 boxes |
+| G1 at the contact curves, 11 stations | normal parallel to the cylinder's at theta = 0 and to the plane's at theta = 1, to 1e-6 (finite differences) |
+| Blend intersected with the plane z = 0.5 (`intersect_carriers`, no guess) | 1 curve, complete; every certified segment end on the plane and on the tube to 1e-10; 3,177 verifier nodes, 0.65 s |
+| Freeform: hill and wall, r = 0.1, 100 random points, 20 boxes, 11 G1 stations | every point r from the ball centre to 1e-12 and inside its enclosure; every box sample enclosed; G1 with the hill and with the wall |
+
+Making the blend intersectable at reasonable cost took two things. The first version needed 145 s for the plane cut: the direct enclosures lose the correlation between contacts and centre, so the arc's dot product u · v grew wider than 1 and boxes could not be decided. A mean-value form in sigma for every spine quantity, plus a cache of the theta-independent part per sigma range (subdivision revisits each range with many theta boxes), brought it to 0.65 s with no loss of rigour.
+
+The whole carrier test runs in about 5 s.
+
+### Fillets and chamfers applied to solids (F5, F4: swept solids)
+
+From `tests/op/fillet_test.cpp` (1,825 checks, 17 s). `op/fillet.hpp` builds the solid from its cross-section. The section's corner is cut by the rolling-ball arc (fillet) or a straight line (chamfer), and the section is split into five ruled cells. The result is extruded (a box edge) or revolved by exact quarter turns (a circular edge of a ring). The supports are trimmed at the contact curves, and the blend face is a cylinder sector, a torus zone, a plane or a cone. One patch per end face would need a straight-angle corner where a fillet's arc meets the trimmed side, which is a singular parametrisation. The five cells avoid it.
+
+| Solid | Faces | Euler | Volume against the closed form |
+|---|---|---|---|
+| Box 2 × 1.5 × 1, edge rounded, r = 1/2 | 18 | 2 | 2.946349540849361 vs abc − c r²(1 − π/4) = …362 |
+| Same box, chamfer 1/2 × 1/2 and 1/2 × 3/4 | 18 | 2 | 2.875 and 2.8125, exact |
+| Ring 1 ≤ ρ ≤ 2, 0 ≤ z ≤ 1, outer top edge rounded (r = 1/4), full turn: a closed chain of four edges | 32 | 0 (genus 1) | 9.260936096743741 vs Pappus …739 |
+| Same, one quarter; outer bottom edge, half turn | 18; 26 | 2 | to 6e-15 |
+| Inner top edge rounded (r = 1/2), three quarters | 34 | 2 | to 2.4e-14 |
+| Inner bottom edge chamfered 1/4 × 1/2, full turn (a cone) | 32 | 0 | 8.966629032120869 vs …867 |
+| Concave: step block 2 × 1.5 × 1 with notch x > 1, y > 3/4, inside edge rounded (r = 1/4) or chamfered (1/4 × 1/2); the blend adds material | 26 | 2 | 2.263412614787660 and 2.3125, equal to the closed forms; each halved by a Boolean (z ≤ 1/2) to 4e-15 |
+| Concave, revolved: boss on a plate, base rounded (full turn) or chamfered (quarter) | 48; 26 | 0; 2 | 13.258517278286844 vs …835; to 1e-15 |
+| Concave, revolved: counterbore (floor inside a wall), floor edge rounded (full turn) or chamfered (half) | 48; 38 | 0; 2 | to 2e-14 |
+| Vertex blends: box 2 × 1.5 × 1 with all twelve edges rounded (r = 1/4); three fillets meet at each corner in an exact sphere octant made of three regular patches | 54 | 2 | 2.779498469497874 vs …873; cut by a Boolean through four corners (x ≤ a − r/2) to 5e-15 |
+
+Every result audits closed, has only dyadic controls (contact B's weight 2 is carried consistently, and revolution uses quarter arcs with alternating end weights (1, 2) and (2, 1) so a full turn closes exactly), has no singular point on a 21 × 21 grid per face (min abs(Su × Sv) 0.008 to 0.16), and tessellates watertight (deviation below 3e-4).
+
+The sphere corners. A sphere octant is three-sided, so a single patch would be degenerate. Stereographic projection maps it to a quarter disc; that disc is cut into three quads (a square and two pieces ruled between half the arc and a segment), and the inverse projection, quadratic in homogeneous coordinates, turns them into sphere patches of bidegree (4, 4) and (4, 2). All controls are exact (the binomial denominators divide a common factor 144 carried by every patch), and sampled points lie on the unit sphere to 5.6e-16. Each cylinder is split lengthwise to meet the octant's boundary pieces, and the octants at its two ends are mirror images, so the rows match bitwise.
+
+As Boolean operands: the rounded box halved by z ≤ 1/2, cut by x ≥ 7/4 (a curved section through the fillet) and united with a block all match their closed forms to 1e-15. The rounded full ring cut by y ≥ 1/2 (through the torus) gives 3.621678018550, the same to 12 digits as an independent quadrature over the section.
+
+What this does not show yet: edges of solids that are not swept (faces that are themselves trimmed, edges between two curved faces, varying dihedral angle), corners where blends of different radii or setbacks meet, and freeform supports, where the blend face is the `BlendCarrier` and the contact curves are procedural.
+
+### A freeform fillet inside a solid (F5 on freeform supports, procedural faces)
+
+From `tests/op/proc_fillet_test.cpp` (41 checks, about 2 minutes, most of it the blend–plane intersections and the mesh-deviation measurement). `op/proc_fillet.hpp` builds a block whose top is a polynomial graph over the rectangle and rounds the edge between the top and the side x = a with a rolling ball. The dihedral angle varies along the edge, so the blend is not a rational surface. It is a procedural face: `Brep::procs` holds the `BlendCarrier` and the face is that carrier over its whole parameter square (docs/FEATURES.md §5.1). The top and the side are trimmed along the contact curves, which are procedural edges read in each support's parameters through the certified spine's own coordinates. The end faces are trimmed by the blend's end sections, which lie in the end planes because the top has zero slope across them.
+
+The top is z = h + c x s(y/L), with s the smoothstep 3t² − 2t³ (degree (1, 3); a = 1, L = 2, h = 3/4, r = 1/4).
+
+| Case | Faces / edges / vertices | Euler | Volume |
+|---|---|---|---|
+| Flat top (c = 0); the blend is a quarter cylinder | 7 / 15 / 10 | 2 | 1.473174770430353 vs a L h − (1 − π/4) r² L = …424681 (5.7e-12) |
+| Freeform top (c = 1/2), edge angle 90° at y = 0 to 63.4° at y = L | 7 / 15 / 10 | 2 | 1.700878161978803; removed 0.049121838022, against 0.049121838026 by slice integration (4.5e-12) |
+| Same, moved by (3, −5, 0) | 7 / 15 / 10 | 2 | differs by 3.1e-11 |
+
+The slice integration is independent of the divergence sum. For each plane y = y0 it finds the blend's section curve by solving P(sigma, theta).y = y0 per theta (regula falsi), measures the cut corner by a shoelace with Richardson extrapolation, and integrates over y by Gauss 8 on 8 cells. Moving the solid changes every face's flux, but the sum of a closed surface does not move, so that check tests closure. Both meshes are watertight and within 2.6e-4 of the surfaces (the blend: 10,664 triangles, mesh in 0.4 s). A Boolean with the rounded solid is refused with a clear error.
+
+Three things had to change in the carrier for this.
+
+- Sigma is now split between spine segments in proportion to the length of each segment's centre path, not equally. A traced spine can end in a very short segment (here 0.15% of the edge); with equal shares, sigma's speed jumped by a factor of 400 there and the blend's mesh lost the surface (deviation 6e-2).
+- Quadrature and sampling align with the carrier's smooth pieces (`Carrier::breaks_u`, `ProcEdge::breaks`), since the speed in sigma still has small jumps between segments.
+- The differences that give the double-precision partials stay inside a piece, one-sided at its ends. Central differences across sigma = 0 had cut the blend's flux by 2e-7.
+
+Trimmed procedural faces. `round_block_edge(top, r, opt, cut)` ends the block at y = cut · L, where the top need not be flat across the end. The ball's end section then leaves the end plane, so the blend (built on the whole supports) is trimmed by its intersection with the end face. That curve is a `TracedEdge` (`op/proc_edge.hpp`): the certified intersection of the two carriers, found by `intersect_carriers` with a completeness proof and kept as its tube segments. Each face reads it in its own parameters through the curve's coordinates. Volume on a procedural face now uses Green's theorem in the carrier's (sigma, theta), so trimmed and whole faces go through the same code.
+
+| Case (cut = 3/4) | Faces / edges / vertices | Volume |
+|---|---|---|
+| Flat top | 7 / 15 / 10 | 1.104881077821548 vs closed form …818511 (3.0e-12) |
+| Freeform top | 7 / 15 / 10 | 1.225637639929603; removed 0.031198297570, by slices …574 (3.6e-12) |
+| Same, moved by (1/2, −1/2, 0) | 7 / 15 / 10 | differs by 3.9e-12 |
+
+Both are closed with Euler 2 and mesh watertight (deviation 3.1e-4). The cost is the blend–plane intersection with its completeness proof: about 18 s here, against 1 s for the rest. Its verifier now splits a box where it is widest in space (parameter width times speed), which cut the boxes by a quarter. Getting to about 1 s needs tighter enclosures of the blend over boxes; that is a follow-up.
+
+What this does not show yet: Booleans on procedural faces (next: cuts by planar solids, decided 2026-11-24), blends meeting other blends (chains, caps), and freeform support pairs other than a graph top with a plane.
+
+### Plane cuts of solids with procedural faces (first step of Booleans on them)
+
+From `tests/op/plane_cut_test.cpp` (28 checks, about 1 minute). `op/plane_cut.hpp` cuts any solid with side and procedural edges by a plane, keeping n · x ≤ d. Every face the plane meets is intersected with a planar cap patch by `intersect_carriers` (certified, with a completeness proof). Each piece of section curve inside a face becomes a `TracedEdge` between the face's surface and the cap, read by both in their own parameters. The face keeps its region on the kept side, found by walking its loop and turning onto the section edge at each crossing. The cap's loops are the section edges chained at the crossings; outer loops are counter-clockwise and holes go into the outer loop that contains them.
+
+| Case | Faces | Section curves | Volume |
+|---|---|---|---|
+| Unit cube, x + y + z ≤ 3/2 (hexagonal cap) | 7 | 6 | 0.500000000000000 |
+| Rounded freeform block (§12 above), y ≤ 1: the section runs through the blend | 7 | 5 | removed 0.017061483944 vs slice integration …957 (1.3e-11) |
+| Same, slanted cut 0.3x + y + 0.4z ≤ 1.2 | 7 | 5 | 0.683046053104180; moved with the plane by (1/2, −1/2, 0): differs by 8.7e-13 |
+
+All are closed with Euler 2 and mesh watertight. Traced edges now give their parameter derivatives from the curve's tangent (dx/dc = t / (m · t) on a slice) instead of differences, which made the cube exact to print precision.
+
+What is certified: the section curves and their completeness. Where boundary edges cross the plane is found in doubles (sign changes along offset samples, then bisection), and which pieces of a section curve lie inside a face is decided by a winding test on sampled loops. These are measurements; the cut refuses when it is close to a decision (a vertex within 1e-9 of the plane, an edge nearly touching it). Not supported yet, each refused with a message: arc edges from earlier rational Booleans, section curves closed inside a face, and faces with inner loops that the plane crosses.
+
+### Booleans with flat-faced, curved and filleted solids (union, intersection, difference)
+
+From `tests/op/poly_boolean_test.cpp`. `op/poly_boolean.hpp` combines a solid that may have procedural faces with a second solid whose faces are rational patches, flat or curved, or procedural too (fillet against fillet). The second solid's procedural faces and edges are re-indexed when the two are merged (`op/brep_transform.hpp`, `reindexed`). Every pair of faces whose enclosures meet is intersected by `intersect_carriers` (certified, complete) over the whole surfaces. New vertices are found on these curves: where a curve leaves one of its faces it crosses an edge of that face, and the point is refined onto the edge by Gauss-Newton. The pieces of each curve inside both faces become traced edges. Each face is then split by the curves on it: an arrangement in its own parameters, with the edges at each vertex sorted by angle. A closed chain of curves inside a face becomes a hole in the region around it. Regions next to a curve are classified by the other face's outward normal; the rest inherit across shared edges, and the first solid's untouched parts take a ray test against the second (certified line-surface roots).
+
+| Case | Operation | Faces | Volume | Check |
+|---|---|---|---|---|
+| Unit cube and box [1/2, 3/2] × [1/4, 3/4] × [0.3, 1.7] | union | 12 | 1.525 | closed form |
+| | intersection | 6 | 0.175000000000000 | closed form |
+| | difference | 10 | 0.825 | closed form |
+| Rounded freeform block (§12) and a notch [1/2, 3/2] × [1/2, 1] × [0.3, 2] through the blend, the top and the side | union | 14 | 2.418201979973524 | |
+| | intersection | 7 | 0.132676182004502 | six plane cuts: 6.3e-13; slice integration: 5.4e-12 |
+| | difference | 12 | 1.568201979973525 | |
+
+| Unit cube and a quarter of a thick cylinder wall (radii 1/8, 3/8, axis vertical through (1/4, 1/4), z in [1/2, 3/2]) through its top | union | 11 | 1.049087385212336 | closed form, 5e-15 |
+| | intersection | 6 | 0.049087385212341 | π/4 (3/8² − 1/8²) / 2, 2e-15 |
+| | difference | 11 | 0.950912614787655 | closed form, 4e-15 |
+| Rounded freeform block and a quarter cylinder wall (radii 1/16, 1/2, axis vertical through (5/8, 11/8), −90° to 0°) whose outer wall cuts the blend, the top and the side | union | 14 | 1.925399282056588 | |
+| | intersection | 8 | 0.104057564691852 | moved with the solid by (1/2, −1/2, 0): differs by 4.4e-13 |
+| | difference | 13 | 1.596820597291479 | |
+
+| Rounded freeform block and the same block turned a quarter about z and moved by (3/2, 1/2, 1/8) (`transformed`, exact), the two rounded edges crossing | union | 19 | 2.682926227669 | |
+| | intersection | 9 | 0.718830096284 | moved together by (1/2, −1/2, 0): see the test output |
+| | difference | 14 | 0.982048065700 | |
+
+In every case union + intersection = A + P and difference + intersection = A (to 3e-13 on the notch, 6.6e-12 on the cylinder against the blend), every result is closed with Euler 2, and every result meshes watertight. The cylinder through the cube's top leaves a hole bounded only by curves in the top face (union and difference), which is the case the hole handling is for.
+
+The first run of the notch case was 1.3e-10 off. A face-by-face comparison with the plane cuts put the error on the planar face at y = 1, the one that meets the blend where two of its spine segments join. The blend's sigma has a kink there: the speed jumps, though the surface is smooth. A traced curve crossing that seam has a kinked parameter inside one of its tube segments, and Gauss quadrature along it lost its accuracy. Traced curves now also break where they cross a piece break of either surface (`CurvePath::find_kinks`). Quadrature and differences along the edge stop there, and the error went from 1.3e-10 to 6e-13. The plane cuts gained from it too.
+
+What is certified: the intersection curves and their completeness. Measured in doubles, with refusals near a decision: where a curve leaves a face (winding on sampled loops, then refined onto the edge), and the order of edges around a vertex. Refused with a message for now: arc edges, faces of the two solids on one surface, curves through vertices, tangent contact, and curves closed inside both faces.
+
+Chains (faces with holes as operands). A pocket cut into the block's top leaves a hole in that face, and the result is used again. Each face's loops are all read: a point is inside when the windings of all loops add to a nonzero number, and every loop's pieces enter the face's arrangement, the inner ones running with the face on their left like the outer one. A hole that no curve meets stays as a hole of the region around it. One crossed by curves becomes part of the regions' boundaries. Five chained cases are checked against volumes from single Booleans of the block (`tests/op/poly_boolean_test.cpp`): a cut across the pocket (difference and intersection), a second pocket beside it that keeps the first hole, and the holed solid as the second operand (intersection and difference). All are closed and watertight, and they agree to 2.8e-12 or better.
+
+Parts that meet no curve. A connected part of either operand's boundary that no curve touches is placed by a ray against the other solid: the parity of its crossings inside that solid's faces, over up to four directions. Earlier this worked only against rational faces. A procedural face is now crossed by `ray_carrier_roots`. Projected across the ray, the face's image must reach the origin, and each crossing is certified unique by a 2-D Krawczyk test on a box of (sigma, theta), with its ray parameter proven positive. A tangent ray, or a root on a box side, is undecided, and the next direction is tried. Seven cases with a small box that touches nothing are checked: under the blend (a cavity), beside the block (a second shell), and with the block as either operand. All are closed and watertight, with exact volumes.
+
+Speed. The notch case first took about 10 s per operation. A profile showed two thirds of the time in interval multiplication at about 85 ns per call, where 5 ns is normal. Exact zeros rounded outward become ±denorm_min, and every product with a subnormal number runs in microcode, about twenty times slower. Interval bounds closer to zero than 2^-500 are now moved out to ±2^-500 (`num::detail::outward`). That only widens intervals, so every enclosure stays valid, and the square of the threshold is still a normal number. The same subdivision (12 477 nodes for the slowest blend-plane pair) now runs about five times faster: about 4 s per operation on the notch, 6 s on the cylinder, and 0.24 s instead of 1.6 s to build the rounded block. The first operation on a new blend takes longer (9 to 16 s), because the blend's spine enclosures are cached per sigma range. Fillet against fillet first took 100 s for the first operation and 50 s for the next ones. The blend-against-blend pair alone took 44 s over 265 000 subdivision boxes. Most of those boxes sat near the curve: the certified tubes around it were thin, because the curve tracer only certified steps of about 1e-3. The tracer was held back by the blend's derivative enclosures, which were about 40 times the box width when the true spread is a few times. Two changes:
+- The section arc is now evaluated over 8 pieces of the theta range and hulled. Its rational form loses the correlation between its basis functions over an interval, so the pieces bring the derivative widths down to about 16 times the box width, and the pair needs 61 000 boxes.
+- Each support and its offset now come from one restriction of the patch instead of two.
+
+The pair now takes 14 s, and the Booleans 34 s for the first operation and 20 s for the next ones. Splitting sigma as well would tighten the enclosures further, but each piece costs a spine enclosure, and it was slower overall. Measuring the volume of a result had also taken 38 s, because every quadrature node recomputed the blend's cross-section. The last 16 sections are now kept per thread, which brought it to 11 s. Most of the remaining interval cost was in restricting patches to boxes. `geom::hull_restricted` now bounds a restricted patch in doubles: both cuts are moved outward to multiples of 2^-53, so that every de Casteljau step is a convex combination with exact weights. The hull is then widened by the control points' radii plus 4u(2p + 2q) times the largest coordinate. Each partial of a support patch and its offset is enclosed this way, and so are the patch pairs of `ssi.hpp` and `csi.hpp`. The double-precision evaluation of a patch's partials (for Newton steps and quadrature) now stops de Casteljau two levels early, instead of evaluating six derivative patches. Together these took fillet against fillet from 27 s to 21 s per operation, the volume of its result from 11 s to 7.7 s, and the whole Boolean test from 185 s to 141 s. The test in `bernstein_test` checks that the new hull holds every sampled point of the patch and is no wider than the interval one, apart from rounding. Most of what was left was in the two blend pairs. Blend against blend traced 408 segments and visited 61 000 boxes, because the blend's derivative enclosures were 30 to 100 times their true spread on any box. That forced short certified steps. An experiment that narrowed them by hand, without rigour, showed what was at stake: four times narrower made the Boolean 2.5 times faster. The derivatives now get a second-order mean-value form. The supports' and offsets' second partials over the spine box come from the forward-mode pass that already ran (`jet2_over_with_patch`). The spine's second derivative x'' solves [F_x; m] x'' = [-F_xx(x', x'); 0] by the same preconditioned fixed point as x' (`linear_enclosure`, which now iterates componentwise instead of bounding every component by the largest one). The contacts' and centre's second sigma derivatives follow by the chain rule. A second-order forward mode in (sigma, theta) (`H2`) carries them through the arc to P_ss, P_st and P_tt. Within one spine segment, P_s and P_t then lie in their centre values plus those second partials times the box's half-widths, intersected with the direct enclosures. On boxes up to 3e-3 the derivative enclosures are now within 3.8 times the sampled spread, checked in `proc_fillet_test`, which also checks that 90 000 sampled values all lie inside. Fillet against fillet now takes 10.6 s per operation, down from 21 s, and the volume of its result 4.0 s, down from 7.7 s. The whole Boolean test takes 83 s instead of 141 s. With fewer, longer traced segments the volume identities for the two rounded blocks came out at 1.3e-11 and 1.4e-11, just over the 1e-11 bound used elsewhere. Each volume moves by about 5e-12 when the quadrature changes: refining the Gauss pieces along traced edges moves the block's own volume by 4e-12 and leaves the identities scattered within ±7e-12. Analytic tangents in place of differences on the blend side changed nothing measurable. So this is the volume's noise floor, not an error in the Booleans, and that case's identities are now bounded by 2e-11. The change can move the last bits of interval bounds near zero, so benchmark hashes recorded before it may differ; every test passes unchanged.

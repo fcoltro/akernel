@@ -10,7 +10,10 @@
 // whatever box the patch was restricted to.
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <cmath>
+#include <limits>
 #include <cassert>
 #include <vector>
 
@@ -178,6 +181,107 @@ inline Vec4<num::Interval> hull(const PolyPatchI& a) {
         h.w = num::hull(h.w, cp.w);
     }
     return h;
+}
+
+namespace detail {
+
+/// Grid used by hull_restricted: on multiples of 2^-53 in [0,1], 1 - t is exact.
+inline double grid_down(double t) { return std::max(0.0, std::floor(t * 0x1p53) * 0x1p-53); }
+inline double grid_up(double t) { return std::min(1.0, std::ceil(t * 0x1p53) * 0x1p-53); }
+
+/// One de Casteljau split in doubles at t (on the grid), as split1d.
+inline void split1d_grid(const Vec4d* b, int n, double t, Vec4d* lo, Vec4d* hi) {
+    std::array<Vec4d, kMaxDegree + 1> w;
+    for (int i = 0; i <= n; ++i) w[i] = b[i];
+    const double s = 1.0 - t;
+    lo[0] = w[0];
+    hi[n] = w[n];
+    for (int r = 1; r <= n; ++r) {
+        for (int i = 0; i <= n - r; ++i)
+            w[i] = {w[i].x * s + w[i + 1].x * t, w[i].y * s + w[i + 1].y * t, w[i].z * s + w[i + 1].z * t,
+                    w[i].w * s + w[i + 1].w * t};
+        lo[r] = w[0];
+        hi[n - r] = w[n - r];
+    }
+}
+
+/// b restricted, in doubles, to a parameter range that contains [a, c]
+/// (0 <= a <= c <= 1); both cuts are at grid points, so every de Casteljau
+/// step is a convex combination with exact weights.
+inline void restrict1d_grid(Vec4d* b, int n, double a, double c) {
+    std::array<Vec4d, kMaxDegree + 1> lo, hi;
+    const double a0 = grid_down(a), c0 = grid_up(c);
+    if (1.0 - a0 >= c0) {
+        split1d_grid(b, n, a0, lo.data(), hi.data());
+        // [a0, 1] -> [0, 1]; c0 maps to (c0 - a0) / (1 - a0), rounded up past it.
+        const double t = a0 < 1.0 ? std::min(1.0, std::ceil(((c0 - a0) / (1.0 - a0)) * 0x1p53 + 1.0) * 0x1p-53) : 1.0;
+        split1d_grid(hi.data(), n, t, b, hi.data());
+    } else {
+        split1d_grid(b, n, c0, lo.data(), hi.data());
+        const double t = std::max(0.0, std::floor((a0 / c0) * 0x1p53 - 1.0) * 0x1p-53);
+        split1d_grid(lo.data(), n, t, lo.data(), b);
+    }
+}
+
+} // namespace detail
+
+/// Componentwise hull of the control points of a restricted to
+/// [u0,u1] x [v0,v1], the same enclosure as hull(a.restricted(...)) but
+/// computed in doubles, several times faster.
+///
+/// Rigour: the patch is split at the midpoints m of its control points, with
+/// radii r. Both cuts in each direction are moved outward to multiples of
+/// 2^-53, so the restriction is to a box containing the asked one (still a
+/// valid enclosure) and every step is a convex combination with exact
+/// weights s + t = 1. A convex combination moves no point further than r
+/// from its exact image, and each rounded step a s + b t adds at most
+/// 3u max(|a|, |b|) (u = 2^-53), with at most 2(p + q) steps on any path. The
+/// hull is widened by R + 4u (2p + 2q) M (M the largest |mid|), plus an
+/// absolute term for underflow. Boxes outside [0,1]^2 fall back to intervals.
+inline Vec4<num::Interval> hull_restricted(const PolyPatchI& a, double u0, double u1, double v0, double v1) {
+    using num::Interval;
+    if (!(0.0 <= u0 && u0 <= u1 && u1 <= 1.0 && 0.0 <= v0 && v0 <= v1 && v1 <= 1.0))
+        return hull(a.restricted(u0, u1, v0, v1));
+    const int p = a.p, q = a.q;
+    std::vector<Vec4d> m(a.c.size());
+    double R[4] = {0, 0, 0, 0}, M[4] = {0, 0, 0, 0};
+    for (std::size_t k = 0; k < a.c.size(); ++k) {
+        const Interval* iv[4] = {&a.c[k].x, &a.c[k].y, &a.c[k].z, &a.c[k].w};
+        double mv[4];
+        for (int j = 0; j < 4; ++j) {
+            const Interval& x = *iv[j];
+            if (!num::is_finite(x)) return hull(a.restricted(u0, u1, v0, v1));
+            mv[j] = num::mid(x);
+            R[j] = std::max(R[j], num::detail::step_up(std::max(x.hi - mv[j], mv[j] - x.lo)));
+            M[j] = std::max(M[j], std::fabs(mv[j]));
+        }
+        m[k] = {mv[0], mv[1], mv[2], mv[3]};
+    }
+    std::array<Vec4d, kMaxDegree + 1> b;
+    for (int j = 0; j <= q; ++j) {
+        for (int i = 0; i <= p; ++i) b[i] = m[static_cast<std::size_t>(i * (q + 1) + j)];
+        detail::restrict1d_grid(b.data(), p, u0, u1);
+        for (int i = 0; i <= p; ++i) m[static_cast<std::size_t>(i * (q + 1) + j)] = b[i];
+    }
+    double lo[4], hi[4];
+    for (int j = 0; j < 4; ++j) { lo[j] = std::numeric_limits<double>::infinity(); hi[j] = -lo[j]; }
+    for (int i = 0; i <= p; ++i) {
+        for (int j = 0; j <= q; ++j) b[j] = m[static_cast<std::size_t>(i * (q + 1) + j)];
+        detail::restrict1d_grid(b.data(), q, v0, v1);
+        for (int j = 0; j <= q; ++j) {
+            const double v[4] = {b[j].x, b[j].y, b[j].z, b[j].w};
+            for (int k = 0; k < 4; ++k) { lo[k] = std::min(lo[k], v[k]); hi[k] = std::max(hi[k], v[k]); }
+        }
+    }
+    const double steps = 2.0 * (p + q) + 1.0;
+    Interval out[4];
+    for (int k = 0; k < 4; ++k) {
+        if (!std::isfinite(lo[k]) || !std::isfinite(hi[k])) return hull(a.restricted(u0, u1, v0, v1));
+        // Upper bound of R + 4u * steps * M + tiny, rounded up.
+        const Interval pad = Interval(R[k]) + Interval(4.0 * 0x1p-53 * steps) * Interval(M[k]) + Interval(0x1p-1000);
+        out[k] = Interval(lo[k], hi[k]) + Interval(-pad.hi, pad.hi);
+    }
+    return {out[0], out[1], out[2], out[3]};
 }
 
 /// Axis-aligned box enclosing the projected (x, y, z) surface over [0,1]^2.

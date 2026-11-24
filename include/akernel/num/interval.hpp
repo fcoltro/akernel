@@ -53,10 +53,21 @@ inline double step_up(double x) noexcept {
     const std::uint64_t b = std::bit_cast<std::uint64_t>(x);
     return std::bit_cast<double>(x > 0.0 ? b + 1 : b - 1);
 }
+/// Bounds closer to zero than this are moved out to it. Products and sums
+/// of tiny bounds would otherwise run in subnormal numbers, which x86 CPUs
+/// handle in microcode about twenty times slower (a zero, rounded outward,
+/// becomes +-denorm_min, and every product with it is subnormal). Moving a
+/// bound outward only widens the interval, so enclosures stay valid; the
+/// square of the threshold is still a normal double.
+inline constexpr double kTinyBound = 0x1p-500;
 /// Widen computed bounds by one double each side; NaN becomes "anything".
 inline Interval outward(double l, double h) noexcept {
     if (std::isnan(l) || std::isnan(h)) return Interval::entire();
-    return {step_down(l), step_up(h)};
+    l = step_down(l);
+    h = step_up(h);
+    if (l > -kTinyBound && l < kTinyBound) l = -kTinyBound;
+    if (h > -kTinyBound && h < kTinyBound) h = kTinyBound;
+    return {l, h};
 }
 } // namespace detail
 

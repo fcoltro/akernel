@@ -1,0 +1,205 @@
+// akernel — procedural edges that are traced intersection curves of two
+// carriers (docs/FEATURES.md §5.1). A blend cut by a plane, or any face
+// meeting a procedural face along a curve that is not a side of its square,
+// has such an edge: the curve is the certified intersection of the two
+// surfaces (solve/carrier_ssi.hpp, intersect_carriers), kept as its tube
+// segments, and each face reads it in its own parameters through the
+// curve's coordinates. One definition, no fitted trimming curve.
+#pragma once
+
+#include <algorithm>
+#include <cmath>
+#include <memory>
+#include <vector>
+
+#include <akernel/op/brep.hpp>
+#include <akernel/solve/carrier_ssi.hpp>
+
+namespace ak::op {
+
+/// A traced curve in the parameters (u, v, s, t) of two carriers,
+/// parametrised by sigma in [0, 1]: each tube segment takes a share of
+/// sigma proportional to its length in space, and inside a segment sigma is
+/// linear in the segment's slice value.
+struct CurvePath {
+    std::vector<solve::TubeSegment> segs; ///< in curve order
+    std::vector<double> brk;              ///< sigma at the segments' ends
+    /// sigma where the curve crosses a piece break of either carrier (inside
+    /// a segment): the carrier's parametrisation may have a kink there, so
+    /// quadrature and differences along the curve stop at these too.
+    std::vector<double> kinks;
+
+    int segment_of(double sigma) const {
+        const auto it = std::upper_bound(brk.begin() + 1, brk.end() - 1, sigma);
+        return static_cast<int>(it - brk.begin()) - 1;
+    }
+    double slice(int k, double sigma) const {
+        const solve::TubeSegment& s = segs[static_cast<std::size_t>(k)];
+        const double a = brk[static_cast<std::size_t>(k)], b = brk[static_cast<std::size_t>(k) + 1];
+        const double f = std::clamp((sigma - a) / (b - a), 0.0, 1.0);
+        return (s.reversed ? 1.0 - f : f) * s.len;
+    }
+    template <class Sys>
+    bool point(const Sys& sys, double sigma, solve::Pt4& x) const {
+        const int k = segment_of(sigma);
+        const solve::TubeSegment& seg = segs[static_cast<std::size_t>(k)];
+        const double c = slice(k, sigma);
+        for (int i = 0; i < 4; ++i) x[i] = seg.a[i] + c * seg.m[i];
+        return solve::newton_slice(sys, seg.m, seg.a, c, x);
+    }
+    /// Shares of sigma by length in space, measured on carrier `a`.
+    template <class Sys>
+    void make_breaks(const Sys& sys, const geom::Carrier& a) {
+        const std::size_t n = segs.size();
+        brk.assign(n + 1, 0.0);
+        for (std::size_t k = 0; k < n; ++k) brk[k + 1] = static_cast<double>(k + 1) / static_cast<double>(n);
+        std::vector<double> w(n, 0.0);
+        double total = 0.0;
+        for (std::size_t k = 0; k < n; ++k) {
+            const solve::TubeSegment& seg = segs[k];
+            Vec3d prev{};
+            for (int i = 0; i <= 4; ++i) {
+                const double c = (seg.reversed ? 1.0 - i / 4.0 : i / 4.0) * seg.len;
+                solve::Pt4 x;
+                for (int d = 0; d < 4; ++d) x[d] = seg.a[d] + c * seg.m[d];
+                solve::newton_slice(sys, seg.m, seg.a, c, x);
+                Vec3d P, Pu, Pv;
+                a.eval(x[0], x[1], P, Pu, Pv);
+                if (i > 0) w[k] += norm(P - prev);
+                prev = P;
+            }
+            if (!std::isfinite(w[k])) return; // keep the even shares
+            total += w[k];
+        }
+        if (!(total > 0.0)) return;
+        double acc = 0.0, sum = 0.0;
+        for (double x : w) sum += std::max(x, 1e-6 * total);
+        for (std::size_t k = 0; k < n; ++k) {
+            acc += std::max(w[k], 1e-6 * total);
+            brk[k + 1] = acc / sum;
+        }
+        brk.back() = 1.0;
+    }
+    /// Kinks: where the curve's u on carrier a or on carrier b crosses one of
+    /// that carrier's interior breaks_u (call after make_breaks).
+    template <class Sys>
+    void find_kinks(const Sys& sys, const geom::Carrier& a, const geom::Carrier& b) {
+        kinks.clear();
+        for (std::size_t k = 0; k < segs.size(); ++k) {
+            const solve::TubeSegment& seg = segs[k];
+            auto x_at = [&](double f, solve::Pt4& x) {
+                const double c = (seg.reversed ? 1.0 - f : f) * seg.len;
+                for (int d = 0; d < 4; ++d) x[d] = seg.a[d] + c * seg.m[d];
+                return solve::newton_slice(sys, seg.m, seg.a, c, x);
+            };
+            for (int side = 0; side < 2; ++side) {
+                std::vector<double> bu = (side == 0 ? a : b).breaks_u();
+                if (bu.size() <= 2) continue;
+                const int n = 32;
+                std::vector<double> u(n + 1);
+                bool ok = true;
+                for (int i = 0; i <= n && ok; ++i) {
+                    solve::Pt4 x;
+                    ok = x_at(static_cast<double>(i) / n, x);
+                    u[static_cast<std::size_t>(i)] = x[static_cast<std::size_t>(2 * side)];
+                }
+                if (!ok) continue;
+                for (std::size_t j = 1; j + 1 < bu.size(); ++j) {
+                    const double beta = bu[j];
+                    for (int i = 0; i < n; ++i) {
+                        const double g0 = u[static_cast<std::size_t>(i)] - beta, g1 = u[static_cast<std::size_t>(i) + 1] - beta;
+                        if ((g0 < 0) == (g1 < 0)) continue;
+                        double lo = static_cast<double>(i) / n, hi = static_cast<double>(i + 1) / n, glo = g0;
+                        for (int it = 0; it < 60 && hi - lo > 1e-16; ++it) {
+                            const double m = 0.5 * (lo + hi);
+                            solve::Pt4 x;
+                            if (!x_at(m, x)) break;
+                            const double gm = x[static_cast<std::size_t>(2 * side)] - beta;
+                            if ((gm < 0) == (glo < 0)) { lo = m; glo = gm; }
+                            else hi = m;
+                        }
+                        const double f = 0.5 * (lo + hi);
+                        kinks.push_back(brk[k] + f * (brk[k + 1] - brk[k]));
+                    }
+                }
+            }
+        }
+        std::sort(kinks.begin(), kinks.end());
+    }
+};
+
+/// An edge on the intersection of two carriers: the part sigma in [from, to]
+/// of a traced curve (to < from runs it backwards), tau = 0 at `from`.
+/// Each side names the Brep surface it is: a polynomial carrier (index into
+/// Brep::carriers) or a procedural one (index into Brep::procs).
+class TracedEdge final : public ProcEdge {
+public:
+    std::shared_ptr<const geom::Carrier> a, b;
+    int carrier[2] = {-1, -1}; ///< Brep::carriers index of side a / b, or -1
+    int proc[2] = {-1, -1};    ///< Brep::procs index of side a / b, or -1
+    CurvePath path;
+    double from = 0.0, to = 1.0;
+
+    solve::CarrierPairSystem sys() const { return solve::CarrierPairSystem(*a, *b); }
+    double sigma(double tau) const { return from + tau * (to - from); }
+    bool at(double tau, solve::Pt4& x) const { return path.point(sys(), sigma(tau), x); }
+
+    Vec3d point(double tau) const override {
+        solve::Pt4 x;
+        at(tau, x);
+        Vec3d P, Pu, Pv;
+        a->eval(x[0], x[1], P, Pu, Pv);
+        return P;
+    }
+    std::vector<double> breaks() const override {
+        const double lo = std::min(from, to), hi = std::max(from, to);
+        std::vector<double> t{0.0};
+        for (const auto* list : {&path.brk, &path.kinks})
+            for (double s : *list)
+                if (s > lo && s < hi) t.push_back((s - from) / (to - from));
+        t.push_back(1.0);
+        std::sort(t.begin(), t.end());
+        return t;
+    }
+    bool coords(int side, double tau, double& u, double& v) const {
+        solve::Pt4 x;
+        if (!at(tau, x)) return false;
+        u = x[static_cast<std::size_t>(2 * side)];
+        v = x[static_cast<std::size_t>(2 * side + 1)];
+        return true;
+    }
+    bool on_carrier(int c, double tau, double& u, double& v, double& du, double& dv) const override {
+        const int side = carrier[0] == c ? 0 : carrier[1] == c ? 1 : -1;
+        if (side < 0) return false;
+        // The derivative from the curve's tangent: on the slice m . (x - a) =
+        // c, dx/dc = t / (m . t); c is linear in sigma on the segment, and
+        // sigma in tau.
+        const double sg = sigma(tau);
+        const int k = path.segment_of(sg);
+        const solve::TubeSegment& seg = path.segs[static_cast<std::size_t>(k)];
+        solve::Pt4 x, t;
+        const auto sy = sys();
+        if (!path.point(sy, sg, x) || !sy.tangent(x, t)) return false;
+        const double mt = solve::dot4(seg.m, t);
+        const double w = path.brk[static_cast<std::size_t>(k) + 1] - path.brk[static_cast<std::size_t>(k)];
+        if (!(std::fabs(mt) > 0.0) || !(w > 0.0)) return false;
+        const double dc = (seg.reversed ? -seg.len : seg.len) / w * (to - from);
+        u = x[static_cast<std::size_t>(2 * side)];
+        v = x[static_cast<std::size_t>(2 * side + 1)];
+        du = t[static_cast<std::size_t>(2 * side)] / mt * dc;
+        dv = t[static_cast<std::size_t>(2 * side + 1)] / mt * dc;
+        return true;
+    }
+    bool on_proc(int p, double tau, double& s, double& t) const override {
+        const int side = proc[0] == p ? 0 : proc[1] == p ? 1 : -1;
+        return side >= 0 && coords(side, tau, s, t);
+    }
+    std::shared_ptr<const ProcEdge> part(double t0, double t1) const override {
+        auto e = std::make_shared<TracedEdge>(*this);
+        e->from = sigma(t0);
+        e->to = sigma(t1);
+        return e;
+    }
+};
+
+} // namespace ak::op
