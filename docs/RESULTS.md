@@ -1483,6 +1483,32 @@ Each result is closed with Euler characteristic 2 and meshes watertight (deviati
 
 What this does not check yet: whether the ball meets faces other than the three at each end, which happens when the radius is too large for the solid. Edges that meet at a rounded vertex (chains, and vertex blends where three rounded edges meet) are not covered yet.
 
+### Fillet corners: mitres through a proven touching point
+
+From `tests/op/round_edge_test.cpp` (second part). The box's top edge at x = a is rounded first with r1 = 0.25. Then the vertical edge at x = a, y = 0 is rounded with a smaller r2. The two fillets meet at the corner. Both touch the side x = a, along contact curves that cross at a point A, so the fillets touch each other at A and their intersection curve has a singular point there: two branches cross. `solve/blend_corner.hpp` proves the local picture:
+
+- A comes from a 2-D Krawczyk on the two contact curves in the side's parameters.
+- On the second fillet, h = (distance to the first spine) − r1 and its gradient vanish exactly at A. So along rays from A in the second fillet's scaled parameters, h / rho² is enclosed by the Hessian of h over each ray's box, using Taylor's integral form. The Hessian is that of the distance to a curve, with the spine's centre, c′ and c″ enclosures (`BlendCarrier::spine_box`), and the fillet's second partials (`jet2_over`).
+- Directions are covered in two stereographic charts. Exclusion holds wherever the enclosure misses zero. Near each root, Krawczyk on the direction, iterated with M ← K(M) ∩ M, proves exactly two branches for every rho up to 1e-3.
+- The sign of (P − p1) · (q1 − p1) / rho picks the branch that lies on the first fillet's arc.
+
+Away from A, the ordinary tracer proves the rest. It runs on the second fillet with a small rectangle around A cut out (`RectCarrier`): two strips beside the rectangle are proven empty, and one curve is proven in the remainder. `round_edge` then splits the first fillet's contact at A and its end curve at the mitre's far end, and joins the pieces.
+
+| Case | Faces / edges / vertices | Volume |
+|---|---|---|
+| Box, r1 = 0.25, r2 = 0.15 | 8 / 19 / 13 | error 2e-12 against the box less both quarter-round regions plus their overlap (integrated independently) |
+| Box, r2 = 0.10 | 8 / 19 / 13 | error 6e-13 |
+| Box, r2 = 0.20 | 8 / 19 / 13 | error 2e-12 |
+| Freeform top, r2 = 0.15 | 8 / 19 / 13 | matches its moved copy to 2e-11 |
+
+All are closed with Euler characteristic 2 and mesh watertight. Each corner takes about 4 s on the box and 6 s on the freeform top. Rounding the larger radius second is refused: its far contact passes the first fillet and meets the top's edge, which needs one more topology case. Equal radii are another special case, where the far contact runs through the first fillet's end vertex.
+
+Three kernel changes came out of the corner work:
+
+- `BlendCarrier::eval` now gives analytic first partials. It solves for the spine's x′ in doubles and runs the arc in forward mode, where before it used central differences. Differences lost about half the digits, and a traced curve's tangent, solved from those partials, lost more where two surfaces meet at a small angle, as next to A. A moved copy of the box corner was off by 4e-9 in volume before and is off by 4e-12 now. The plain rounded block under translation went from 3e-11 to 2e-12.
+- `ProcEdge::on_proc_jet` gives procedural-face coordinates with their derivatives. `TracedEdge` answers from the curve's tangent, and volume uses it.
+- The second partials over a theta range are now hulled from 8 pieces, like the first, which narrows them several times.
+
 ### Plane cuts of solids with procedural faces (first step of Booleans on them)
 
 From `tests/op/plane_cut_test.cpp` (28 checks, about 1 minute). `op/plane_cut.hpp` cuts any solid with side and procedural edges by a plane, keeping n · x ≤ d. Every face the plane meets is intersected with a planar cap patch by `intersect_carriers` (certified, with a completeness proof). Each piece of section curve inside a face becomes a `TracedEdge` between the face's surface and the cap, read by both in their own parameters. The face keeps its region on the kept side, found by walking its loop and turning onto the section edge at each crossing. The cap's loops are the section edges chained at the crossings; outer loops are counter-clockwise and holes go into the outer loop that contains them.

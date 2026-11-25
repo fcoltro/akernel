@@ -38,6 +38,7 @@ op::PolyPatchD top_patch(double a, double L, double h, double c, double x0 = 0, 
 int edge_between(const op::Brep& b, int c0, int c1) {
     for (std::size_t i = 0; i < b.edges.size(); ++i) {
         const op::BEdge& e = b.edges[i];
+        if (e.proc || e.arc) continue;
         if ((e.on[0].carrier == c0 && e.on[1].carrier == c1) || (e.on[0].carrier == c1 && e.on[1].carrier == c0))
             return static_cast<int>(i);
     }
@@ -180,6 +181,67 @@ int main() {
         std::printf("  volume %.15f, moved %.15f, difference %.2e, removed %.6f\n", v, w, v - w, block - v);
         AK_CHECK_NEAR(v, w, 1e-10);
         AK_CHECK(v < block && block - v < r * r * a * 1.5);
+    }
+    // Mitre corners: the top edge at x = a rounded with r1, then the
+    // vertical edge at x = a, y = 0 with a smaller r2. The two fillets meet
+    // in a mitre through the point where both touch the side x = a. The
+    // volume is the box less both quarter-round regions plus their overlap
+    // near the corner, integrated independently in x (Gauss-Legendre after
+    // x = a - r2 sin^2 t, which takes out the square roots at x = a).
+    {
+        auto overlap = [&](double r1, double r2) {
+            static constexpr double gx[4] = {0.1834346424956498, 0.5255324099163290, 0.7966664774136267, 0.9602898564975363};
+            static constexpr double gw[4] = {0.3626837833783620, 0.3137066458778873, 0.2223810344533745, 0.1012285362903763};
+            auto f = [&](double x) {
+                const double d1 = x - (a - r1), d2 = x - (a - r2);
+                return (r1 - std::sqrt(std::max(0.0, r1 * r1 - d1 * d1))) * (r2 - std::sqrt(std::max(0.0, r2 * r2 - d2 * d2)));
+            };
+            double I = 0.0;
+            const int n = 400;
+            for (int k = 0; k < n; ++k) {
+                const double t0 = M_PI / 2 * k / n, t1 = M_PI / 2 * (k + 1) / n;
+                for (int i = 0; i < 4; ++i)
+                    for (int sg = -1; sg <= 1; sg += 2) {
+                        const double t = 0.5 * (t0 + t1) + 0.5 * sg * gx[i] * (t1 - t0);
+                        I += 0.5 * (t1 - t0) * gw[i] * f(a - r2 * std::sin(t) * std::sin(t)) * 2 * r2 * std::sin(t) * std::cos(t);
+                    }
+            }
+            return I;
+        };
+        const op::Brep box = op::to_brep(op::freeform_block(top_patch(a, L, h, 0.0)));
+        const op::ProcFilletResult first = op::round_edge(box, edge_between(box, 2, 3), r);
+        AK_CHECK(first.solid.has_value());
+        for (const double r2 : {0.15, 0.1, 0.2}) {
+            if (!first.solid) break;
+            char name[64];
+            std::snprintf(name, sizeof name, "box corner, mitre r1 = %.2f, r2 = %.2f", r, r2);
+            const double V = a * L * h, q2 = (1 - M_PI / 4) * r2 * r2;
+            const double exact = V - q * L - q2 * h + overlap(r, r2);
+            const double v = rounded(*first.solid, 2, 4, r2, name);
+            std::printf("  volume %.15f, exact %.15f, error %.2e\n", v, exact, v - exact);
+            AK_CHECK_NEAR(v, exact, 1e-10);
+        }
+        // The larger radius second: its far contact passes the earlier
+        // fillet and meets the top's edge, which is not handled yet.
+        if (first.solid) {
+            const op::Brep small = *op::round_edge(box, edge_between(box, 2, 4), 0.15).solid;
+            const op::ProcFilletResult big = op::round_edge(small, edge_between(small, 2, 3), r);
+            std::printf("box corner, larger radius second: %s\n", big.solid ? "built" : big.error.c_str());
+            AK_CHECK(!big.solid);
+        }
+    }
+    // A mitre on a freeform top: its edge at x = a rounded, then the vertical
+    // edge at y = 0, and the same solid moved.
+    {
+        auto corner = [&](double x0, double y0, const char* name) {
+            const op::Brep block = op::to_brep(op::freeform_block(top_patch(a, L, h, c, x0, y0)));
+            const op::ProcFilletResult first = op::round_edge(block, edge_between(block, 2, 3), r);
+            AK_CHECK(first.solid.has_value());
+            return first.solid ? rounded(*first.solid, 2, 4, 0.15, name) : std::nan("");
+        };
+        const double v = corner(0, 0, "freeform top corner, mitre"), w = corner(2.0, -1.5, "  moved");
+        std::printf("  volume %.15f, moved %.15f, difference %.2e\n", v, w, v - w);
+        AK_CHECK_NEAR(v, w, 1e-10);
     }
     // Refusals: a concave edge does not exist on a block, so a radius too
     // large for the face.
