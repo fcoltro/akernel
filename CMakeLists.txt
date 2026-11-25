@@ -28,6 +28,7 @@ endfunction()
 
 ak_add_test(escalation_policy_test tests/num/escalation_policy_test.cpp)
 ak_add_test(interval_test          tests/num/interval_test.cpp)
+ak_add_test(detmath_test           tests/num/detmath_test.cpp)
 ak_add_test(expansion_test         tests/num/expansion_test.cpp)
 ak_add_test(predicates_test        tests/num/predicates_test.cpp)
 ak_add_test(bernstein_test         tests/geom/bernstein_test.cpp)

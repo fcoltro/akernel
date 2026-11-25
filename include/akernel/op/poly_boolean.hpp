@@ -50,6 +50,7 @@
 #include <string>
 #include <vector>
 
+#include <akernel/num/detmath.hpp>
 #include <akernel/op/brep.hpp>
 #include <akernel/op/brep_transform.hpp>
 #include <akernel/op/plane_cut.hpp>
@@ -600,7 +601,7 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
             const BEdge& e = E[static_cast<std::size_t>(edge)];
             Half h{edge, rev, boundary, outward, rev ? e.v1 : e.v0, rev ? e.v0 : e.v1, 0.0};
             // Direction at `from`: the edge's tangent at that end, in the face's parameters.
-            double u, v, du, dv;
+            double u = 0.0, v = 0.0, du = 0.0, dv = 0.0;
             bool ok;
             if (e.proc) {
                 if (F.proc >= 0) {
@@ -615,7 +616,7 @@ inline PolyBooleanResult poly_boolean(const Brep& A, const Brep& P, PolyOp op, c
             }
             if (!ok) return false;
             if (rev) { du = -du; dv = -dv; }
-            h.angle = std::atan2(dv, du);
+            h.angle = num::det::atan2(dv, du);
             H.push_back(h);
             return true;
         };

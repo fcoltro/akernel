@@ -12,6 +12,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <numbers>
 #include <cstdio>
 
 #include "check.hpp"
@@ -134,7 +135,7 @@ int main() {
     {
         auto res = build(top_patch(a, L, h, 0.0), r, "flat top");
         if (res.solid) {
-            const double v = op::volume(*res.solid), exact = a * L * h - (1 - M_PI / 4) * r * r * L;
+            const double v = op::volume(*res.solid), exact = a * L * h - (1 - std::numbers::pi / 4) * r * r * L;
             std::printf("  volume %.15f, closed form %.15f, error %.2e\n", v, exact, v - exact);
             AK_CHECK_NEAR(v, exact, 1e-10);
         }
@@ -177,7 +178,7 @@ int main() {
     {
         auto res = build(top_patch(a, L, h, 0.0), r, "flat top, cut at 3L/4", cut);
         if (res.solid) {
-            const double v = op::volume(*res.solid), exact = a * y1 * h - (1 - M_PI / 4) * r * r * y1;
+            const double v = op::volume(*res.solid), exact = a * y1 * h - (1 - std::numbers::pi / 4) * r * r * y1;
             std::printf("  volume %.15f, closed form %.15f, error %.2e\n", v, exact, v - exact);
             AK_CHECK_NEAR(v, exact, 1e-10);
         }

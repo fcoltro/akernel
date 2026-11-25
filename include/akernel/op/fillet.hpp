@@ -58,10 +58,12 @@
 
 #include <array>
 #include <cmath>
+#include <numbers>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include <akernel/num/detmath.hpp>
 #include <akernel/geom/bernstein.hpp>
 #include <akernel/op/patch_solid.hpp>
 
@@ -287,21 +289,21 @@ inline BlendedSolid revolve_section(const Section& sec, double p0r, double p0h, 
     PatchSolid S;
     for (int q = 0; q < quarters; ++q) {
         const auto Q = quarter(q);
-        const double phi = (q + 0.5) * M_PI / 2;
+        const double phi = (q + 0.5) * std::numbers::pi / 2;
         for (const auto& side : sec.sides) {
             PolyPatchD P(2, static_cast<int>(side.curve.size()) - 1);
             for (int i = 0; i < 3; ++i)
                 for (std::size_t j = 0; j < side.curve.size(); ++j)
                     P.at(i, static_cast<int>(j)) = hom(side.curve[j], Q[static_cast<std::size_t>(i)]);
             const double nr = ur * side.nx, nh = vh * side.ny;
-            S.faces.push_back(outward(P, {nr * std::cos(phi), nr * std::sin(phi), nh}));
+            S.faces.push_back(outward(P, {nr * num::det::cos(phi), nr * num::det::sin(phi), nh}));
         }
     }
     if (quarters < 4) {
         // End faces: radial half-planes at angle 0 and quarters * 90 degrees.
         const auto start = quarter(0)[0], end = quarter(quarters - 1)[2];
-        const double th = quarters * M_PI / 2;
-        const Vec3d out0{0, -1, 0}, out1{-std::sin(th), std::cos(th), 0};
+        const double th = quarters * std::numbers::pi / 2;
+        const Vec3d out0{0, -1, 0}, out1{-num::det::sin(th), num::det::cos(th), 0};
         for (const auto& cell : sec.cells) {
             S.faces.push_back(outward(ruled(row(cell.row0, start), row(cell.row1, start)), out0));
             S.faces.push_back(outward(ruled(row(cell.row0, end), row(cell.row1, end)), out1));

@@ -38,6 +38,7 @@
 #include <utility>
 #include <vector>
 
+#include <akernel/num/detmath.hpp>
 #include <akernel/num/predicates.hpp>
 #include <akernel/op/brep.hpp>
 
@@ -892,7 +893,7 @@ inline TessResult tessellate(const Brep& b, const TessOptions& opt = {}) {
         // closer to isotropic in space.
         double sv = 1.0;
         if (cs.Lu_mean > 0.0 && cs.Lv_mean > 0.0)
-            sv = std::ldexp(1.0, static_cast<int>(std::lround(std::log2(cs.Lv_mean / cs.Lu_mean))));
+            sv = std::ldexp(1.0, num::det::round_log2(cs.Lv_mean / cs.Lu_mean));
         auto Q = [&](double u, double v) { return P2{u, v * sv}; };
 
         P2 lo{inf, inf}, hi{-inf, -inf};

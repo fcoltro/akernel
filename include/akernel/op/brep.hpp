@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include <akernel/num/detmath.hpp>
 #include <akernel/geom/carrier.hpp>
 #include <akernel/op/contact.hpp>
 #include <akernel/op/patch_solid.hpp>
@@ -542,7 +543,7 @@ inline bool check_edge_fans(const Brep& b, std::string& why) {
             const geom::Jet3 J = geom::BezierSurface(b.carriers[static_cast<std::size_t>(face.carrier)]).jet(u, v);
             const Vec3d n = cross(J[iu], J[iv]);
             const Vec3d d = cross(n, rev ? -T : T);
-            around.push_back({std::atan2(dot(d, B), dot(d, A)), (rev ? -1 : 1) * (face.flipped ? -1 : 1), face.carrier, 0});
+            around.push_back({num::det::atan2(dot(d, B), dot(d, A)), (rev ? -1 : 1) * (face.flipped ? -1 : 1), face.carrier, 0});
         }
         // Faces at one angle touch tangentially along the edge. A curved face
         // whose side along this edge lies in the plane of a flat face there,
@@ -566,7 +567,7 @@ inline bool check_edge_fans(const Brep& b, std::string& why) {
                     const Vec4d h = C.eval(0.5, 0.5);
                     const double off = dot(nP, Vec3d{h.x / h.w - c00.x, h.y / h.w - c00.y, h.z / h.w - c00.z});
                     // Direction of increasing angle at this angle.
-                    const Vec3d up = A * -std::sin(cu.angle) + B * std::cos(cu.angle);
+                    const Vec3d up = A * -num::det::sin(cu.angle) + B * num::det::cos(cu.angle);
                     const double turn = dot(nP, up) * (off > 0.0 ? 1.0 : -1.0);
                     if (off != 0.0 && turn != 0.0) cu.tie = turn > 0.0 ? 1 : -1;
                 }
