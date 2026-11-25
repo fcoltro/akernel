@@ -42,7 +42,16 @@ Requires the Visual Studio Build Tools (MSVC, CMake and Ninja are bundled).
 .\build.ps1 -Filter ssi     # run only matching tests
 ```
 
-The library is header-only. It must be compiled with strict IEEE semantics (`/fp:strict`; `-ffp-contract=off -fno-fast-math` elsewhere), because the rigour of the interval and exact arithmetic depends on it. Only MSVC 19.51 on Windows x64 has been tested.
+On Linux (GCC 13 or Clang 18, CMake, Ninja):
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+ctest --test-dir build --output-on-failure
+./build/ak_bench            # benchmark tables; the hash lines must match bench/hashes.txt
+```
+
+The library is header-only. It must be compiled with strict IEEE semantics (`/fp:strict`; `-ffp-contract=off -fno-fast-math` elsewhere), because the rigour of the interval and exact arithmetic depends on it. MSVC 19.51 on Windows x64 is the development toolchain. The CI (`.github/workflows/ci.yml`) builds and tests every push and pull request with MSVC on Windows and with GCC and Clang on Linux, runs the tests under AddressSanitizer and UndefinedBehaviorSanitizer and with a checked standard library, and runs the benchmark on all three: its result hashes must be identical on every platform and equal to `bench/hashes.txt`. Results do not depend on the C runtime: sines, cosines, arc tangents, integer powers and binary logarithms come from `num/detmath.hpp`, which uses only correctly rounded operations (RESULTS.md §8).
 
 ## Try it
 

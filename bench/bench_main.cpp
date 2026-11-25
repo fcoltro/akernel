@@ -432,8 +432,8 @@ void bench_ssi() {
 struct Wave {
     static double dz(int k, int l, double x, double y) {
         const double hp = 1.57079632679489661923;
-        double s = 0.2 * std::pow(2.5, k) * std::sin(2.5 * x + 0.3 + k * hp) * std::pow(2.0, l) *
-                   std::cos(2.0 * y + l * hp);
+        double s = 0.2 * num::det::ipow(2.5, k) * num::det::sin(2.5 * x + 0.3 + k * hp) * num::det::ipow(2.0, l) *
+                   num::det::cos(2.0 * y + l * hp);
         if (k == 0 && l == 0) s += 0.1 * x * y;
         if (k == 1 && l == 0) s += 0.1 * y;
         if (k == 0 && l == 1) s += 0.1 * x;
@@ -532,7 +532,7 @@ RandomBox random_box(akt::Rng& rng, const Vec3d& clo, const Vec3d& chi) {
         len = geom::norm(axis);
     } while (len < 0.2 || len > 1.0);
     axis = axis / len;
-    const double ang = rng.range(0.2, 2.9), c = std::cos(ang), s = std::sin(ang);
+    const double ang = rng.range(0.2, 2.9), c = num::det::cos(ang), s = num::det::sin(ang);
     const double ax = axis.x, ay = axis.y, az = axis.z;
     const double R[3][3] = {{c + ax * ax * (1 - c), ax * ay * (1 - c) - az * s, ax * az * (1 - c) + ay * s},
                             {ay * ax * (1 - c) + az * s, c + ay * ay * (1 - c), ay * az * (1 - c) - ax * s},
@@ -1066,9 +1066,9 @@ void bench_curved_chains(int chains, int depth, int first_chain = 0, bool trace 
         }
         bool inside(const Vec3d& p) const {
             if (kind == 0) {
-                const double rho = std::sqrt(p.x * p.x + p.y * p.y), th = std::atan2(p.y, p.x);
-                return rho >= r0 && rho <= r1 && p.z >= z0 && p.z <= z1 && th >= 2.0 * std::atan(t0) &&
-                       th <= 2.0 * std::atan(t1);
+                const double rho = std::sqrt(p.x * p.x + p.y * p.y), th = num::det::atan2(p.y, p.x);
+                return rho >= r0 && rho <= r1 && p.z >= z0 && p.z <= z1 && th >= 2.0 * num::det::atan(t0) &&
+                       th <= 2.0 * num::det::atan(t1);
             }
             if (kind == 1) {
                 const double x = (p.x - o.x) / sx, y = (p.y - o.y) / sy;

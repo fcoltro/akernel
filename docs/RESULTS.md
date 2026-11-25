@@ -1265,6 +1265,33 @@ Timings of the tangency-along-a-ruling round are not comparable with the earlier
 
 So the Boolean results are bitwise identical between Debug and Release; the rewrite for trimmed operands, and the later rewrite for shared geometry, did not change any earlier result. The reuse chains have been run in Release only. All of this covers one machine, one compiler and single-threaded execution; other platforms and parallel execution are untested.
 
+### Across platforms (2026-11-24)
+
+Until this round every hash above came from MSVC on Windows. The same sources (main at 5bcf823) built with GCC 13.3 on Linux reproduced four of them bit for bit (grid chains `c5f2137f04d933f9`, identities `896b9c04bb9ba003`, curved chains `235c0cebe0b71b2e`, scaling `3a32233dc2ef1304`) and differed in the others: core `3bb466cb58541f8a`, Boolean pairs `9b244cdfb556eaf2`, chains `800202df5ac846aa`, reuse `1ef12a1be9fb9537`, tessellation `25ca46036fb581cf`, multi-patch chains `1c8769ba475fa2f5`.
+
+**Cause.** The sections that differed are the ones whose inputs pass through the C runtime's elementary functions: the random rotations of the boxes (`std::cos`, `std::sin`), the boundary data of the fill (`std::sin`, `std::cos`, `std::pow`), the Chebyshev and Gauss nodes (`std::cos`), and the B-spline boxes. MSVC's and glibc's `sin`, `cos`, `atan2` and `pow` are not correctly rounded and differ in the last bit of many results. The kernel's own arithmetic (the four basic operations and `sqrt`, all correctly rounded under IEEE-754, with contraction off) was already the same: every section whose inputs avoid those functions matched.
+
+**Fix.** `num/detmath.hpp` gives `sin`, `cos`, `tan`, `atan` and `atan2` with fdlibm's algorithms and coefficients (Cody-Waite reduction by π/2 in three parts, then the kernel polynomials), using only +, −, ×, / in a fixed order, so the result is the same double on every IEEE-754 platform; `sin` and `cos` within 1 ulp for |x| ≤ 1.6 · 10⁶ (beyond, the C runtime is used), `atan` and `atan2` within 1 ulp. Integer powers are repeated squaring (`ipow`; exact whenever the result is representable, which the exact-arithmetic uses in `op/boolean.hpp` need), and the two binary logarithms the kernel takes (rounded, in the tessellation's aspect scaling; rounded up, in the Boolean's bounding square) are decided exactly from the exponent and mantissa. Every call of a C runtime transcendental in `include/` and in the benchmark's hashed inputs now goes through these. The one left is `diag/rate.hpp` (`log`, `exp`), whose convergence orders are printed but not hashed. `tests/num/detmath_test.cpp` compares about 470,000 results with the C runtime (worst 1 ulp for sin, cos, atan and atan2) and checks a hash over their exact bits, so a platform that rounds differently fails that test first.
+
+**Effect.** The inputs move by an ulp, so seven hashes change; nothing else does. Every count, audit, refusal, Monte Carlo deviation and tessellation tally printed by the benchmark is the same as before the change (compared line by line on GCC, timings aside), with one exception within rounding: the mean number of surface pairs intersected at step 4 of the random chains is 47 instead of 46. The widest vertex enclosure at step 3 of the random chains is 4.3e-13 (5.0e-13 before). New hashes, the same with GCC 13.3 and Clang 18 on Linux; the CI checks that MSVC on Windows gives them too (`bench/hashes.txt`):
+
+| Hash | Value |
+|---|---|
+| Core | `a97ce92f6250fc67` |
+| Boolean pairs | `65b912caad655511` |
+| Random chains | `d3559ab485924414` |
+| Random chains with reused operands | `0cfe68b927a3a05f` |
+| Random chains of grid-aligned boxes | `c5f2137f04d933f9` (unchanged) |
+| Tessellation of every committed result | `773aa050649bf84e` |
+| Algebraic identities | `896b9c04bb9ba003` (unchanged) |
+| Chains with curved operands | `1b1d34c7ee98c117` |
+| Chains with multi-patch faces | `7a690510135af528` |
+| Scaling with the number of faces | `3a32233dc2ef1304` (unchanged) |
+
+The tables of §1 to §3 were measured before this change. Their counts and checks are unchanged by it; their timings are MSVC's.
+
+**Also found.** The order in which function arguments are evaluated is unspecified in C++ and differs between compilers (here GCC and Clang took opposite orders), so two random draws inside one call, `f(rng.unit(), rng.unit())`, give different inputs per compiler. The first version of `detmath_test` did that and gave different hashes under GCC and Clang. The benchmark draws one value per statement or inside braced lists, which C++ evaluates left to right; a few tests still draw two per call (`carrier_test`), harmlessly, since they check tolerances, not hashes.
+
 ## 9. Against the blueprint's targets (§5.4)
 
 | Target | State |

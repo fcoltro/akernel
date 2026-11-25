@@ -12,6 +12,7 @@
 #include <akernel/op/tessellate.hpp>
 
 #include <cmath>
+#include <numbers>
 #include <cstdio>
 
 #include "check.hpp"
@@ -55,7 +56,7 @@ SectionMoments section(double a, double b, const op::EdgeCut& cut) {
     SectionMoments m{a * b, a * b * a / 2, a * b * b / 2};
     double ar, cx, cy; // the removed corner piece and its centroid
     if (cut.kind == op::EdgeCut::Round) {
-        const double r = cut.dA, q = M_PI * r * r / 4, e = 4 * r / (3 * M_PI);
+        const double r = cut.dA, q = std::numbers::pi * r * r / 4, e = 4 * r / (3 * std::numbers::pi);
         ar = r * r - q;
         cx = (r * r * (a - r / 2) - q * (a - r + e)) / ar;
         cy = (r * r * (b - r / 2) - q * (b - r + e)) / ar;
@@ -77,7 +78,7 @@ SectionMoments step_section(double a, double b, double a1, double b1, const op::
                      a * b1 * b1 / 2 + a1 * (b - b1) * (b1 + b) / 2};
     double ar, cx, cy; // the added corner piece and its centroid
     if (cut.kind == op::EdgeCut::Round) {
-        const double r = cut.dA, q = M_PI * r * r / 4, e = 4 * r / (3 * M_PI);
+        const double r = cut.dA, q = std::numbers::pi * r * r / 4, e = 4 * r / (3 * std::numbers::pi);
         ar = r * r - q;
         cx = (r * r * (a1 + r / 2) - q * (a1 + r - e)) / ar;
         cy = (r * r * (b1 + r / 2) - q * (b1 + r - e)) / ar;
@@ -116,7 +117,7 @@ void check_faces(const char* name, const op::PatchSolid& s) {
 
 int main() {
     const double a = 2.0, b = 1.5, c = 1.0, r = 0.5;
-    const double V = a * b * c - c * r * r * (1.0 - M_PI / 4.0);
+    const double V = a * b * c - c * r * r * (1.0 - std::numbers::pi / 4.0);
 
     const op::FilletedSolid f = op::fillet_box_edge({0, 0, 0}, {a, 0, 0}, {0, b, 0}, {0, 0, c}, r);
     AK_CHECK(f.solid.has_value());
@@ -210,7 +211,7 @@ int main() {
             const SectionMoments m = section(r1 - r0, z1 - z0, rg.cut);
             // Pappus: volume = angle * integral of rho over the section.
             const double rho_moment = outer ? r0 * m.area + m.mx : r1 * m.area - m.mx;
-            const double volume = rg.quarters * (M_PI / 2) * rho_moment;
+            const double volume = rg.quarters * (std::numbers::pi / 2) * rho_moment;
             check_faces(rg.name, *res.solid);
             check_solid(rg.name, op::to_brep(*res.solid), volume, rg.quarters == 4 ? 0 : 2);
         }
@@ -229,20 +230,20 @@ int main() {
                 // Reference by quadrature over the section: the angle range with
                 // rho sin(theta) >= 1/2 is pi - 2 asin(1 / (2 rho)).
                 const double rr = 0.25, A = r1 - r0, H = z1 - z0;
-                auto f = [&](double x) {
+                auto arc = [&](double x) {
                     const double rho = r0 + x;
-                    return rho * (M_PI - 2 * std::asin(0.5 / rho));
+                    return rho * (std::numbers::pi - 2 * std::asin(0.5 / rho));
                 };
                 auto simpson = [](auto g, double lo, double hi, int n) {
                     double sum = g(lo) + g(hi);
                     for (int i = 1; i < n; ++i) sum += g(lo + (hi - lo) * i / n) * (i % 2 ? 4 : 2);
                     return sum * (hi - lo) / (3 * n);
                 };
-                const double ref = simpson([&](double x) { return f(x) * H; }, 0, A - rr, 2000) +
+                const double ref = simpson([&](double x) { return arc(x) * H; }, 0, A - rr, 2000) +
                                    simpson([&](double t) {
                                        const double x = A - rr + rr * std::sin(t);
-                                       return f(x) * (H - rr + rr * std::cos(t)) * rr * std::cos(t);
-                                   }, 0, M_PI / 2, 2000);
+                                       return arc(x) * (H - rr + rr * std::cos(t)) * rr * std::cos(t);
+                                   }, 0, std::numbers::pi / 2, 2000);
                 std::printf("   reference by quadrature %.12f\n", ref);
                 AK_CHECK_NEAR(v, ref, 1e-9);
             } else {
@@ -280,24 +281,24 @@ int main() {
             int quarters;
         };
         const double r0 = 1.0, r1 = 1.75, r2 = 2.5, z0 = 0.0, z1 = 0.5, z2 = 1.25;
-        const Stepped cases[] = {
+        const Stepped stepped[] = {
             {"boss on a plate, base rounded, full turn", true, op::EdgeCut::round(0.25), 4},
             {"boss on a plate, base chamfered, one quarter", true, op::EdgeCut::flat(0.25, 0.5), 1},
             {"counterbore, floor edge rounded, full turn", false, op::EdgeCut::round(0.25), 4},
             {"counterbore, floor edge chamfered, half", false, op::EdgeCut::flat(0.375, 0.5), 2},
         };
-        for (const Stepped& k : cases) {
+        for (const Stepped& k : stepped) {
             const auto res = op::blend_stepped_ring_edge(r0, r1, r2, z0, z1, z2, k.tall_inside, k.cut, k.quarters);
             AK_CHECK(res.solid.has_value());
             if (!res.solid) {
                 std::printf("FAIL %s: %s\n", k.name, res.error.c_str());
                 continue;
             }
-            const double a = r2 - r0, b = z2 - z0, a1 = k.tall_inside ? r1 - r0 : r2 - r1;
-            const SectionMoments m = step_section(a, b, a1, z1 - z0, k.cut);
+            const double wa = r2 - r0, wb = z2 - z0, wa1 = k.tall_inside ? r1 - r0 : r2 - r1;
+            const SectionMoments m = step_section(wa, wb, wa1, z1 - z0, k.cut);
             const double rho_moment = k.tall_inside ? r0 * m.area + m.mx : r2 * m.area - m.mx;
             check_faces(k.name, *res.solid);
-            check_solid(k.name, op::to_brep(*res.solid), k.quarters * (M_PI / 2) * rho_moment,
+            check_solid(k.name, op::to_brep(*res.solid), k.quarters * (std::numbers::pi / 2) * rho_moment,
                         k.quarters == 4 ? 0 : 2);
         }
     }
@@ -326,14 +327,14 @@ int main() {
             // Core box plus face slabs, quarter cylinders and the ball.
             const double a0 = A - 2 * rr, b0 = Bh - 2 * rr, c0 = Ch - 2 * rr;
             const double vol = a0 * b0 * c0 + 2 * rr * (a0 * b0 + b0 * c0 + a0 * c0) +
-                               M_PI * rr * rr * (a0 + b0 + c0) + 4.0 / 3.0 * M_PI * rr * rr * rr;
+                               std::numbers::pi * rr * rr * (a0 + b0 + c0) + 4.0 / 3.0 * std::numbers::pi * rr * rr * rr;
             const op::Brep rbb = op::to_brep(*rb.solid);
             check_solid("rounded box (all 12 edges)", rbb, vol);
             // Cut through four corners: keep x <= a - r/2. The removed slab
             // is the half-ball sweep of the core's x face from depth r/2 to r.
             const double cut_vol = b0 * c0 * rr / 2 +
-                                   2 * (b0 + c0) * (M_PI * rr * rr / 6 - std::sqrt(3.0) * rr * rr / 8) +
-                                   M_PI * 5 * rr * rr * rr / 24;
+                                   2 * (b0 + c0) * (std::numbers::pi * rr * rr / 6 - std::sqrt(3.0) * rr * rr / 8) +
+                                   std::numbers::pi * 5 * rr * rr * rr / 24;
             const auto res = op::boolean_op(rbb, op::to_brep(op::make_box({-1, -1, -1}, {A - rr / 2, 3, 3})),
                                             op::Op::Intersection);
             AK_CHECK(res.ok);

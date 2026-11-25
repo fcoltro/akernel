@@ -266,9 +266,9 @@ int main() {
                 {"b2 & (block - pocket)", check_result("b2 & (block - pocket)", op::PolyOp::Intersection, op::poly_boolean(b2, H, op::PolyOp::Intersection)), i2 - i12, 1e-11},
                 {"b2 - (block - pocket)", check_result("b2 - (block - pocket)", op::PolyOp::Difference, op::poly_boolean(b2, H, op::PolyOp::Difference)), op::volume(b2) - (i2 - i12), 1e-11},
             };
-            for (const Case& c : cases) {
-                std::printf("  %s: expected %.15f, difference %.2e\n", c.name, c.expect, c.v - c.expect);
-                AK_CHECK_NEAR(c.v, c.expect, c.tol);
+            for (const Case& k : cases) {
+                std::printf("  %s: expected %.15f, difference %.2e\n", k.name, k.expect, k.v - k.expect);
+                AK_CHECK_NEAR(k.v, k.expect, k.tol);
             }
         }
     }
@@ -291,9 +291,9 @@ int main() {
             {"inner box & block", op::PolyOp::Intersection, &in, &*rb.solid, vb},
             {"outer box - block", op::PolyOp::Difference, &out, &*rb.solid, vb},
         };
-        for (const Case& c : cases) {
-            const double v = check_result(c.name, c.o, op::poly_boolean(*c.a, *c.b, c.o));
-            AK_CHECK_NEAR(v, c.expect, 1e-12);
+        for (const Case& k : cases) {
+            const double v = check_result(k.name, k.o, op::poly_boolean(*k.a, *k.b, k.o));
+            AK_CHECK_NEAR(v, k.expect, 1e-12);
         }
     }
     return akt::finish("poly_boolean_test");
