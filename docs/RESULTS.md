@@ -1501,7 +1501,27 @@ Away from A, the ordinary tracer proves the rest. It runs on the second fillet w
 | Box, r2 = 0.20 | 8 / 19 / 13 | error 2e-12 |
 | Freeform top, r2 = 0.15 | 8 / 19 / 13 | matches its moved copy to 2e-11 |
 
-All are closed with Euler characteristic 2 and mesh watertight. Each corner takes about 4 s on the box and 6 s on the freeform top. Rounding the larger radius second is refused: its far contact passes the first fillet and meets the top's edge, which needs one more topology case. Equal radii are another special case, where the far contact runs through the first fillet's end vertex.
+All are closed with Euler characteristic 2 and mesh watertight. Each corner takes about 4 s on the box and 6 s on the freeform top.
+
+**Equal radii and the larger radius second (2026-11-25).** The traced part of the mitre now ends in one of three places, read from which domain side its far end lies on (to 1e-9):
+
+- on the new fillet's far contact only: the smaller radius second, as above;
+- on both that contact and the first fillet's far contact: equal radii. The mitre ends at the first fillet's end vertex (checked to 1e-9), and the first fillet's end curve is removed;
+- on the first fillet's far contact only: the larger radius second. The mitre ends at P on that contact. Past P the new fillet meets the contact's face (the top), along a curve traced on the same region of the new fillet and cut at P. It runs to Q on the top's edge with the end face. The first fillet's contact is split at P, the top's edge at Q, and the end curve and its far vertex are removed.
+
+Unused edges and vertices are then dropped and the rest renumbered. The test now rounds the second edge with r2 = 0.25 (equal) and 0.35 after r1 = 0.25, and in the other order (0.15 then 0.25). It also rounds the top's front edge first, so that the shared face lies on the other side of the new fillet:
+
+| Case | Faces / edges / vertices | Volume error against the overlap integral |
+|---|---|---|
+| Top edge r1 = 0.25, vertical r2 = 0.25 (equal) | 8 / 18 / 12 | 6e-13 |
+| Top edge r1 = 0.25, vertical r2 = 0.35 (larger) | 8 / 19 / 13 | 3e-13 |
+| Vertical r1 = 0.15, top edge r2 = 0.25 (larger) | 8 / 19 / 13 | 6e-13 |
+| Front top edge r1 = 0.25, vertical r2 = 0.15 / 0.25 / front top 0.15 then vertical 0.25 | 8 / 19 / 13, 8 / 18 / 12, 8 / 19 / 13 | below 3e-12 |
+| Freeform top, r2 = 0.35 (larger) | 8 / 19 / 13 | matches its moved copy to 4e-12 |
+
+The overlap integral now substitutes x = a − rm sin²t with rm the smaller radius, which keeps the integrand smooth whichever radius is larger.
+
+The front-top cases found an error that the earlier tests could not see. The mitre piece next to A took its derivative in the fillet's coordinates from a two-point difference of step 1e-6. Its coordinates come from Newton solves, so the difference carried about 1e-10 of noise. The volume weighs that derivative by the face's flux function, which is near zero when A lies at theta = 0 (the earlier tests) and of order one when A lies at theta = 1. The volume was then off by 1e-9 and did not converge under refinement. `CornerEdge` now takes the derivative from a five-point stencil of step 1e-3 inside its piece, and the error is 1e-12.
 
 Three kernel changes came out of the corner work:
 

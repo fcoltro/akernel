@@ -242,7 +242,73 @@ public:
         return false;
     }
     std::vector<double> breaks() const override { return {0.0, 0.25, 0.5, 0.75, 1.0}; }
+    /// Derivatives from a five-point Lagrange stencil of step 1e-3 inside the
+    /// piece (error about 1e-12): the coordinates come from Newton solves,
+    /// whose last-digit noise a two-point difference of step 1e-6 turns into
+    /// 1e-10, and the volume weighs ds by the face's flux function.
+    bool on_proc_jet(int p, double tau, double& s, double& t, double& ds, double& dt) const override {
+        if (!on_proc(p, tau, s, t)) return false;
+        const std::vector<double> br = breaks();
+        const auto it = std::upper_bound(br.begin() + 1, br.end() - 1, tau);
+        const double lo = *(it - 1), hi = *it, h = 1e-3;
+        const double c = std::min(std::max(tau, lo + 2 * h), hi - 2 * h);
+        double x[5], fs[5], ft[5];
+        for (int k = 0; k < 5; ++k) {
+            x[k] = c + (k - 2) * h;
+            if (!on_proc(p, x[k], fs[k], ft[k])) return false;
+        }
+        ds = dt = 0.0;
+        for (int k = 0; k < 5; ++k) {
+            double den = 1.0, num_ = 0.0;
+            for (int n = 0; n < 5; ++n)
+                if (n != k) den *= x[k] - x[n];
+            for (int m = 0; m < 5; ++m) {
+                if (m == k) continue;
+                double pr = 1.0;
+                for (int n = 0; n < 5; ++n)
+                    if (n != k && n != m) pr *= tau - x[n];
+                num_ += pr;
+            }
+            ds += fs[k] * num_ / den;
+            dt += ft[k] * num_ / den;
+        }
+        if (p == p2) dt = L.k_t * b_end; // theta is linear in tau
+        return true;
+    }
 };
+
+/// Remove the edges no loop uses and the vertices no edge uses, renumbering
+/// the rest (a corner whose fillet swallows an earlier end curve leaves
+/// both behind).
+inline void drop_unused(Brep& b) {
+    std::vector<int> emap(b.edges.size(), -1), vmap(b.vertices.size(), -1);
+    for (const BFace& F : b.faces)
+        for (const auto& L : F.loops)
+            for (const BCoedge& c : L) emap[static_cast<std::size_t>(c.edge)] = 0;
+    std::vector<BEdge> edges;
+    for (std::size_t i = 0; i < b.edges.size(); ++i)
+        if (emap[i] == 0) {
+            emap[i] = static_cast<int>(edges.size());
+            edges.push_back(b.edges[i]);
+            vmap[static_cast<std::size_t>(b.edges[i].v0)] = 0;
+            vmap[static_cast<std::size_t>(b.edges[i].v1)] = 0;
+        }
+    std::vector<BVertex> vertices;
+    for (std::size_t i = 0; i < b.vertices.size(); ++i)
+        if (vmap[i] == 0) {
+            vmap[i] = static_cast<int>(vertices.size());
+            vertices.push_back(b.vertices[i]);
+        }
+    for (BEdge& e : edges) {
+        e.v0 = vmap[static_cast<std::size_t>(e.v0)];
+        e.v1 = vmap[static_cast<std::size_t>(e.v1)];
+    }
+    for (BFace& F : b.faces)
+        for (auto& L : F.loops)
+            for (BCoedge& c : L) c.edge = emap[static_cast<std::size_t>(c.edge)];
+    b.edges = std::move(edges);
+    b.vertices = std::move(vertices);
+}
 
 } // namespace proc_fillet_detail
 
@@ -563,10 +629,14 @@ inline ProcFilletResult round_block_edge(const PolyPatchD& top, double r, const 
 /// two branches at A are proven by solve/blend_corner.hpp (a polar blow-up:
 /// the blends touch at A, so the ordinary tracer cannot prove the curve
 /// there). The rest of the curve is traced on the new blend with a small
-/// rectangle around A removed. The earlier blend's contact and end curve
-/// are split where the mitre meets them. Handled: the new radius smaller
-/// than the earlier one, so that its far contact meets the earlier end
-/// curve.
+/// rectangle around A removed. Where it ends depends on the radii. A
+/// smaller new radius: on the new blend's far contact, inside the earlier
+/// blend's end curve, which is split there. Equal radii: at the end curve's
+/// far vertex, and the end curve goes. A larger new radius: at P on the
+/// earlier blend's far contact (split there); the new blend then meets that
+/// contact's face along a traced curve from P to Q on the face's edge with
+/// the end curve's face (split there), and the end curve and its far vertex
+/// go. The earlier contact on the shared face is split at A.
 inline ProcFilletResult round_edge(const Brep& S, int edge, double r, const solve::SsiOptions& opt = {}) {
     using namespace proc_fillet_detail;
     ProcFilletResult res;
@@ -657,6 +727,8 @@ inline ProcFilletResult round_edge(const Brep& S, int edge, double r, const solv
         std::shared_ptr<TracedEdge> curve;
         bool corner = false; ///< the end face is an earlier blend: a mitre
         std::vector<BCoedge> chain; ///< edges from vertex V (theta 0) to B (theta 1)
+        std::vector<BCoedge> fe_chain; ///< what goes into the end face's loop, if not `chain`
+        int drop = -1;              ///< an edge the end removes from every loop
     };
     End end[2];
     auto other_edge = [&](int f, int V) {
@@ -676,10 +748,29 @@ inline ProcFilletResult round_edge(const Brep& S, int edge, double r, const solv
         for (BCoedge& x : r) x.reversed = !x.reversed;
         return r;
     };
+    // Split side edge e (one end at V) at the contact, which is at (u, v) on
+    // carrier c; the end at V becomes vertex W.
+    auto split = [&](int e, int V, int c, double u, double v, int W, int CE) {
+        BEdge& x = b.edges[static_cast<std::size_t>(e)];
+        const BEdge::SideRef* ref = side_on(x, c);
+        const double sp_ = (ref->side == 0 || ref->side == 2) ? u : v;
+        const double t = ref->reversed ? 1.0 - sp_ : sp_;
+        if (!(t > std::min(x.t0.hi, x.t1.hi) && t < std::max(x.t0.lo, x.t1.lo))) return false; // strictly inside
+        if (x.v0 == V) { x.v0 = W; x.t0 = Interval(t); }
+        else { x.v1 = W; x.t1 = Interval(t); }
+        const BEdge::SideRef* re = side_on(x, CE);
+        double ue, ve;
+        side_uv(re->side, re->reversed ? 1.0 - t : t, ue, ve);
+        BVertex& w = b.vertices[static_cast<std::size_t>(W)];
+        w.charts.push_back({c, Interval(u), Interval(v)});
+        w.charts.push_back({CE, Interval(ue), Interval(ve)});
+        return true;
+    };
     auto support_of = [&](int j) -> const Support& { return j == 0 ? SA : SB; };
     // An end at an earlier blend's face: the new blend meets it in a mitre
     // through the point A where both touch the shared face (solve/
     // blend_corner.hpp). Returns an error or null.
+    
     auto corner_end = [&](End& en, int k) -> const char* {
         (void)k;
         const std::vector<int> fa = faces_with(en.eA), fb = faces_with(en.eB);
@@ -790,7 +881,15 @@ inline ProcFilletResult round_edge(const Brep& S, int edge, double r, const solv
                 te->from = 1.0;
                 te->to = 0.0;
             }
-            if (!(std::fabs(q0[1] - vj) < 1e-9 && std::fabs(q1[1] - (1.0 - vj)) < 1e-9)) continue;
+            // Where the mitre ends. On the new blend's far contact, inside the
+            // earlier blend's end curve: the smaller radius second. On the
+            // earlier blend's far contact: the larger radius second, and the
+            // new blend goes on to meet that contact's face. On both: equal
+            // radii, at the earlier blend's end vertex.
+            if (!(std::fabs(q0[1] - vj) < 1e-9)) continue;
+            const bool far2 = std::fabs(q1[1] - (1.0 - vj)) < 1e-9;
+            const bool far1 = std::fabs(q1[3] - (1.0 - f1.theta_c)) < 1e-9;
+            if (!far1 && !far2) continue;
             if (!(q0[0] > sc0 && q0[0] < sc1)) continue;
             // The pieces, and the vertices: X joins them; T (touching) and F
             // (far end) are the chain's ends.
@@ -804,29 +903,11 @@ inline ProcFilletResult round_edge(const Brep& S, int edge, double r, const solv
             ce->p2 = pi;
             ce->a_end = (q0[0] - s2A) / ks;
             ce->b_end = rin;
-            const double s1B = q1[2], t1B = q1[3], s2B = q1[0];
-            // Split the earlier contact at A and its end curve at the far end.
+            const BEdge& xo = S.edges[static_cast<std::size_t>(eO)];
+            const int A0 = xo.v0 == en.V ? xo.v1 : xo.v0; // the end curve's far vertex
             const double tS = (s1A - bs->from) / (bs->to - bs->from);
-            double lo = 0.0, hi = 1.0, slo = 0.0, shi = 0.0, tmp;
-            other->on_proc(Fe.proc, 0.0, tmp, slo);
-            other->on_proc(Fe.proc, 1.0, tmp, shi);
-            if (!((slo - t1B) * (shi - t1B) < 0.0)) continue;
-            for (int it = 0; it < 80; ++it) {
-                const double m = 0.5 * (lo + hi);
-                double sm, tm;
-                other->on_proc(Fe.proc, m, sm, tm);
-                if ((tm - t1B) * (slo - t1B) > 0.0) lo = m;
-                else hi = m;
-            }
-            const double tO = 0.5 * (lo + hi);
-            (void)s1B;
-            // Vertices: side 0 is V, side 1 new.
-            b.vertices.push_back({});
-            en.B = static_cast<int>(b.vertices.size()) - 1;
-            const int vT = j == 0 ? en.V : en.B, vF = j == 0 ? en.B : en.V;
             BVertex vt, vf;
             vt.point = ce->point(0.0);
-            vf.point = te->point(1.0);
             {
                 solve::Pt4 x;
                 if (!blend->spine_at(s2A, x)) continue;
@@ -834,33 +915,189 @@ inline ProcFilletResult round_edge(const Brep& S, int edge, double r, const solv
                 const double u = sp_.alpha[0] * x[static_cast<std::size_t>(2 * j)] + sp_.beta[0];
                 const double v = sp_.alpha[1] * x[static_cast<std::size_t>(2 * j + 1)] + sp_.beta[1];
                 vt.charts.push_back({Csh[j], Interval(u), Interval(v)});
+            }
+            double s2F = q1[0];
+            // The smaller radius second: the end curve split where the mitre
+            // meets it.
+            double tO = -1.0;
+            if (far2 && !far1) {
+                const double t1B = q1[3];
+                double lo = 0.0, hi = 1.0, slo = 0.0, shi = 0.0, tmp;
+                other->on_proc(Fe.proc, 0.0, tmp, slo);
+                other->on_proc(Fe.proc, 1.0, tmp, shi);
+                if (!((slo - t1B) * (shi - t1B) < 0.0)) continue;
+                for (int it = 0; it < 80; ++it) {
+                    const double m = 0.5 * (lo + hi);
+                    double sm, tm;
+                    other->on_proc(Fe.proc, m, sm, tm);
+                    if ((tm - t1B) * (slo - t1B) > 0.0) lo = m;
+                    else hi = m;
+                }
+                tO = 0.5 * (lo + hi);
+                vf.point = te->point(1.0);
                 double uo, vo, duo, dvo;
                 if (other->on_carrier(CO, tO, uo, vo, duo, dvo)) vf.charts.push_back({CO, Interval(uo), Interval(vo)});
             }
+            // Equal radii: the mitre ends at the end curve's far vertex.
+            if (far1 && far2 && !(norm(te->point(1.0) - S.vertices[static_cast<std::size_t>(A0)].point) < 1e-9)) continue;
+            // The larger radius second: at P on the earlier blend's far
+            // contact (edge eT, on carrier CT), the new blend goes on along
+            // CT to Q on the edge eFT that CT shares with the end curve's
+            // face. The end curve and its far vertex go.
+            int eT = -1, eFT = -1, CT = -1, FT = -1;
+            std::shared_ptr<const BlendSide> bsT;
+            std::shared_ptr<const ProcEdge> te2;
+            double tPT = 0.0, uQ = 0.0, vQ = 0.0;
+            if (far1 && !far2) {
+                auto neighbour = [&](int f, int e, int V) {
+                    for (const BCoedge& c : S.faces[static_cast<std::size_t>(f)].loops[0]) {
+                        const BEdge& x = S.edges[static_cast<std::size_t>(c.edge)];
+                        if (c.edge != e && (x.v0 == V || x.v1 == V)) return c.edge;
+                    }
+                    return -1;
+                };
+                int FO = -1;
+                for (int f : faces_with(eO))
+                    if (f != FE) FO = f;
+                if (FO < 0) return "the earlier blend's end curve has no other face";
+                eT = neighbour(FE, eO, A0);
+                eFT = neighbour(FO, eO, A0);
+                if (eT < 0 || eFT < 0) return "the earlier blend's end vertex";
+                bsT = std::dynamic_pointer_cast<const BlendSide>(S.edges[static_cast<std::size_t>(eT)].proc);
+                if (!bsT || !bsT->contact || bsT->proc != Fe.proc) return "the earlier blend's far contact";
+                CT = bsT->support;
+                FT = face_of(CT);
+                const BEdge& xft = S.edges[static_cast<std::size_t>(eFT)];
+                if (FT < 0 || xft.proc || xft.arc || !side_on(xft, CT) || !side_on(xft, CO))
+                    return "the larger radius second needs a plain edge between the faces past the earlier blend";
+                tPT = (q1[2] - bsT->from) / (bsT->to - bsT->from);
+                if (!(tPT > 0.0 && tPT < 1.0)) continue;
+                auto plane = std::make_shared<geom::PatchCarrier>(S.carriers[static_cast<std::size_t>(CT)]);
+                const solve::SsiResult cp = solve::intersect_carriers(*R, *plane, opt);
+                if (!cp.complete || cp.curves.size() != 1) continue;
+                auto tc = std::make_shared<TracedEdge>();
+                tc->a = R;
+                tc->b = plane;
+                tc->proc[0] = pi;
+                tc->carrier[1] = CT;
+                tc->off[1] = rl;
+                tc->scl[1] = rh - rl;
+                tc->path.segs = cp.curves[0].segs;
+                tc->path.make_breaks(tc->sys(), *tc->a);
+                tc->path.find_kinks(tc->sys(), *tc->a, *tc->b);
+                solve::Pt4 c0, c1;
+                if (!tc->at(0.0, c0) || !tc->at(1.0, c1)) continue;
+                // Q: the end on the new blend's far contact; P where R's v
+                // is the mitre's.
+                const double tQ = std::fabs(c1[1] - (1.0 - vj)) < 1e-9 ? 1.0 : 0.0;
+                const solve::Pt4& cq = tQ == 1.0 ? c1 : c0;
+                if (!(std::fabs(cq[1] - (1.0 - vj)) < 1e-9)) continue;
+                const double vP = q1[1];
+                double lo = 0.0, hi = 1.0;
+                auto vof = [&](double t) {
+                    solve::Pt4 x;
+                    tc->at(t, x);
+                    return x[1] - vP;
+                };
+                const double flo = vof(lo);
+                if (!(flo * vof(hi) < 0.0)) continue;
+                for (int it = 0; it < 80; ++it) {
+                    const double m = 0.5 * (lo + hi);
+                    if (vof(m) * flo > 0.0) lo = m;
+                    else hi = m;
+                }
+                const double tP = 0.5 * (lo + hi);
+                if (!(norm(tc->point(tP) - te->point(1.0)) < 1e-9)) continue;
+                te2 = tc->part(tP, tQ);
+                double du, dv, sq, tq;
+                if (!te2->on_carrier(CT, 1.0, uQ, vQ, du, dv) || !te2->on_proc(pi, 1.0, sq, tq)) continue;
+                s2F = sq;
+                vf.point = te2->point(1.0);
+            }
+            // Commit: vertices. Side 0 of the new blend keeps V.
+            int vT, vF;
+            const bool equal = far1 && far2;
+            auto push_vertex = [&]() {
+                b.vertices.push_back({});
+                return static_cast<int>(b.vertices.size()) - 1;
+            };
+            if (j == 0) {
+                vT = en.V;
+                vF = equal ? A0 : push_vertex();
+                en.B = vF;
+            } else {
+                vF = en.V;
+                vT = push_vertex();
+                en.B = vT;
+            }
             b.vertices[static_cast<std::size_t>(vT)] = vt;
-            b.vertices[static_cast<std::size_t>(vF)] = vf;
+            if (!equal) b.vertices[static_cast<std::size_t>(vF)] = vf;
             BEdge& ns = b.edges[static_cast<std::size_t>(eS)];
             if (ns.v0 == en.V) { ns.proc = bs->part(tS, 1.0); ns.v0 = vT; }
             else { ns.proc = bs->part(0.0, tS); ns.v1 = vT; }
-            BEdge& no = b.edges[static_cast<std::size_t>(eO)];
-            if (no.v0 == en.V) { no.proc = other->part(tO, 1.0); no.v0 = vF; }
-            else { no.proc = other->part(0.0, tO); no.v1 = vF; }
-            if (!ns.proc || !no.proc) return "an edge at the end cannot be split";
+            if (!ns.proc) return "an edge at the end cannot be split";
+            if (tO >= 0.0) {
+                BEdge& no = b.edges[static_cast<std::size_t>(eO)];
+                if (no.v0 == en.V) { no.proc = other->part(tO, 1.0); no.v0 = vF; }
+                else { no.proc = other->part(0.0, tO); no.v1 = vF; }
+                if (!no.proc) return "an edge at the end cannot be split";
+            } else en.drop = eO;
             BVertex vx;
             vx.point = te->point(0.0);
             b.vertices.push_back(vx);
             const int vX = static_cast<int>(b.vertices.size()) - 1;
+            const int vP = te2 ? push_vertex() : vF;
             BEdge e1, e2;
             e1.v0 = vT; e1.v1 = vX; e1.proc = ce;
-            e2.v0 = vX; e2.v1 = vF; e2.proc = te;
+            e2.v0 = vX; e2.v1 = vP; e2.proc = te;
             b.edges.push_back(e1);
             const int i1 = static_cast<int>(b.edges.size()) - 1;
             b.edges.push_back(e2);
             const int i2 = static_cast<int>(b.edges.size()) - 1;
-            const std::vector<BCoedge> t2f = {{i1, false}, {i2, false}};
+            std::vector<BCoedge> t2f = {{i1, false}, {i2, false}};
+            en.fe_chain = t2f;
+            if (te2) {
+                // P on the earlier far contact; the contact, and the edge
+                // past it on CT, shortened; the new piece in CT's face.
+                BVertex vp;
+                vp.point = te->point(1.0);
+                double up, vp_, dup, dvp;
+                if (bsT->on_carrier(CT, tPT, up, vp_, dup, dvp)) vp.charts.push_back({CT, Interval(up), Interval(vp_)});
+                b.vertices[static_cast<std::size_t>(vP)] = vp;
+                BEdge& nt = b.edges[static_cast<std::size_t>(eT)];
+                if (nt.v0 == A0) { nt.proc = bsT->part(tPT, 1.0); nt.v0 = vP; }
+                else { nt.proc = bsT->part(0.0, tPT); nt.v1 = vP; }
+                if (!split(eFT, A0, CT, uQ, vQ, vF, CO)) return "the new blend meets the edge past the earlier blend outside it";
+                BEdge e3;
+                e3.v0 = vP; e3.v1 = vF; e3.proc = te2;
+                b.edges.push_back(e3);
+                const int i3 = static_cast<int>(b.edges.size()) - 1;
+                t2f.push_back({i3, false});
+                std::vector<BCoedge>& LT = b.faces[static_cast<std::size_t>(FT)].loops[0];
+                const int n = static_cast<int>(LT.size());
+                int iT = -1, iF = -1;
+                for (int i = 0; i < n; ++i) {
+                    if (LT[static_cast<std::size_t>(i)].edge == eT) iT = i;
+                    if (LT[static_cast<std::size_t>(i)].edge == eFT) iF = i;
+                }
+                if (iT < 0 || iF < 0) return "the face past the earlier blend does not hold both edges";
+                if ((iT + 1) % n == iF) LT.insert(LT.begin() + iT + 1, BCoedge{i3, false});
+                else if ((iF + 1) % n == iT) LT.insert(LT.begin() + iF + 1, BCoedge{i3, true});
+                else return "the face past the earlier blend: its edges at the vertex are not consecutive";
+            }
+            if (equal && j == 1) {
+                // V takes the far vertex's place.
+                b.vertices[static_cast<std::size_t>(en.V)] = S.vertices[static_cast<std::size_t>(A0)];
+                for (BEdge& x : b.edges) {
+                    if (x.v0 == A0) x.v0 = en.V;
+                    if (x.v1 == A0) x.v1 = en.V;
+                }
+            }
+            if (!te2) en.fe_chain = t2f;
             en.chain = j == 0 ? t2f : reversed_chain(t2f);
-            en.sA = j == 0 ? s2A : s2B;
-            en.sB = j == 0 ? s2B : s2A;
+            if (j == 1) en.fe_chain = reversed_chain(en.fe_chain);
+            en.sA = j == 0 ? s2A : s2F;
+            en.sB = j == 0 ? s2F : s2A;
             return nullptr;
         }
         return "the mitre at the end could not be proven";
@@ -917,24 +1154,6 @@ inline ProcFilletResult round_edge(const Brep& S, int edge, double r, const solv
         if (!blend->spine_at(sigma, x)) return false;
         u = s.alpha[0] * x[static_cast<std::size_t>(coord)] + s.beta[0];
         v = s.alpha[1] * x[static_cast<std::size_t>(coord + 1)] + s.beta[1];
-        return true;
-    };
-    // Split side edge e (one end at V) at the contact, which is at (u, v) on
-    // carrier c; the end at V becomes vertex W.
-    auto split = [&](int e, int V, int c, double u, double v, int W, int CE) {
-        BEdge& x = b.edges[static_cast<std::size_t>(e)];
-        const BEdge::SideRef* ref = side_on(x, c);
-        const double sp_ = (ref->side == 0 || ref->side == 2) ? u : v;
-        const double t = ref->reversed ? 1.0 - sp_ : sp_;
-        if (!(t > std::min(x.t0.hi, x.t1.hi) && t < std::max(x.t0.lo, x.t1.lo))) return false; // strictly inside
-        if (x.v0 == V) { x.v0 = W; x.t0 = Interval(t); }
-        else { x.v1 = W; x.t1 = Interval(t); }
-        const BEdge::SideRef* re = side_on(x, CE);
-        double ue, ve;
-        side_uv(re->side, re->reversed ? 1.0 - t : t, ue, ve);
-        BVertex& w = b.vertices[static_cast<std::size_t>(W)];
-        w.charts.push_back({c, Interval(u), Interval(v)});
-        w.charts.push_back({CE, Interval(ue), Interval(ve)});
         return true;
     };
     for (End& en : end) {
@@ -1018,11 +1237,17 @@ inline ProcFilletResult round_edge(const Brep& S, int edge, double r, const solv
             if (L[static_cast<std::size_t>(i)].edge == en.eB) iB = i;
         }
         if (iA < 0 || iB < 0) return fail("the end face does not hold both edges at the vertex");
-        if ((iA + 1) % n == iB) L.insert(L.begin() + iA + 1, en.chain.begin(), en.chain.end());
+        const std::vector<BCoedge>& ch = en.fe_chain.empty() ? en.chain : en.fe_chain;
+        if ((iA + 1) % n == iB) L.insert(L.begin() + iA + 1, ch.begin(), ch.end());
         else if ((iB + 1) % n == iA) {
-            const std::vector<BCoedge> r = reversed_chain(en.chain);
+            const std::vector<BCoedge> r = reversed_chain(ch);
             L.insert(L.begin() + iB + 1, r.begin(), r.end());
         } else return fail("the end face's edges at the vertex are not consecutive");
+        if (en.drop >= 0)
+            for (BFace& F : b.faces)
+                for (auto& lp : F.loops)
+                    lp.erase(std::remove_if(lp.begin(), lp.end(), [&](const BCoedge& c) { return c.edge == en.drop; }),
+                             lp.end());
     }
     // The blend: counter-clockwise in (sigma, theta).
     {
@@ -1061,6 +1286,7 @@ inline ProcFilletResult round_edge(const Brep& S, int edge, double r, const solv
                 const int xe = L[i].reversed ? x.v0 : x.v1, ys = L[(i + 1) % L.size()].reversed ? y.v1 : y.v0;
                 if (xe != ys) return fail("internal: a loop does not close");
             }
+    drop_unused(b);
     res.support[0] = CA;
     res.support[1] = CB;
     for (int k = 0; k < 2; ++k) {
