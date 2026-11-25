@@ -40,6 +40,7 @@
 #include <string>
 #include <vector>
 
+#include <akernel/num/detmath.hpp>
 #include <akernel/op/brep.hpp>
 #include <akernel/op/proc_edge.hpp>
 #include <akernel/solve/blend_corner.hpp>
@@ -169,10 +170,10 @@ inline bool blend_coords(const solve::BlendCarrier& b, const Vec3d& P, double sg
     const Vec3d a{S.cp[0].x / S.cp[0].w, S.cp[0].y / S.cp[0].w, S.cp[0].z / S.cp[0].w};
     const Vec3d e{S.cp[2].x / S.cp[2].w, S.cp[2].y / S.cp[2].w, S.cp[2].z / S.cp[2].w};
     const Vec3d ua = a - S.centre, ue = e - S.centre, up = P - S.centre;
-    auto ang = [](const Vec3d& x, const Vec3d& y) { return std::atan2(norm(cross(x, y)), dot(x, y)); };
+    auto ang = [](const Vec3d& x, const Vec3d& y) { return num::det::atan2(norm(cross(x, y)), dot(x, y)); };
     const double phi = ang(ua, ue), psi = ang(ua, up);
     // theta of the angle psi on a rational quadratic arc of angle phi.
-    const double tp = std::tan(0.5 * psi), tq = std::tan(0.5 * (phi - psi));
+    const double tp = num::det::tan(0.5 * psi), tq = num::det::tan(0.5 * (phi - psi));
     double th = tp / (tp + tq);
     for (int it = 0; it < 30; ++it) {
         Vec3d Q, Qs, Qt;
@@ -744,9 +745,9 @@ inline ProcFilletResult round_edge(const Brep& S, int edge, double r, const solv
         return x.on[0].carrier == c ? x.on[1].carrier : x.on[0].carrier;
     };
     auto reversed_chain = [](const std::vector<BCoedge>& c) {
-        std::vector<BCoedge> r(c.rbegin(), c.rend());
-        for (BCoedge& x : r) x.reversed = !x.reversed;
-        return r;
+        std::vector<BCoedge> out(c.rbegin(), c.rend());
+        for (BCoedge& x : out) x.reversed = !x.reversed;
+        return out;
     };
     // Split side edge e (one end at V) at the contact, which is at (u, v) on
     // carrier c; the end at V becomes vertex W.
@@ -825,7 +826,7 @@ inline ProcFilletResult round_edge(const Brep& S, int edge, double r, const solv
         for (int i = 0; i <= 400; ++i) {
             double w2[2];
             if (!solve::corner_detail::face_w(f2, i / 400.0, w2)) continue;
-            const double d = std::hypot(w2[0] - w1[0], w2[1] - w1[1]);
+            const double d = std::sqrt((w2[0] - w1[0]) * (w2[0] - w1[0]) + (w2[1] - w1[1]) * (w2[1] - w1[1]));
             if (d < best) { best = d; g2 = i / 400.0; }
         }
         const auto A = solve::corner_point(f1, f2, g1, g2);
@@ -1240,8 +1241,8 @@ inline ProcFilletResult round_edge(const Brep& S, int edge, double r, const solv
         const std::vector<BCoedge>& ch = en.fe_chain.empty() ? en.chain : en.fe_chain;
         if ((iA + 1) % n == iB) L.insert(L.begin() + iA + 1, ch.begin(), ch.end());
         else if ((iB + 1) % n == iA) {
-            const std::vector<BCoedge> r = reversed_chain(ch);
-            L.insert(L.begin() + iB + 1, r.begin(), r.end());
+            const std::vector<BCoedge> rc = reversed_chain(ch);
+            L.insert(L.begin() + iB + 1, rc.begin(), rc.end());
         } else return fail("the end face's edges at the vertex are not consecutive");
         if (en.drop >= 0)
             for (BFace& F : b.faces)
@@ -1276,6 +1277,63 @@ inline ProcFilletResult round_edge(const Brep& S, int edge, double r, const solv
         oa.eval(x[0], x[1], c, cu, cv);
         f.flipped = dot(cross(Qs, Qt), Q - c) < 0.0;
         b.faces.push_back(std::move(f));
+    }
+    // Clearance: the blend, over its sigma span, meets no face of the solid
+    // other than those at its own vertices (the supports, the end faces, and
+    // at a corner the faces at the earlier blend's end vertex). Faces whose
+    // enclosure misses the blend's are skipped; the rest must have no
+    // intersection curve with it, with a completeness proof. Conservative:
+    // a face is refused when its carrier, not only its trimmed region, meets
+    // the blend.
+    {
+        const int nb = static_cast<int>(b.faces.size()) - 1;
+        std::vector<char> at_blend(b.vertices.size(), 0);
+        for (const BCoedge& c : b.faces[static_cast<std::size_t>(nb)].loops[0]) {
+            at_blend[static_cast<std::size_t>(b.edges[static_cast<std::size_t>(c.edge)].v0)] = 1;
+            at_blend[static_cast<std::size_t>(b.edges[static_cast<std::size_t>(c.edge)].v1)] = 1;
+        }
+        double smin = 1e300, smax = -1e300;
+        for (const End& en : end) {
+            smin = std::min({smin, en.sA, en.sB});
+            smax = std::max({smax, en.sA, en.sB});
+        }
+        auto boxes = [](const geom::Carrier& C, double u0, double u1, int nu, int nv, std::vector<geom::IVec3>& out) {
+            for (int i = 0; i < nu; ++i)
+                for (int k = 0; k < nv; ++k) {
+                    geom::IVec3 P, Pu, Pv;
+                    if (!C.jet1_over(u0 + (u1 - u0) * i / nu, u0 + (u1 - u0) * (i + 1) / nu, static_cast<double>(k) / nv,
+                                     static_cast<double>(k + 1) / nv, P, Pu, Pv))
+                        return false;
+                    out.push_back(P);
+                }
+            return true;
+        };
+        std::vector<geom::IVec3> bb;
+        const bool bb_ok = boxes(*blend, smin, smax, 16, 2, bb);
+        auto rb = std::make_shared<solve::RectCarrier>(blend, smin, smax, 0.0, 1.0);
+        for (int f = 0; f < nb; ++f) {
+            const BFace& F = b.faces[static_cast<std::size_t>(f)];
+            bool touches = false;
+            for (const auto& L : F.loops)
+                for (const BCoedge& c : L) {
+                    const BEdge& x = b.edges[static_cast<std::size_t>(c.edge)];
+                    touches = touches || at_blend[static_cast<std::size_t>(x.v0)] || at_blend[static_cast<std::size_t>(x.v1)];
+                }
+            if (touches) continue;
+            std::shared_ptr<const geom::Carrier> surf;
+            if (F.proc >= 0) surf = b.procs[static_cast<std::size_t>(F.proc)];
+            else surf = std::make_shared<geom::PatchCarrier>(b.carriers[static_cast<std::size_t>(F.carrier)]);
+            std::vector<geom::IVec3> fb;
+            if (bb_ok && boxes(*surf, 0.0, 1.0, 4, 4, fb)) {
+                bool near = false;
+                auto meet = [](const num::Interval& x, const num::Interval& y) { return x.lo <= y.hi && y.lo <= x.hi; };
+                for (const geom::IVec3& p : bb)
+                    for (const geom::IVec3& q : fb) near = near || (meet(p.x, q.x) && meet(p.y, q.y) && meet(p.z, q.z));
+                if (!near) continue;
+            }
+            const solve::SsiResult cr = solve::intersect_carriers(*rb, *surf, opt);
+            if (!cr.complete || !cr.curves.empty()) return fail("the ball meets another face of the solid: the radius is too large here");
+        }
     }
     // Every loop closes: each coedge ends where the next begins.
     for (const BFace& F : b.faces)

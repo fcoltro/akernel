@@ -4,6 +4,7 @@
 // a closed shell that meshes watertight; volumes are checked against closed
 // forms on a box, against round_block_edge on the same freeform edge,
 // against a mirrored block, and against translation.
+#include <akernel/num/detmath.hpp>
 #include <akernel/op/boolean.hpp>
 #include <akernel/op/proc_fillet.hpp>
 #include <akernel/op/tessellate.hpp>
@@ -12,6 +13,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <numbers>
 
 #include "check.hpp"
 
@@ -87,7 +89,7 @@ double rounded(const op::Brep& block, int c0, int c1, double r, const char* name
     AK_CHECK(res.solid.has_value());
     if (!res.solid) return std::nan("");
     const auto rep = op::audit(*res.solid);
-    AK_CHECK(rep.closed() && rep.euler == 2);
+    AK_CHECK(rep.closed() && rep.euler == 2 * static_cast<int>(rep.shells.size()));
     const double v = op::volume(*res.solid);
     std::printf("%s: %zu faces, %zu edges, %zu vertices, spine %zu segments, %.2f s\n", name, res.solid->faces.size(),
                 res.solid->edges.size(), res.solid->vertices.size(), res.blend->segments(), seconds_since(t0));
@@ -110,11 +112,39 @@ double rounded(const op::PolyPatchD& top, int c0, int c1, double r, const char* 
     return rounded(op::to_brep(op::freeform_block(top)), c0, c1, r, name);
 }
 
+/// The solid b with the box c as a cavity: c's faces appended, reversed.
+op::Brep with_cavity(op::Brep b, const op::Brep& c) {
+    const int nc = static_cast<int>(b.carriers.size()), ne = static_cast<int>(b.edges.size()),
+              nv = static_cast<int>(b.vertices.size());
+    for (const op::PolyPatchD& x : c.carriers) b.carriers.push_back(x);
+    for (op::BVertex v : c.vertices) {
+        for (op::Chart& ch : v.charts) ch.carrier += nc;
+        b.vertices.push_back(v);
+    }
+    for (op::BEdge e : c.edges) {
+        e.v0 += nv;
+        e.v1 += nv;
+        for (auto& ref : e.on)
+            if (ref.carrier >= 0) ref.carrier += nc;
+        for (int& k : e.carrier)
+            if (k >= 0) k += nc;
+        b.edges.push_back(e);
+    }
+    for (op::BFace f : c.faces) {
+        f.carrier += nc;
+        f.flipped = !f.flipped;
+        for (auto& L : f.loops)
+            for (op::BCoedge& ce : L) ce.edge += ne;
+        b.faces.push_back(f);
+    }
+    return b;
+}
+
 } // namespace
 
 int main() {
     const double a = 1.0, L = 2.0, h = 0.75, r = 0.25, c = 0.5;
-    const double q = (1 - M_PI / 4) * r * r; // cross-section removed by a quarter-round
+    const double q = (1 - std::numbers::pi / 4) * r * r; // cross-section removed by a quarter-round
 
     // A box: a vertical edge, a top edge along x, a top edge along y.
     {
@@ -203,11 +233,11 @@ int main() {
             double I = 0.0;
             const int n = 400;
             for (int k = 0; k < n; ++k) {
-                const double t0 = M_PI / 2 * k / n, t1 = M_PI / 2 * (k + 1) / n;
+                const double t0 = std::numbers::pi / 2 * k / n, t1 = std::numbers::pi / 2 * (k + 1) / n;
                 for (int i = 0; i < 4; ++i)
                     for (int sg = -1; sg <= 1; sg += 2) {
                         const double t = 0.5 * (t0 + t1) + 0.5 * sg * gx[i] * (t1 - t0);
-                        I += 0.5 * (t1 - t0) * gw[i] * f(a - rm * std::sin(t) * std::sin(t)) * 2 * rm * std::sin(t) * std::cos(t);
+                        I += 0.5 * (t1 - t0) * gw[i] * f(a - rm * num::det::sin(t) * num::det::sin(t)) * 2 * rm * num::det::sin(t) * num::det::cos(t);
                     }
             }
             return I;
@@ -220,7 +250,7 @@ int main() {
             if (!first.solid) return;
             char name[96];
             std::snprintf(name, sizeof name, "box corner, %s, r1 = %.2f, r2 = %.2f", what, r1, r2);
-            const double V = a * L * h, q1 = (1 - M_PI / 4) * r1 * r1, q2 = (1 - M_PI / 4) * r2 * r2;
+            const double V = a * L * h, q1 = (1 - std::numbers::pi / 4) * r1 * r1, q2 = (1 - std::numbers::pi / 4) * r2 * r2;
             const double exact = V - q1 * len1 - q2 * len2 + overlap(r1, r2);
             const double v = rounded(*first.solid, d0, d1, r2, name);
             std::printf("  volume %.15f, exact %.15f, error %.2e\n", v, exact, v - exact);
@@ -250,6 +280,24 @@ int main() {
             std::printf("  volume %.15f, moved %.15f, difference %.2e\n", v, w, v - w);
             AK_CHECK_NEAR(v, w, 1e-10);
         }
+    }
+    // Clearance: a small cavity inside the corner region of the edge x = a
+    // on top. With r = 0.25 the ball would cut it: refused. With r = 0.1 the
+    // blend passes it (their carriers proven apart) and the volume is the
+    // closed form less the cavity.
+    {
+        const op::Brep block = with_cavity(op::to_brep(op::freeform_block(top_patch(a, L, h, 0.0))),
+                                           op::to_brep(op::make_box({0.9, 0.9, 0.6}, {0.97, 1.1, 0.7})));
+        const auto rep = op::audit(block);
+        AK_CHECK(rep.closed() && rep.euler == 4);
+        const op::ProcFilletResult big = op::round_edge(block, edge_between(block, 2, 3), r);
+        std::printf("cavity in the corner region, r = 0.25: %s\n", big.solid ? "built" : big.error.c_str());
+        AK_CHECK(!big.solid);
+        const double r0 = 0.1, cav = 0.07 * 0.2 * 0.1;
+        const double v = rounded(block, 2, 3, r0, "cavity beside the blend, r = 0.10");
+        const double exact = a * L * h - cav - (1 - std::numbers::pi / 4) * r0 * r0 * L;
+        std::printf("  volume %.15f, closed form %.15f, error %.2e\n", v, exact, v - exact);
+        AK_CHECK_NEAR(v, exact, 1e-10);
     }
     // Refusals: a concave edge does not exist on a block, so a radius too
     // large for the face.

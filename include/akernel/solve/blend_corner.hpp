@@ -26,10 +26,12 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <numbers>
 #include <optional>
 #include <vector>
 
 #include <akernel/solve/carrier_ssi.hpp>
+#include <akernel/num/detmath.hpp>
 
 namespace ak::solve {
 
@@ -283,8 +285,8 @@ inline void chart_ddir(int chart, const Interval& tau, Interval& ea, Interval& e
 }
 /// The angle of chart direction tau (doubles, monotone in tau).
 inline double chart_angle(int chart, double tau) {
-    const double a = 2.0 * std::atan(tau);
-    return chart == 0 ? a : M_PI - a;
+    const double a = 2.0 * num::det::atan(tau);
+    return chart == 0 ? a : std::numbers::pi - a;
 }
 
 } // namespace corner_detail
