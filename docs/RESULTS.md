@@ -1558,6 +1558,30 @@ Three kernel changes came out of the corner work:
 
 **Clearance (2026-11-25).** `round_edge` now proves that the ball stays clear of the rest of the solid. Over the blend's sigma span, the blend must meet no face except those at its own vertices (the supports, the end faces, and at a corner the faces around the earlier fillet's end vertex). Faces whose interval enclosures miss the blend's (16 × 2 pieces against 4 × 4) are skipped. For the rest, `intersect_carriers` must prove that there is no curve. The check is conservative: it refuses a face whose carrier meets the blend outside the face's trimmed region. Most oversized radii are already refused earlier, because a contact runs past the edge it splits. The new check catches what those checks cannot see. The test puts a small box-shaped cavity, 0.07 × 0.2 × 0.1, inside the corner region of the top edge. With r = 0.25 the ball would cut the cavity, and the fillet is refused. With r = 0.1 the blend passes beside it: the carriers are proven apart, and the volume matches the closed form less the cavity to 2e-12. The check adds about 25 s to round_edge_test, now about 175 s.
 
+### Fillet corners: three fillets at one corner
+
+From `tests/op/round_edge_test.cpp` (2026-11-25). The box's top edge at x = a is rounded with r1 = 0.25, the vertical edge at x = a, y = 0 with r2 = 0.15, then the top edge at y = 0 with r3. The third fillet's end vertex lies on the first fillet. Its far contact, on the front, crosses the second fillet's contact at a second touching point B. The third fillet then runs:
+
+- from A, where it touches the first fillet on the top,
+- along its mitre with the first fillet to T, where all three fillets meet,
+- along its mitre with the second fillet to B.
+
+Both touching points are proven as before (Krawczyk, then the polar blow-up), each with the largest rectangle that works at it. Each rectangle is proven free of the other earlier fillet. The two mitres are traced on the region between the rectangles, each with one curve and a completeness proof. T is found three ways: on each new mitre where it crosses the other earlier fillet, and on the first two fillets' mitre where it crosses the new one. A crossing counts only inside that fillet's arc (a wedge test), because the full cylinder is crossed twice. The three positions of T must agree to 1e-9. The first two fillets' mitre is cut at T, the second fillet's contact at B, and what is left of the first fillet's end curve is removed. With r3 = 0.01, small enough that the far contact meets that end curve, the two-fillet path applies.
+
+The reference volume is the box less the union of the three quarter-round regions, by inclusion and exclusion. The pairwise overlaps are integrated as before. The triple overlap is the integral, over the second region's cross-section, of the smaller of the other two regions' depths, split at its kinks.
+
+| r3 | Faces / edges / vertices | Volume error |
+|---|---|---|
+| 0.01 | 9 / 23 / 16 | 1.7e-12 |
+| 0.05 | 9 / 24 / 17 | 6.6e-13 |
+| 0.10 | 9 / 24 / 17 | 1.2e-12 |
+| 0.20 | 9 / 24 / 17 | 1.2e-13 |
+
+All are closed, with Euler characteristic 2, and mesh watertight. Each takes 8 to 14 s. Still refused:
+
+- three equal radii, where the third edge's end vertex has four faces;
+- some orders, such as the front top edge with r = 0.1 and then the vertical edge with r = 0.15. There the polar blow-up at A does not prove the two branches for rho ≥ 5e-4: Krawczyk stalls, though no enclosure straddles zero. At rho = 2.5e-4 the tracer cannot complete next to the small rectangle.
+
 ### Plane cuts of solids with procedural faces (first step of Booleans on them)
 
 From `tests/op/plane_cut_test.cpp` (28 checks, about 1 minute). `op/plane_cut.hpp` cuts any solid with side and procedural edges by a plane, keeping n · x ≤ d. Every face the plane meets is intersected with a planar cap patch by `intersect_carriers` (certified, with a completeness proof). Each piece of section curve inside a face becomes a `TracedEdge` between the face's surface and the cap, read by both in their own parameters. The face keeps its region on the kept side, found by walking its loop and turning onto the section edge at each crossing. The cap's loops are the section edges chained at the crossings; outer loops are counter-clockwise and holes go into the outer loop that contains them.

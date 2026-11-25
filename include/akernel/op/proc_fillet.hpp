@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -187,6 +188,19 @@ inline bool blend_coords(const solve::BlendCarrier& b, const Vec3d& P, double sg
     s = sg;
     t = th;
     return std::isfinite(s) && std::isfinite(t);
+}
+
+/// Whether P lies in the wedge of the blend's section at its spine foot:
+/// between the rays from the centre through the arc's two ends.
+inline bool in_wedge(const solve::BlendCarrier& b, const Vec3d& P, double sg) {
+    sg = spine_foot(b, P, sg);
+    const auto S = b.section(sg);
+    if (!S.ok) return false;
+    const Vec3d a{S.cp[0].x / S.cp[0].w, S.cp[0].y / S.cp[0].w, S.cp[0].z / S.cp[0].w};
+    const Vec3d e{S.cp[2].x / S.cp[2].w, S.cp[2].y / S.cp[2].w, S.cp[2].z / S.cp[2].w};
+    const Vec3d ua = a - S.centre, ue = e - S.centre, up = P - S.centre;
+    auto ang = [](const Vec3d& x, const Vec3d& y) { return num::det::atan2(norm(cross(x, y)), dot(x, y)); };
+    return ang(ua, up) + ang(up, ue) < ang(ua, ue) + 1e-9;
 }
 
 /// The piece of a mitre curve next to the touching point A of two blends
@@ -637,7 +651,13 @@ inline ProcFilletResult round_block_edge(const PolyPatchD& top, double r, const 
 /// earlier blend's far contact (split there); the new blend then meets that
 /// contact's face along a traced curve from P to Q on the face's edge with
 /// the end curve's face (split there), and the end curve and its far vertex
-/// go. The earlier contact on the shared face is split at A.
+/// go. The earlier contact on the shared face is split at A. Three blends:
+/// when the earlier end curve was itself cut short by a second earlier
+/// blend b2, and the new blend's far contact crosses b2's contact at a
+/// second touching point B, the new blend runs from A along its mitre with
+/// the first earlier blend to the point T where all three meet, then along
+/// its mitre with b2 to B (both touching points proven, both mitres traced
+/// on the region between their rectangles).
 inline ProcFilletResult round_edge(const Brep& S, int edge, double r, const solve::SsiOptions& opt = {}) {
     using namespace proc_fillet_detail;
     ProcFilletResult res;
@@ -834,6 +854,299 @@ inline ProcFilletResult round_edge(const Brep& S, int edge, double r, const solv
         const double s1A = num::mid(A->s1), s2A = num::mid(A->s2);
         if (!(s1A > std::min(bs->from, bs->to) && s1A < std::max(bs->from, bs->to)))
             return "the new contact meets the earlier one outside its edge";
+        // A rectangle around a touching point P of an earlier blend (bp) and
+        // the new one: the local branch on the earlier blend, the
+        // rectangle's size, and the strips beside it proven free of bp.
+        struct Rect {
+            solve::CornerLocal L;
+            double rin = 0.0, sc0 = 0.0, sc1 = 0.0, tb = 0.0;
+        };
+        auto rect_at = [&](const solve::ContactOnFace& ca, const solve::ContactOnFace& cb, const solve::CornerPoint& P,
+                           const geom::Carrier& bp, double rho) -> std::optional<Rect> {
+            const auto Lp = solve::corner_local(ca, cb, P, rho);
+            if (!Lp) return std::nullopt;
+            const solve::CornerBranch* br = nullptr;
+            int n_on = 0;
+            for (const auto& x : Lp->branches)
+                if (x.on_first) { br = &x; ++n_on; }
+            if (n_on != 1) return std::nullopt;
+            const double tau = num::mid(br->m);
+            const double da = br->chart == 0 ? 1.0 - tau * tau : tau * tau - 1.0, db = 2.0 * tau;
+            if (!(db > 0.0)) return std::nullopt;
+            const double slope = std::max(std::fabs(da / db), 1e-3);
+            const double w = 0.95 * rho / std::sqrt(1.0 + 0.81 / (slope * slope));
+            Rect q;
+            q.L = *Lp;
+            q.rin = 0.9 * w / slope;
+            if (!(q.rin > 1e-5 * rho)) return std::nullopt;
+            const double sP = num::mid(P.s2);
+            q.sc0 = sP - Lp->k_s * w;
+            q.sc1 = sP + Lp->k_s * w;
+            if (q.sc0 > q.sc1) std::swap(q.sc0, q.sc1);
+            if (!(q.sc0 > 0.0 && q.sc1 < 1.0)) return std::nullopt;
+            q.tb = cb.theta_c + Lp->k_t * q.rin;
+            const double sl = std::min(cb.theta_c, q.tb), sh = std::max(cb.theta_c, q.tb);
+            const solve::RectCarrier left(blend, 0.0, q.sc0, sl, sh), right(blend, q.sc1, 1.0, sl, sh);
+            const solve::SsiResult cl = solve::intersect_carriers(left, bp, opt);
+            const solve::SsiResult cr = solve::intersect_carriers(right, bp, opt);
+            if (!cl.complete || !cl.curves.empty() || !cr.complete || !cr.curves.empty()) return std::nullopt;
+            return q;
+        };
+        // Three blends at the corner: the earlier end curve (eO) was cut
+        // short by a second earlier blend b2, whose mitre with b1 (eM) and
+        // contact on CO (eC2) meet at eO's far vertex W. When the new
+        // blend's far contact crosses b2's contact on CO at B, the new blend
+        // runs A -> mitre with b1 -> T -> mitre with b2 -> B, T where all
+        // three blends meet; eO, W and the pieces of eM and eC2 past T and B
+        // go.
+        {
+            const BEdge& xo = S.edges[static_cast<std::size_t>(eO)];
+            const int W = xo.v0 == en.V ? xo.v1 : xo.v0;
+            auto neighbour = [&](int f, int e, int Vx) {
+                for (const BCoedge& c : S.faces[static_cast<std::size_t>(f)].loops[0]) {
+                    const BEdge& x = S.edges[static_cast<std::size_t>(c.edge)];
+                    if (c.edge != e && (x.v0 == Vx || x.v1 == Vx)) return c.edge;
+                }
+                return -1;
+            };
+            int FO = -1;
+            for (int f : faces_with(eO))
+                if (f != FE) FO = f;
+            const int eM = FO >= 0 ? neighbour(FE, eO, W) : -1, eC2 = FO >= 0 ? neighbour(FO, eO, W) : -1;
+            int FE2 = -1;
+            if (eM >= 0)
+                for (int f : faces_with(eM))
+                    if (f != FE) FE2 = f;
+            std::shared_ptr<const solve::BlendCarrier> b2;
+            std::shared_ptr<const BlendSide> bc;
+            if (FE2 >= 0 && eC2 >= 0 && S.faces[static_cast<std::size_t>(FE2)].proc >= 0) {
+                const int p2 = S.faces[static_cast<std::size_t>(FE2)].proc;
+                b2 = std::dynamic_pointer_cast<const solve::BlendCarrier>(S.procs[static_cast<std::size_t>(p2)]);
+                bc = std::dynamic_pointer_cast<const BlendSide>(S.edges[static_cast<std::size_t>(eC2)].proc);
+                if (bc && !(bc->contact && bc->proc == p2 && bc->support == CO)) bc = nullptr;
+            }
+            std::optional<solve::CornerPoint> Bp;
+            solve::ContactOnFace k1, k2;
+            if (b2 && bc) {
+                k1.blend = b2.get();
+                k1.coord = bc->coord;
+                k1.theta_c = bc->fixed;
+                for (int i = 0; i < 2; ++i) {
+                    k1.alpha[i] = 1.0 / bc->scale[i];
+                    k1.beta[i] = -bc->shift[i] / bc->scale[i];
+                }
+                k2.blend = blend.get();
+                k2.coord = 2 * (1 - j);
+                k2.theta_c = 1 - j;
+                for (int i = 0; i < 2; ++i) {
+                    k2.alpha[i] = support_of(1 - j).alpha[i];
+                    k2.beta[i] = support_of(1 - j).beta[i];
+                }
+                const BEdge& xc = S.edges[static_cast<std::size_t>(eC2)];
+                const double h1 = xc.v0 == W ? bc->from : bc->to;
+                double wc[2], h2 = 0.5, bst = 1e300;
+                if (solve::corner_detail::face_w(k1, h1, wc)) {
+                    for (int i = 0; i <= 400; ++i) {
+                        double w2[2];
+                        if (!solve::corner_detail::face_w(k2, i / 400.0, w2)) continue;
+                        const double d = std::sqrt((w2[0] - wc[0]) * (w2[0] - wc[0]) + (w2[1] - wc[1]) * (w2[1] - wc[1]));
+                        if (d < bst) { bst = d; h2 = i / 400.0; }
+                    }
+                    Bp = solve::corner_point(k1, k2, h1, h2);
+                }
+                if (Bp && !(num::mid(Bp->s1) > std::min(bc->from, bc->to) && num::mid(Bp->s1) < std::max(bc->from, bc->to)))
+                    Bp.reset();
+            }
+            if (Bp) {
+                const int p2 = S.faces[static_cast<std::size_t>(FE2)].proc;
+                const double s1B = num::mid(Bp->s1), s3B = num::mid(Bp->s2);
+                // h_b(P) = distance to b's spine - its radius.
+                auto hdist = [&](const solve::BlendCarrier& bb, const Vec3d& P, double& sg) {
+                    sg = spine_foot(bb, P, sg);
+                    return norm(P - bb.section(sg).centre) - bb.radius();
+                };
+                // The parameter in [0, 1] of a curve where it crosses blend bb
+                // inside bb's theta range: the sign changes of h by samples,
+                // each refined by bisection; exactly one must lie on bb.
+                auto crossing = [&](const std::function<Vec3d(double)>& pt, const solve::BlendCarrier& bb, double sg0,
+                                    double& tx) {
+                    const int n = 200;
+                    double sg = sg0, prev = hdist(bb, pt(0.0), sg);
+                    int found = 0;
+                    for (int i = 1; i <= n; ++i) {
+                        const double h = hdist(bb, pt(static_cast<double>(i) / n), sg);
+                        if ((h > 0.0) != (prev > 0.0)) {
+                            double lo = static_cast<double>(i - 1) / n, hi = static_cast<double>(i) / n, sl = sg;
+                            const double flo = hdist(bb, pt(lo), sl);
+                            for (int it = 0; it < 60; ++it) {
+                                const double m = 0.5 * (lo + hi);
+                                double sm = sl;
+                                if ((hdist(bb, pt(m), sm) > 0.0) == (flo > 0.0)) lo = m;
+                                else hi = m;
+                            }
+                            if (in_wedge(bb, pt(0.5 * (lo + hi)), sl)) {
+                                tx = 0.5 * (lo + hi);
+                                ++found;
+                            }
+                        }
+                        prev = h;
+                    }
+                    return found == 1;
+                };
+                // The rectangles: the largest radius that works at each point.
+                std::optional<Rect> RA, RB;
+                for (double rho : {1e-3, 5e-4, 2.5e-4, 1.25e-4})
+                    if (!RA) RA = rect_at(f1, f2, *A, *b1, rho);
+                for (double rho : {1e-3, 5e-4, 2.5e-4, 1.25e-4})
+                    if (RA && !RB) RB = rect_at(k1, k2, *Bp, *b2, rho);
+                for (int once = 0; once < 1 && RA && RB; ++once) {
+                    const double rl = std::min(RA->tb, RB->tb), rh = std::max(RA->tb, RB->tb);
+                    // The rectangles at A and B are free of the other earlier blend.
+                    {
+                        const solve::RectCarrier sa(blend, RA->sc0, RA->sc1, std::min(f2.theta_c, RA->tb), std::max(f2.theta_c, RA->tb));
+                        const solve::RectCarrier sb(blend, RB->sc0, RB->sc1, std::min(k2.theta_c, RB->tb), std::max(k2.theta_c, RB->tb));
+                        const solve::SsiResult ca = solve::intersect_carriers(sa, *b2, opt);
+                        const solve::SsiResult cb = solve::intersect_carriers(sb, *b1, opt);
+                        if (!ca.complete || !ca.curves.empty() || !cb.complete || !cb.curves.empty()) continue;
+                    }
+                    auto R = std::make_shared<solve::RectCarrier>(blend, 0.0, 1.0, rl, rh);
+                    // The traced mitre with earlier blend bp, starting on the
+                    // strip side v = vs of R.
+                    auto traced = [&](const std::shared_ptr<const solve::BlendCarrier>& bp, int pp, double vs,
+                                      const Rect& q) -> std::shared_ptr<TracedEdge> {
+                        const solve::SsiResult cm = solve::intersect_carriers(*R, *bp, opt);
+                        if (!cm.complete || cm.curves.size() != 1) return nullptr;
+                        auto t = std::make_shared<TracedEdge>();
+                        t->a = R;
+                        t->b = bp;
+                        t->proc[0] = pi;
+                        t->proc[1] = pp;
+                        t->off[1] = rl;
+                        t->scl[1] = rh - rl;
+                        t->path.segs = cm.curves[0].segs;
+                        t->path.make_breaks(t->sys(), *t->a);
+                        t->path.find_kinks(t->sys(), *t->a, *t->b);
+                        solve::Pt4 a0, a1;
+                        if (!t->at(0.0, a0) || !t->at(1.0, a1)) return nullptr;
+                        if (std::fabs(a0[1] - vs) > std::fabs(a1[1] - vs)) {
+                            std::swap(a0, a1);
+                            t->from = 1.0;
+                            t->to = 0.0;
+                        }
+                        if (!(std::fabs(a0[1] - vs) < 1e-9 && a0[0] > q.sc0 && a0[0] < q.sc1)) return nullptr;
+                        return t;
+                    };
+                    const double vA = RA->tb == rl ? 0.0 : 1.0, vB = 1.0 - vA;
+                    const auto t1 = traced(b1, Fe.proc, vA, *RA);
+                    const auto t2 = t1 ? traced(b2, p2, vB, *RB) : nullptr;
+                    if (!t1 || !t2) continue;
+                    // T on both mitres and on the earlier mitre eM.
+                    const auto& xm = S.edges[static_cast<std::size_t>(eM)];
+                    double tT1 = 0.0, tT2 = 0.0, tTM = 0.0;
+                    if (!crossing([&](double x) { return t1->point(x); }, *b2, s1B, tT1)) continue;
+                    if (!crossing([&](double x) { return t2->point(x); }, *b1, s1A, tT2)) continue;
+                    if (!crossing([&](double x) { return xm.proc->point(x); }, *blend, s3B, tTM)) continue;
+                    const Vec3d PT = t1->point(tT1);
+                    if (!(norm(t2->point(tT2) - PT) < 1e-9 && norm(xm.proc->point(tTM) - PT) < 1e-9)) continue;
+                    // The corner pieces.
+                    auto corner_piece = [&](const std::shared_ptr<const solve::BlendCarrier>& bp, int pp,
+                                            const solve::ContactOnFace& ka, const solve::ContactOnFace& kb, const Rect& q,
+                                            const TracedEdge& t, double sP) {
+                        auto c = std::make_shared<CornerEdge>();
+                        c->b1 = bp;
+                        c->b2 = blend;
+                        c->f1 = ka;
+                        c->f2 = kb;
+                        c->L = q.L;
+                        c->p1 = pp;
+                        c->p2 = pi;
+                        solve::Pt4 a0;
+                        t.at(0.0, a0);
+                        c->a_end = (a0[0] - sP) / q.L.k_s;
+                        c->b_end = q.rin;
+                        return c;
+                    };
+                    const auto ceA = corner_piece(b1, Fe.proc, f1, f2, *RA, *t1, s2A);
+                    const auto ceB = corner_piece(b2, p2, k1, k2, *RB, *t2, s3B);
+                    if (!(norm(ceA->point(1.0) - t1->point(0.0)) < 1e-9 && norm(ceB->point(1.0) - t2->point(0.0)) < 1e-9))
+                        continue;
+                    // Commit. Vertices: side 0 of the new blend keeps V.
+                    auto push_vertex = [&]() {
+                        b.vertices.push_back({});
+                        return static_cast<int>(b.vertices.size()) - 1;
+                    };
+                    const int vA_ = j == 0 ? en.V : push_vertex();
+                    const int vB_ = j == 0 ? push_vertex() : en.V;
+                    en.B = j == 0 ? vB_ : vA_;
+                    auto contact_vertex = [&](int side, double s3, int carrier) {
+                        BVertex v;
+                        solve::Pt4 x;
+                        Vec3d P, Ps, Pt;
+                        blend->eval(s3, static_cast<double>(side), P, Ps, Pt);
+                        v.point = P;
+                        if (blend->spine_at(s3, x)) {
+                            const Support& sp_ = support_of(side);
+                            v.charts.push_back({carrier, Interval(sp_.alpha[0] * x[static_cast<std::size_t>(2 * side)] + sp_.beta[0]),
+                                                Interval(sp_.alpha[1] * x[static_cast<std::size_t>(2 * side + 1)] + sp_.beta[1])});
+                        }
+                        return v;
+                    };
+                    b.vertices[static_cast<std::size_t>(vA_)] = contact_vertex(j, s2A, Csh[j]);
+                    b.vertices[static_cast<std::size_t>(vB_)] = contact_vertex(1 - j, s3B, CO);
+                    const int vXA = push_vertex(), vXB = push_vertex(), vT = push_vertex();
+                    b.vertices[static_cast<std::size_t>(vXA)].point = t1->point(0.0);
+                    b.vertices[static_cast<std::size_t>(vXB)].point = t2->point(0.0);
+                    b.vertices[static_cast<std::size_t>(vT)].point = PT;
+                    // The earlier edges: b1's contact at A, b2's contact at B,
+                    // the earlier mitre at T.
+                    const double tS = (s1A - bs->from) / (bs->to - bs->from);
+                    BEdge& ns = b.edges[static_cast<std::size_t>(eS)];
+                    if (ns.v0 == en.V) { ns.proc = bs->part(tS, 1.0); ns.v0 = vA_; }
+                    else { ns.proc = bs->part(0.0, tS); ns.v1 = vA_; }
+                    const double tB = (s1B - bc->from) / (bc->to - bc->from);
+                    BEdge& nc = b.edges[static_cast<std::size_t>(eC2)];
+                    if (nc.v0 == W) { nc.proc = bc->part(tB, 1.0); nc.v0 = vB_; }
+                    else { nc.proc = bc->part(0.0, tB); nc.v1 = vB_; }
+                    BEdge& nm = b.edges[static_cast<std::size_t>(eM)];
+                    if (nm.v0 == W) { nm.proc = xm.proc->part(tTM, 1.0); nm.v0 = vT; }
+                    else { nm.proc = xm.proc->part(0.0, tTM); nm.v1 = vT; }
+                    if (!ns.proc || !nc.proc || !nm.proc) return "an edge at the end cannot be split";
+                    en.drop = eO;
+                    // The new edges: A -> XA -> T and B -> XB -> T.
+                    auto add_edge = [&](int v0, int v1, std::shared_ptr<const ProcEdge> pe) {
+                        BEdge e;
+                        e.v0 = v0;
+                        e.v1 = v1;
+                        e.proc = std::move(pe);
+                        b.edges.push_back(e);
+                        return static_cast<int>(b.edges.size()) - 1;
+                    };
+                    const int iA = add_edge(vA_, vXA, ceA), i1 = add_edge(vXA, vT, t1->part(0.0, tT1));
+                    const int iB = add_edge(vB_, vXB, ceB), i2 = add_edge(vXB, vT, t2->part(0.0, tT2));
+                    const std::vector<BCoedge> a2t = {{iA, false}, {i1, false}}, b2t = {{iB, false}, {i2, false}};
+                    std::vector<BCoedge> a2b = a2t;
+                    for (const BCoedge& c : reversed_chain(b2t)) a2b.push_back(c);
+                    en.chain = j == 0 ? a2b : reversed_chain(a2b);
+                    en.fe_chain = j == 0 ? a2t : reversed_chain(a2t);
+                    // b2's loop: T -> B between the shortened eM and eC2.
+                    std::vector<BCoedge>& L2 = b.faces[static_cast<std::size_t>(FE2)].loops[0];
+                    const int n2 = static_cast<int>(L2.size());
+                    int iM = -1, iC = -1;
+                    for (int i = 0; i < n2; ++i) {
+                        if (L2[static_cast<std::size_t>(i)].edge == eM) iM = i;
+                        if (L2[static_cast<std::size_t>(i)].edge == eC2) iC = i;
+                    }
+                    const std::vector<BCoedge> t2b = reversed_chain(b2t);
+                    if (iM >= 0 && iC >= 0 && (iM + 1) % n2 == iC) L2.insert(L2.begin() + iM + 1, t2b.begin(), t2b.end());
+                    else if (iM >= 0 && iC >= 0 && (iC + 1) % n2 == iM) L2.insert(L2.begin() + iC + 1, b2t.begin(), b2t.end());
+                    else return "the second earlier blend's edges at the corner are not consecutive";
+                    en.sA = j == 0 ? s2A : s3B;
+                    en.sB = j == 0 ? s3B : s2A;
+                    return nullptr;
+                }
+                return "the corner of three blends could not be proven";
+            }
+        }
         // The local branches, then the regular rest around them.
         for (double rho : {1e-3, 5e-4, 2.5e-4}) {
             const auto L = solve::corner_local(f1, f2, *A, rho);

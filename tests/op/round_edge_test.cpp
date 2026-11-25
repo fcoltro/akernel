@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <numbers>
+#include <vector>
 
 #include "check.hpp"
 
@@ -263,6 +264,92 @@ int main() {
         corner(3, 4, a, r, 2, 4, h, 0.15, "front top then vertical");
         corner(3, 4, a, r, 2, 4, h, r, "front top then vertical");
         corner(3, 4, a, 0.15, 2, 4, h, r, "front top then vertical");
+    }
+    // Three fillets at one corner: the top edge at x = a (r1), the vertical
+    // edge at x = a, y = 0 (r2), then the top edge at y = 0 (r3), whose mitre
+    // crosses both earlier fillets through the point where all three meet.
+    // The volume by inclusion and exclusion of the three quarter-round
+    // regions R1, R2, R3: pairwise overlaps as above, and R1 & R2 & R3 as the
+    // integral over R2's section of min(g1(u), g3(v)), g the depth of a
+    // region at distance t from its face, g(r, t) = r - sqrt(t (2r - t)),
+    // after t = r (1 - cos p).
+    {
+        static constexpr double gx[4] = {0.1834346424956498, 0.5255324099163290, 0.7966664774136267, 0.9602898564975363};
+        static constexpr double gw[4] = {0.3626837833783620, 0.3137066458778873, 0.2223810344533745, 0.1012285362903763};
+        auto quad = [&](const auto& f, double lo, double hi, int n) {
+            double I = 0.0;
+            for (int k = 0; k < n; ++k) {
+                const double t0 = lo + (hi - lo) * k / n, t1 = lo + (hi - lo) * (k + 1) / n;
+                for (int i = 0; i < 4; ++i)
+                    for (int sg = -1; sg <= 1; sg += 2) I += 0.5 * (t1 - t0) * gw[i] * f(0.5 * (t0 + t1) + 0.5 * sg * gx[i] * (t1 - t0));
+            }
+            return I;
+        };
+        auto g = [](double rr, double t) { return t >= rr ? 0.0 : rr - std::sqrt(std::max(0.0, t * (2 * rr - t))); };
+        auto ginv = [](double rr, double y) { return rr - std::sqrt(std::max(0.0, rr * rr - (rr - y) * (rr - y))); };
+        const double hp = std::numbers::pi / 2;
+        auto ov = [&](double ri, double rj) {
+            const double rm = std::min(ri, rj);
+            return quad([&](double p) { return g(ri, rm * (1 - num::det::cos(p))) * g(rj, rm * (1 - num::det::cos(p))) * rm * num::det::sin(p); },
+                        0.0, hp, 200);
+        };
+        auto triple = [&](double r1, double r2, double r3) {
+            auto inner = [&](double u) {
+                const double G1 = g(r1, u), vmax = std::min(g(r2, u), r3);
+                if (vmax <= 0.0 || G1 <= 0.0) return 0.0;
+                const double vs = G1 < r3 ? ginv(r3, G1) : 0.0, lo = std::min(vs, vmax);
+                double tot = G1 * lo;
+                if (vmax > lo) {
+                    const double ca = std::acos(1 - lo / r3), cb = std::acos(std::min(1.0, 1 - vmax / r3));
+                    tot += quad([&](double ch) { return g(r3, r3 * (1 - num::det::cos(ch))) * r3 * num::det::sin(ch); }, ca, cb, 20);
+                }
+                return tot;
+            };
+            // The outer integrand's kinks: g1 = r3, g2 = r3, and where the
+            // switch point reaches the section's edge.
+            std::vector<double> ks = {0.0, hp};
+            for (double uk : {r3 < r1 ? ginv(r1, r3) : -1.0, r3 < r2 ? ginv(r2, r3) : -1.0})
+                if (uk > 0.0 && uk < r2) ks.push_back(std::acos(1 - uk / r2));
+            auto sw = [&](double p) {
+                const double u = r2 * (1 - num::det::cos(p)), G1 = g(r1, u);
+                return (G1 < r3 ? ginv(r3, G1) : 0.0) - std::min(g(r2, u), r3);
+            };
+            const int N = 2000;
+            for (int i = 1; i <= N; ++i) {
+                double lo = hp * (i - 1) / N, hi = hp * i / N;
+                const double flo = sw(lo);
+                if ((flo > 0.0) == (sw(hi) > 0.0)) continue;
+                for (int it = 0; it < 80; ++it) {
+                    const double m = 0.5 * (lo + hi);
+                    if ((sw(m) > 0.0) == (flo > 0.0)) lo = m;
+                    else hi = m;
+                }
+                ks.push_back(0.5 * (lo + hi));
+            }
+            std::sort(ks.begin(), ks.end());
+            double tot = 0.0;
+            for (std::size_t i = 0; i + 1 < ks.size(); ++i)
+                tot += quad([&](double p) { return inner(r2 * (1 - num::det::cos(p))) * r2 * num::det::sin(p); }, ks[i], ks[i + 1], 60);
+            return tot;
+        };
+        const op::Brep box = op::to_brep(op::freeform_block(top_patch(a, L, h, 0.0)));
+        const double r1 = r, r2 = 0.15;
+        const op::ProcFilletResult first = op::round_edge(box, edge_between(box, 2, 3), r1);
+        AK_CHECK(first.solid.has_value());
+        const op::ProcFilletResult second = first.solid ? op::round_edge(*first.solid, edge_between(*first.solid, 2, 4), r2)
+                                                        : op::ProcFilletResult{};
+        AK_CHECK(second.solid.has_value());
+        for (const double r3 : {0.01, 0.05, 0.1, 0.2}) {
+            if (!second.solid) break;
+            char name[96];
+            std::snprintf(name, sizeof name, "box corner, three fillets, r = %.2f, %.2f, %.2f", r1, r2, r3);
+            auto q3 = [](double rr) { return (1 - std::numbers::pi / 4) * rr * rr; };
+            const double exact = a * L * h - q3(r1) * L - q3(r2) * h - q3(r3) * a + ov(r1, r2) + ov(r1, r3) + ov(r2, r3) -
+                                 triple(r1, r2, r3);
+            const double v = rounded(*second.solid, 3, 4, r3, name);
+            std::printf("  volume %.15f, exact %.15f, error %.2e\n", v, exact, v - exact);
+            AK_CHECK_NEAR(v, exact, 1e-10);
+        }
     }
     // A mitre on a freeform top: its edge at x = a rounded, then the vertical
     // edge at y = 0, and the same solid moved.
