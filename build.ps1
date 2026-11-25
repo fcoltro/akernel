@@ -4,10 +4,14 @@
 #   .\build.ps1 -Config Debug   Debug build, run all tests
 #   .\build.ps1 -Bench          also run the benchmark program
 #   .\build.ps1 -Filter ssi     run only tests whose name matches
+#   .\build.ps1 -Workbench      build and start the desktop workbench
+#                               (apps/workbench; fetches GLFW and Dear ImGui
+#                               once, needs git), no tests
 param(
     [ValidateSet('Release', 'Debug')] [string]$Config = 'Release',
     [switch]$Bench,
-    [string]$Filter = ''
+    [string]$Filter = '',
+    [switch]$Workbench
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,8 +29,18 @@ cmd /c "`"$vcvars`" >nul 2>nul && set" | ForEach-Object {
 }
 
 $buildDir = Join-Path $root "build\$Config"
-cmake -S $root -B $buildDir -G Ninja "-DCMAKE_BUILD_TYPE=$Config" | Out-Host
+$workbenchFlag = if ($Workbench) { 'ON' } else { 'OFF' }
+cmake -S $root -B $buildDir -G Ninja "-DCMAKE_BUILD_TYPE=$Config" "-DAK_BUILD_WORKBENCH=$workbenchFlag" | Out-Host
 if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed.' }
+
+if ($Workbench) {
+    cmake --build $buildDir --target ak_workbench | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw 'Workbench build failed.' }
+    $exe = Join-Path $buildDir 'apps\workbench\ak_workbench.exe'
+    Write-Host "Starting $exe"
+    Start-Process -FilePath $exe -WorkingDirectory $root
+    exit 0
+}
 cmake --build $buildDir | Out-Host
 if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
 

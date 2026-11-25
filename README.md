@@ -67,6 +67,38 @@ This intersects two freeform patches and writes both surfaces and the certified 
 
 This cuts a box that has a hill on top with a tilted box, then drills a square hole through the result, and writes `boolean_intersection.obj`, `boolean_union.obj`, `boolean_difference.obj` and `boolean_chained.obj` into the `build` folder. Each file is a closed triangle mesh (one group per face) with the model's edges as polylines; the program checks that every mesh is closed before writing it. If Windows refuses to run the Release program, use `.\build\Debug\ak_boolean_demo.exe build` after `.\build.ps1 -Config Debug`.
 
+## Workbench
+
+![The workbench with its demo scene](docs/images/workbench.png)
+
+`ak_workbench` is a small desktop app for trying the kernel on real geometry: a 3D viewport and panels of buttons that call the kernel's own operations. It is an optional target (GLFW and Dear ImGui are fetched by CMake the first time, which needs git and network access); the library, tests and main CI do not depend on it.
+
+```powershell
+.\build.ps1 -Workbench     # build it and start it (no tests)
+```
+
+On Linux (needs the X11 and OpenGL headers, e.g. `libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl-dev`):
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DAK_BUILD_WORKBENCH=ON
+cmake --build build --target ak_workbench
+./build/apps/workbench/ak_workbench --demo
+```
+
+What the buttons do (all in `apps/workbench/kernel_ops.hpp`):
+
+| Panel | Kernel call |
+|---|---|
+| Primitives: box, bump box, spline box, rounded box | `op/patch_solid.hpp`, `op/fillet.hpp` (`rounded_box`) |
+| Extrude: a rectangle, its corner plain, filleted or chamfered; an L-step with its inside edge filled | `op/fillet.hpp` (`extrude_section`, `blend_box_edge`, `blend_step_edge`) |
+| Revolve: a rectangle by 1 to 4 quarter turns, optionally with one circular edge blended | `op/fillet.hpp` (`revolve_section`, `blend_ring_edge`) |
+| Sweep and loft: open NURBS surfaces (not solids yet) | `geom/sweep.hpp` (`translational_sweep`, `skin`) |
+| Freeform fillet: a rolling-ball blend on a freeform block (procedural face) | `op/proc_fillet.hpp` (`round_block_edge`) |
+| Booleans: union, A minus B, intersection | `op/boolean.hpp`, or `op/poly_boolean.hpp` when an operand has procedural faces |
+| Plane cut, translate, quarter turns, mirrors | `op/plane_cut.hpp`, `op/brep_transform.hpp` |
+
+Every new body is audited and reported in the inspector: face, edge and vertex counts, the topology audit (closed, shells, Euler characteristic, genus), the volume by quadrature, the certified volume enclosure where the faces are in its class (or the reason it is not), the certified edge gap bound, and the watertight tessellation. A refused operation shows the kernel's own message in the log. Click a body to make it A, Shift+click for B; left drag orbits, right or middle drag pans, the wheel zooms, F fits the view. "Export OBJ" writes the kernel's mesh of a solid. Operations run on a worker thread, so the window stays responsive during a long Boolean.
+
 ## Boolean operations
 
 ```cpp
@@ -170,4 +202,5 @@ include/akernel/
 tests/    one executable per module (22)
 bench/    bench_main.cpp   (source of docs/RESULTS.md)
 examples/ intersect_demo.cpp  boolean_demo.cpp
+apps/     workbench/ (optional desktop app: main.cpp, kernel_ops.hpp)
 ```

@@ -69,3 +69,11 @@ target_link_libraries(ak_demo PRIVATE akernel)
 
 add_executable(ak_boolean_demo examples/boolean_demo.cpp)
 target_link_libraries(ak_boolean_demo PRIVATE akernel)
+
+# Optional desktop workbench (apps/workbench): a 3D viewport with buttons for
+# the kernel's operations. Off by default so the library, tests and CI do not
+# fetch or build GLFW and Dear ImGui.
+option(AK_BUILD_WORKBENCH "Build the ak_workbench desktop app (fetches GLFW and Dear ImGui)" OFF)
+if(AK_BUILD_WORKBENCH)
+  add_subdirectory(apps/workbench)
+endif()
