@@ -49,8 +49,12 @@
 // (op/contact.hpp): the pair contributes no curve, edges touching the plane
 // at their ends add no vertex, and the curves and faces that meet
 // tangentially there are ordered by the side of the plane the surface lies
-// on. Other contact that is not shared by construction (tangency at a point
-// or between curved surfaces, two different surfaces that coincide, an edge
+// on. Two curved surfaces on quadrics touching along a ruling of each (two
+// cylinders side by side, or one inside the other) are decided exactly as
+// well (op/quadric_contact.hpp): the pair contributes no curve, and edges on
+// either surface touch the other only on that line. Other contact that is
+// not shared by construction (tangency at a point or along other curves
+// between curved surfaces, two different surfaces that coincide, an edge
 // through an edge) is reported as "not in general position".
 //
 // Not proven: that an operand does not intersect itself.
@@ -76,6 +80,7 @@
 #include <akernel/geom/box_index.hpp>
 #include <akernel/op/brep.hpp>
 #include <akernel/op/contact.hpp>
+#include <akernel/op/quadric_contact.hpp>
 #include <akernel/op/tsi.hpp>
 #include <akernel/solve/contact_point.hpp>
 #include <akernel/solve/csi.hpp>
@@ -167,7 +172,8 @@ struct ImprintStats {
     int iso_edges = 0;               ///< straight edges proven to lie in a curved surface of the other solid, along a line of constant parameter
     int line_contacts = 0;           ///< of their pieces, those along which the other solid only touches the surface inside a face
     int edge_crossings = 0;          ///< edges proven to cross an edge of the other solid in space, at an exact point
-    int line_tangencies = 0;         ///< curved surfaces proven to touch a plane along a line inside the patch
+    int line_tangencies = 0;         ///< curved surfaces proven to touch a plane or a curved surface along a line inside the patch
+    int curved_line_tangencies = 0;  ///< of those, two curved surfaces touching along a ruling of each (op/quadric_contact.hpp)
     int graph_crossings = 0;         ///< pairs of graphs crossing where they share boundary lines, desingularised exactly
     int point_contacts = 0;          ///< pairs of surfaces touching at one point (a curved one against a plane or a curved one), proven exactly
     int near_misses = 0;             ///< pairs whose facing points are proven apart, with nothing between them in the region the search left
@@ -578,12 +584,60 @@ class Builder {
     };
     /// Curved surface a meets plane b exactly along a line of constant
     /// parameter inside a's patch, touching it (op/contact.hpp, line_contact).
+    /// Where b is curved as well (op/quadric_contact.hpp), the line is
+    /// also a line of constant parameter of b, rb on b's parameter fixed_u_b
+    /// (u if true), and along it both surfaces have degree 1 (a ruling of each).
     struct LineTouch {
         int a = -1, b = -1;
         bool fixed_u = true;
         Interval r;
+        bool b_curved = false;
+        bool fixed_u_b = true;
+        Interval rb;
     };
     std::vector<LineTouch> line_touches;
+    /// The parameters on surface g (of b's class, curved) of a point P of
+    /// the line of a curved line touch: on g's line rb, the position along
+    /// the ruling from the coordinate in which the ruling's two homogeneous
+    /// ends differ most, (x0 - P w0) / ((x0 - x1) - P (w0 - w1)). P must be
+    /// on the line; the enclosure is as wide as P's and rb's.
+    bool ruling_params(const LineTouch& t, int g, const geom::Vec3<Interval>& P, Interval& pu, Interval& pv) {
+        if (!equiv(g, t.b)) return false;
+        const PolyPatchD& B = im.carriers[static_cast<std::size_t>(t.b)];
+        if ((t.fixed_u_b ? B.q : B.p) != 1) return false;
+        // The ruling's two homogeneous end points at the fixed parameter rb.
+        geom::Vec4<Interval> e[2];
+        for (int k = 0; k < 2; ++k) {
+            const auto& ic = icarrier[static_cast<std::size_t>(t.b)];
+            e[k] = t.fixed_u_b ? ic.eval(t.rb, Interval(static_cast<double>(k))) : ic.eval(Interval(static_cast<double>(k)), t.rb);
+        }
+        const Interval c0[4] = {e[0].x, e[0].y, e[0].z, e[0].w}, c1[4] = {e[1].x, e[1].y, e[1].z, e[1].w};
+        const Interval p[3] = {P.x, P.y, P.z};
+        int best = -1;
+        double big = 0.0;
+        for (int c = 0; c < 3; ++c) {
+            const Interval d = c0[c] * c1[3] - c1[c] * c0[3]; // differ in this affine coordinate
+            const double m = std::min(std::fabs(d.lo), std::fabs(d.hi));
+            if (!num::contains_zero(d) && m > big) { big = m; best = c; }
+        }
+        if (best < 0) return false;
+        const Interval den = (c0[best] - c1[best]) - p[best] * (c0[3] - c1[3]);
+        if (num::contains_zero(den)) return false;
+        const Interval s = (c0[best] - p[best] * c0[3]) / den;
+        // The point of the ruling there must enclose P in every coordinate:
+        // else P is not on b's line (a's line can reach b's quadric outside
+        // b's patch), and nothing is claimed.
+        for (int c = 0; c < 3; ++c) {
+            const Interval wc = c0[3] + s * (c1[3] - c0[3]), xc = c0[c] + s * (c1[c] - c0[c]);
+            if (num::contains_zero(wc)) return false;
+            const Interval q = xc / wc;
+            if (q.hi < p[c].lo || q.lo > p[c].hi) return false;
+        }
+        // Back to b's own parameters (the class map, if g is another member).
+        Interval bu = t.fixed_u_b ? t.rb : s, bv = t.fixed_u_b ? s : t.rb;
+        map(t.b, g).apply(bu, bv, pu, pv);
+        return true;
+    }
     /// A curved surface `a` touching the surface `b` at one point: its exact
     /// parameters on `a`, the point, and, where `b` is curved too, its exact
     /// parameters on `b` (on a plane they follow from the point).
@@ -1713,12 +1767,38 @@ private:
                     const int a = is_planar[static_cast<std::size_t>(x)] ? y : x, b = a == x ? y : x;
                     const PlaneLineContact lc = line_contact(im.carriers[static_cast<std::size_t>(a)], im.carriers[static_cast<std::size_t>(b)]);
                     if (lc.found) {
-                        line_touches.push_back({a, b, lc.fixed_u, lc.r});
+                        line_touches.push_back({a, b, lc.fixed_u, lc.r, false, true, Interval(0.0)});
                         ++im.stats.line_tangencies;
                         note(where + ": surface " + str(a) + " touches the plane of " + str(b) + " along its line " +
                              (lc.fixed_u ? "u" : "v") + " = " + std::to_string(num::mid(lc.r)) + " (exact)");
                         continue;
                     }
+                }
+                // Two curved surfaces touching along a line inside both patches
+                // (two equal cylinders side by side, touching along a ruling),
+                // proven exactly from the implicit quadric of each
+                // (op/quadric_contact.hpp): each surface meets the other's quadric
+                // only on one line of constant parameter and does not cross it
+                // there, so the pair contributes no curve.
+                if (known.empty() && !is_planar[static_cast<std::size_t>(x)] && !is_planar[static_cast<std::size_t>(y)]) {
+                    const PolyPatchD& X = im.carriers[static_cast<std::size_t>(x)];
+                    const PolyPatchD& Y = im.carriers[static_cast<std::size_t>(y)];
+                    const QuadricLineContact cx = quadric_line_contact(X, Y), cy = quadric_line_contact(Y, X);
+                    // Along the line both patches must have degree 1 (rulings),
+                    // so that a point of it is placed on the other exactly.
+                    const bool ruled = cx.found && cy.found && cx.r.size() == 1 && cy.r.size() == 1 &&
+                                       (cx.fixed_u ? X.q : X.p) == 1 && (cy.fixed_u ? Y.q : Y.p) == 1;
+                    if (ruled) {
+                        line_touches.push_back({x, y, cx.fixed_u, cx.r[0], true, cy.fixed_u, cy.r[0]});
+                        ++im.stats.line_tangencies;
+                        ++im.stats.curved_line_tangencies;
+                        note(where + ": the two curved surfaces touch along their lines " + (cx.fixed_u ? "u" : "v") + " = " +
+                             std::to_string(num::mid(cx.r[0])) + " and " + (cy.fixed_u ? "u" : "v") + " = " + std::to_string(num::mid(cy.r[0])) +
+                             " and meet nowhere else (exact)");
+                        continue;
+                    }
+                    if (opt.trace && (cx.found || cy.found))
+                        note(where + ": a line contact was proven on one surface only, or not along rulings");
                 }
                 bool iso_side_tangent = false;
                 // A straight side of a lying in a curved surface b along one of
@@ -4042,6 +4122,7 @@ private:
         // has one solution per slice. Then the part is an existing edge if
         // that point lies within an edge on (that plane, b).
         for (const LineTouch& t : line_touches) {
+            if (t.b_curved) continue; // b is not a plane through L
             const int plane = y == t.a ? x : (x == t.a ? y : -1);
             if (plane < 0 || !is_planar[static_cast<std::size_t>(plane)] || equiv(plane, t.b)) continue;
             const PolyPatchD& A = im.carriers[static_cast<std::size_t>(t.a)];
@@ -5953,7 +6034,9 @@ private:
                         if (locate(R1.geom, ua, va, opt.refine_depth) != Where::Inside) continue;
                         const auto h = icarrier[static_cast<std::size_t>(t.a)].eval(ua, va);
                         Interval pu, pv;
-                        if (!plane_params(im.carriers[static_cast<std::size_t>(gb)], {h.x / h.w, h.y / h.w, h.z / h.w}, pu, pv)) continue;
+                        if (t.b_curved) {
+                            if (!ruling_params(t, gb, {h.x / h.w, h.y / h.w, h.z / h.w}, pu, pv)) continue;
+                        } else if (!plane_params(im.carriers[static_cast<std::size_t>(gb)], {h.x / h.w, h.y / h.w, h.z / h.w}, pu, pv)) continue;
                         if (locate(R2.geom, pu, pv, opt.refine_depth) != Where::Inside) continue;
                         found = true;
                         break;
