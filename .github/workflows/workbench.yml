@@ -1,0 +1,61 @@
+# Build the optional desktop workbench (apps/workbench) on Windows (MSVC) and
+# Linux (GCC), and run its demo scene headless on Linux: every demo body goes
+# through the kernel and is rendered once. Runs only when the workbench or the
+# top-level CMake file changes, so the main CI is not burdened.
+name: Workbench
+
+on:
+  push:
+    branches: [main]
+    paths: ['apps/workbench/**', 'CMakeLists.txt', '.github/workflows/workbench.yml']
+  pull_request:
+    paths: ['apps/workbench/**', 'CMakeLists.txt', '.github/workflows/workbench.yml']
+  workflow_dispatch:
+
+concurrency:
+  group: workbench-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Workbench (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows MSVC
+            os: windows-latest
+          - name: Linux GCC
+            os: ubuntu-24.04
+            generator: Ninja
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Ninja, X11 and OpenGL headers, Xvfb
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+            libgl-dev libgl1-mesa-dri xvfb
+      - name: Configure
+        shell: bash
+        run: |
+          args=()
+          [ -n "${{ matrix.generator }}" ] && args+=(-G "${{ matrix.generator }}")
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAK_BUILD_WORKBENCH=ON "${args[@]}"
+      - name: Build
+        run: cmake --build build --config Release --target ak_workbench --parallel 4
+      - name: Run the demo scene headless
+        if: runner.os == 'Linux'
+        run: |
+          xvfb-run -a -s "-screen 0 1500x900x24" build/apps/workbench/ak_workbench --demo --shot workbench.ppm
+          test -s workbench.ppm
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: workbench-screenshot
+          path: workbench.ppm
