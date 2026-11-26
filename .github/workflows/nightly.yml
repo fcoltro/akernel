@@ -1,0 +1,96 @@
+# Random models checked by oracles (fuzz/README.md), every night on Windows
+# (MSVC) and Linux (GCC). Each run replays the regression seeds, a fixed block
+# of seeds (the same every night, so the counts are comparable from one night
+# to the next), and a block of new seeds taken from the date. The summary
+# (refusals and failures per operation, failing seeds) is on the run's page;
+# the reports are kept as artifacts for 90 days.
+name: Nightly random models
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+    inputs:
+      first_seed:
+        description: 'First seed of the new block (empty: from the date)'
+        required: false
+        default: ''
+      count:
+        description: Seeds in the new block
+        required: false
+        default: '600'
+      minutes:
+        description: 'Time budget for the new block, in minutes'
+        required: false
+        default: '40'
+
+permissions:
+  contents: read
+
+jobs:
+  random-models:
+    name: Random models (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-msvc
+            os: windows-latest
+          - name: linux-gcc
+            os: ubuntu-24.04
+            cxx: g++
+            generator: Ninja
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Ninja
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y ninja-build
+      - name: Build
+        shell: bash
+        run: |
+          args=()
+          [ -n "${{ matrix.generator }}" ] && args+=(-G "${{ matrix.generator }}")
+          [ -n "${{ matrix.cxx }}" ] && args+=("-DCMAKE_CXX_COMPILER=${{ matrix.cxx }}")
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release "${args[@]}"
+          cmake --build build --config Release --target ak_random_models --parallel 4
+          exe=build/ak_random_models
+          [ -f build/Release/ak_random_models.exe ] && exe=build/Release/ak_random_models.exe
+          echo "EXE=$exe" >> "$GITHUB_ENV"
+      - name: Regression seeds
+        shell: bash
+        run: |
+          mkdir -p reports
+          "$EXE" --seeds-file fuzz/regression_seeds.txt --markdown reports/regressions.md --json reports/regressions.json \
+            | tee reports/regressions.log
+      - name: Fixed seeds 1 to 300
+        if: always()
+        shell: bash
+        run: fuzz/nightly.sh "$EXE" reports/fixed 1 300 1800
+      - name: New seeds
+        if: always()
+        shell: bash
+        run: |
+          first="${{ github.event.inputs.first_seed }}"
+          [ -z "$first" ] && first=$(( $(date -u +%Y%m%d) * 10000 ))
+          count="${{ github.event.inputs.count }}"; count=${count:-600}
+          minutes="${{ github.event.inputs.minutes }}"; minutes=${minutes:-40}
+          echo "First seed $first" | tee reports/new-first-seed.txt
+          fuzz/nightly.sh "$EXE" reports/new "$first" "$count" $(( minutes * 60 ))
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "# Random models, ${{ matrix.name }}"
+            for f in reports/regressions.md reports/fixed/summary.md reports/new/summary.md; do
+              [ -f "$f" ] && { echo; echo "<details open><summary>$f</summary>"; echo; cat "$f"; echo; echo "</details>"; }
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: random-models-${{ matrix.name }}
+          path: reports
+          retention-days: 90

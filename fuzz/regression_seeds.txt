@@ -1,0 +1,2 @@
+# Seeds of random models that once failed an oracle (fuzz/README.md).
+# Every CI run replays them; add a seed here when its bug is fixed.
