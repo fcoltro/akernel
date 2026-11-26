@@ -323,6 +323,40 @@ int main() {
             }
             std::printf("sphere octant patches: off the unit sphere by %.2e\n", worst);
             AK_CHECK(worst < 1e-14);
+            // The split is symmetric: the three pieces are (near) copies of
+            // one another, each a third of the octant (area pi / 6), and the
+            // cuts from the axes' midpoints to the centre are great circles.
+            {
+                const auto Q = op::fillet_detail::octant_patches();
+                double amin = 1e9, amax = 0.0;
+                for (const auto& P : Q) {
+                    const geom::BezierSurface S(P);
+                    double area = 0.0;
+                    const int n = 100; // midpoint rule
+                    for (int i = 0; i < n; ++i)
+                        for (int j = 0; j < n; ++j) {
+                            const auto J = S.jet((i + 0.5) / n, (j + 0.5) / n);
+                            area += geom::norm(cross(J[1], J[2])) / (n * n);
+                        }
+                    amin = std::min(amin, area);
+                    amax = std::max(amax, area);
+                }
+                const geom::BezierSurface S1(Q[0]);
+                double off = 0.0;
+                for (int side = 0; side < 2; ++side) {
+                    auto at = [&](double t) { return side ? S1.point(t, 1.0) : S1.point(1.0, t); };
+                    Vec3d nrm = cross(at(0.0), at(1.0));
+                    nrm = nrm / geom::norm(nrm);
+                    for (int i = 0; i <= 20; ++i) off = std::max(off, std::fabs(dot(nrm, at(i / 20.0))));
+                }
+                const Vec3d ctr = S1.point(1.0, 1.0);
+                std::printf("octant pieces: areas %.5f .. %.5f (pi/6 %.5f), seams off great circles %.1e, centre "
+                            "%.2f deg off\n",
+                            amin, amax, std::numbers::pi / 6, off,
+                            std::acos(std::min(1.0, (ctr.x + ctr.y + ctr.z) / std::sqrt(3.0))) * 180 / std::numbers::pi);
+                AK_CHECK(amax - amin < 0.01 * std::numbers::pi / 6);
+                AK_CHECK(off < 1e-14);
+            }
             check_faces("rounded box", *rb.solid);
             // Core box plus face slabs, quarter cylinders and the ball.
             const double a0 = A - 2 * rr, b0 = Bh - 2 * rr, c0 = Ch - 2 * rr;
