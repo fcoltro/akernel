@@ -616,6 +616,8 @@ class BlendCarrier final : public geom::Carrier {
         carrier_detail::V2 a, c, b; ///< contacts and centre
         carrier_detail::V2 u, v;    ///< (a - c) / r and (b - c) / r
         geom::IVec3 a2, c2, b2;     ///< second sigma derivatives of a, c, b
+        Box4 x{};                   ///< spine coordinates (u, v, s, t)
+        std::array<Interval, 4> xp{}; ///< their sigma derivatives
     };
     struct Cache {
         std::mutex mutex;
@@ -708,6 +710,8 @@ class BlendCarrier final : public geom::Carrier {
         for (auto& d : xpp) d = d * dcds2;
 
         SpineJet j;
+        j.x = K;
+        j.xp = xp;
         j.a = lift(SA[0], SA[1] * xp[0] + SA[2] * xp[1]);
         // The centre is on both offsets: A's enclosure meets B's.
         j.c = lift(geom::carrier_detail::meet(OA[0], OB[0]), OA[1] * xp[0] + OA[2] * xp[1]);
@@ -770,18 +774,24 @@ class BlendCarrier final : public geom::Carrier {
             };
             const Interval R1(r_);
             const geom::IVec3 u2 = (j->a2 - j->c2) / R1, v2 = (j->b2 - j->c2) / R1;
-            bool ok2 = false;
-            const Vec3<H2> q = arc_point(h(j->a, j->a2), h(j->c, j->c2), h(j->b, j->b2), h(j->u, u2), h(j->v, v2), r_,
-                                         H2(T, Interval(0.0), Interval(1.0), Interval(0.0), Interval(0.0), Interval(0.0)),
-                                         ok2);
             const Interval ent = Interval::entire();
-            if (ok2) {
-                second[0] = {q.x.dss, q.y.dss, q.z.dss};
-                second[1] = {q.x.dst, q.y.dst, q.z.dst};
-                second[2] = {q.x.dtt, q.y.dtt, q.z.dtt};
-            } else {
-                second[0] = second[1] = second[2] = {ent, ent, ent};
+            // In pieces of theta, hulled, as for the first partials below.
+            const int pieces2 = T.hi > T.lo ? 8 : 1;
+            bool ok_all = true;
+            for (int q2 = 0; q2 < pieces2 && ok_all; ++q2) {
+                const double t0 = T.lo + (T.hi - T.lo) * q2 / pieces2;
+                const double t1 = q2 + 1 == pieces2 ? T.hi : T.lo + (T.hi - T.lo) * (q2 + 1) / pieces2;
+                bool ok2 = false;
+                const Vec3<H2> q = arc_point(h(j->a, j->a2), h(j->c, j->c2), h(j->b, j->b2), h(j->u, u2), h(j->v, v2), r_,
+                                             H2(Interval(t0, t1), Interval(0.0), Interval(1.0), Interval(0.0), Interval(0.0), Interval(0.0)),
+                                             ok2);
+                if (!ok2) { ok_all = false; break; }
+                const geom::IVec3 n0{q.x.dss, q.y.dss, q.z.dss}, n1{q.x.dst, q.y.dst, q.z.dst}, n2{q.x.dtt, q.y.dtt, q.z.dtt};
+                auto hh = [](geom::IVec3& x, const geom::IVec3& y) { x = {num::hull(x.x, y.x), num::hull(x.y, y.y), num::hull(x.z, y.z)}; };
+                if (q2 == 0) { second[0] = n0; second[1] = n1; second[2] = n2; }
+                else { hh(second[0], n0); hh(second[1], n1); hh(second[2], n2); }
             }
+            if (!ok_all) second[0] = second[1] = second[2] = {ent, ent, ent};
         }
         // The arc's rational form loses the correlation between its basis
         // functions over a theta interval; pieces of theta, hulled, keep
@@ -828,6 +838,59 @@ public:
         return newton_slice(sys(), seg.m, seg.a, c, x);
     }
 
+    /// Certified enclosures over sigma in [s0, s1] (hulled over the spine
+    /// segments it meets; a derivative hull is still a mean-value bound, the
+    /// spine being continuous): spine coordinates x and x', contacts a, b
+    /// and centre c with their sigma derivatives, and the second derivative
+    /// of the centre. False if any segment's enclosure fails.
+    struct SpineBox {
+        Box4 x, xp;
+        geom::IVec3 a, a1, b, b1, c, c1, c2;
+    };
+    bool spine_box(double s0, double s1, SpineBox& out) const {
+        const int k0 = segment_of(s0), k1 = segment_of(s1);
+        bool first = true;
+        for (int k = k0; k <= k1; ++k) {
+            const double a = std::max(s0, brk_[static_cast<std::size_t>(k)]);
+            const double b = std::min(s1, brk_[static_cast<std::size_t>(k) + 1]);
+            const auto j = spine_jet(k, a, b);
+            if (!j) return false;
+            auto v = [](const carrier_detail::V2& q) { return geom::IVec3{q.x.v, q.y.v, q.z.v}; };
+            auto d = [](const carrier_detail::V2& q) { return geom::IVec3{q.x.du, q.y.du, q.z.du}; };
+            SpineBox s{j->x, j->xp, v(j->a), d(j->a), v(j->b), d(j->b), v(j->c), d(j->c), j->c2};
+            if (first) { out = s; first = false; continue; }
+            auto h3 = [](geom::IVec3& x, const geom::IVec3& y) {
+                x = {num::hull(x.x, y.x), num::hull(x.y, y.y), num::hull(x.z, y.z)};
+            };
+            for (int i = 0; i < 4; ++i) {
+                out.x[i] = num::hull(out.x[i], s.x[i]);
+                out.xp[i] = num::hull(out.xp[i], s.xp[i]);
+            }
+            h3(out.a, s.a); h3(out.a1, s.a1); h3(out.b, s.b); h3(out.b1, s.b1);
+            h3(out.c, s.c); h3(out.c1, s.c1); h3(out.c2, s.c2);
+        }
+        return !first;
+    }
+    /// Index of the spine segment holding sigma, and its sigma range.
+    int segment_range(double sigma, double& lo, double& hi) const {
+        const int k = segment_of(sigma);
+        lo = brk_[static_cast<std::size_t>(k)];
+        hi = brk_[static_cast<std::size_t>(k) + 1];
+        return k;
+    }
+    /// Value, first and second partials over [s0, s1] x [t0, t1] inside one
+    /// spine segment (the blend is not C^1 across segments in sigma).
+    bool jet2_over(double s0, double s1, double t0, double t1, geom::IVec3& P, geom::IVec3& Ps, geom::IVec3& Pt,
+                   geom::IVec3 second[3]) const {
+        const int k = segment_of(s0);
+        if (segment_of(s1) != k && s1 > brk_[static_cast<std::size_t>(k) + 1]) return false;
+        if (!segment_jet(k, s0, s1, Interval(t0, t1), P, Ps, Pt, second)) return false;
+        for (int i = 0; i < 3; ++i)
+            if (!num::is_finite(second[i].x) || !num::is_finite(second[i].y) || !num::is_finite(second[i].z)) return false;
+        return true;
+    }
+    double radius() const { return r_; }
+
     /// The section arc at sigma, as the homogeneous control points of its
     /// rational quadratic (or the centre if no ball fits). Quadrature and
     /// sampling evaluate many theta at one sigma, so the last few sections
@@ -866,6 +929,59 @@ public:
         return S;
     }
 
+    /// First partials in doubles without differences: the spine's x' from
+    /// [F_x; m] x' = e3 dc/dsigma at the spine point, then the arc in forward
+    /// mode on point intervals. Differences lose about half the digits, and
+    /// a traced curve's tangent, solved from these partials, loses more
+    /// where it meets another surface at a small angle.
+    bool analytic_partials(double sigma, double theta, Vec3d& Ps, Vec3d& Pt) const {
+        using namespace carrier_detail;
+        const int k = segment_of(sigma);
+        const TubeSegment& seg = segs_[static_cast<std::size_t>(k)];
+        Pt4 x;
+        if (!spine_at(sigma, x)) return false;
+        Vec3d a, au, av, b, bs, bt, c, cu, cv, d, ds, dt;
+        pa_.eval(x[0], x[1], a, au, av);
+        pb_.eval(x[2], x[3], b, bs, bt);
+        oa_.eval(x[0], x[1], c, cu, cv);
+        ob_.eval(x[2], x[3], d, ds, dt);
+        // Rows: the three components of F = OA - OB, and the slice m.
+        double M[4][5];
+        const Vec3d col[4] = {cu, cv, ds * -1.0, dt * -1.0};
+        for (int r = 0; r < 3; ++r)
+            for (int j = 0; j < 4; ++j) M[r][j] = r == 0 ? col[j].x : r == 1 ? col[j].y : col[j].z;
+        for (int j = 0; j < 4; ++j) M[3][j] = seg.m[static_cast<std::size_t>(j)];
+        const double w = brk_[static_cast<std::size_t>(k) + 1] - brk_[static_cast<std::size_t>(k)];
+        M[0][4] = M[1][4] = M[2][4] = 0.0;
+        M[3][4] = (seg.reversed ? -seg.len : seg.len) / w;
+        for (int i = 0; i < 4; ++i) {
+            int p = i;
+            for (int r = i + 1; r < 4; ++r)
+                if (std::fabs(M[r][i]) > std::fabs(M[p][i])) p = r;
+            if (!(std::fabs(M[p][i]) > 0.0)) return false;
+            for (int j = 0; j < 5; ++j) std::swap(M[i][j], M[p][j]);
+            for (int r = 0; r < 4; ++r) {
+                if (r == i) continue;
+                const double f = M[r][i] / M[i][i];
+                for (int j = i; j < 5; ++j) M[r][j] -= f * M[i][j];
+            }
+        }
+        double xp[4];
+        for (int i = 0; i < 4; ++i) xp[i] = M[i][4] / M[i][i];
+        auto iv = [](const Vec3d& v) { return geom::IVec3{Interval(v.x), Interval(v.y), Interval(v.z)}; };
+        const V2 A = lift(iv(a), iv(au * xp[0] + av * xp[1]));
+        const V2 C = lift(iv(c), iv(cu * xp[0] + cv * xp[1]));
+        const V2 B = lift(iv(b), iv(bs * xp[2] + bt * xp[3]));
+        const D2 R(r_);
+        bool ok = false;
+        const V2 q = arc_point(A, C, B, (A - C) / R, (B - C) / R, r_, D2(Interval(theta), Interval(0.0), Interval(1.0)), ok);
+        if (!ok) return false;
+        Ps = {num::mid(q.x.du), num::mid(q.y.du), num::mid(q.z.du)};
+        Pt = {num::mid(q.x.dv), num::mid(q.y.dv), num::mid(q.z.dv)};
+        return std::isfinite(Ps.x) && std::isfinite(Ps.y) && std::isfinite(Ps.z) && std::isfinite(Pt.x) &&
+               std::isfinite(Pt.y) && std::isfinite(Pt.z);
+    }
+
     void eval(double sigma, double theta, Vec3d& P, Vec3d& Ps, Vec3d& Pt) const override {
         // Point from the section; derivatives by central differences (doubles
         // are only guesses for Newton steps and quadrature nodes; certified
@@ -878,6 +994,7 @@ public:
             return Vec3d{h.x / h.w, h.y / h.w, h.z / h.w};
         };
         P = at(sigma, theta);
+        if (analytic_partials(sigma, theta, Ps, Pt)) return;
         // Differences in sigma stay inside sigma's spine segment (the speed
         // may jump at its ends): one-sided, second order, near them.
         const int k = segment_of(sigma);

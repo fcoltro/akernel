@@ -58,6 +58,7 @@
 
 #include <array>
 #include <cmath>
+#include <initializer_list>
 #include <numbers>
 #include <optional>
 #include <string>
@@ -418,21 +419,23 @@ inline BlendedSolid blend_stepped_ring_edge(double r0, double r1, double r2, dou
 // becomes a sphere patch of bidegree (2m, 2n) with exact controls: products
 // of Bernstein polynomials, whose binomial denominators all divide 144, so
 // every patch of the solid carries the common factor 144 (a uniform factor
-// does not change a patch). The quarter disc is cut at s = 1/2, t = 1/2 and
-// at q, the midpoint in parameter of the arc (1, 0) -> (0, 1) with
-// homogeneous controls (1,0,1), (1,1,1), (0,2,2):
+// does not change a patch). The quarter disc is cut from p, the image of
+// the octant's centre, to m on each axis and to q on the arc (1, 0) ->
+// (0, 1), the images of the boundary arcs' midpoints, along the images of
+// great circles (see octant_patches):
 //
 //      t
 //      1  .
-//         | Q3  .  q = (3/5, 4/5)
-//     1/2 +-----p   .
-//         | Q1  | Q2  .
-//      0  +-----+-------  s
-//         0    1/2     1
+//         |  Q3   .
+//      m  +.         q
+//         |  `p.   .
+//         | Q1 |  Q2  .
+//      0  +----+-------  s
+//         0    m       1
 //
-//   Q1 (bidegree (2, 2) in the plane, sides elevated lines) and Q2, Q3
-//   (ruled between half the arc and a segment, bidegree (2, 1)). On the
-//   sphere: Q1 (4, 4), Q2 and Q3 (4, 2). The octant's boundary pieces become
+//   Q1 (bidegree (2, 2) in the plane, a Coons patch of two segments and two
+//   arcs) and Q2, Q3 (ruled between half the arc and an arc, bidegree
+//   (2, 1)). On the sphere: Q1 (4, 4), Q2 and Q3 (4, 2). The octant's boundary pieces become
 //   the cylinders' end rows; each cylinder is split lengthwise in two to
 //   match, and the two octants at its ends are mirror images, so their rows
 //   coincide after the translation along the edge (the rows lie in the
@@ -469,17 +472,62 @@ inline PolyPatchD sphere_image(const PolyPatchD& P) {
     return R;
 }
 
-/// The unit octant x, y, z >= 0 as three exact sphere patches Q1, Q2, Q3.
+/// The unit octant x, y, z >= 0 as three congruent exact sphere patches Q1,
+/// Q2, Q3. The cuts are great-circle arcs from the octant's centre
+/// (1, 1, 1) / sqrt 3 to the midpoints of the three boundary arcs, as the
+/// threefold symmetry of the octant asks, so the three pieces are copies of
+/// one another (up to small rational rounding, below).
+///
+/// In the stereographic plane the centre is p = (c, c), c = (sqrt 3 - 1) / 2,
+/// and the midpoints are m = tan(pi / 8) on each axis and the parameter
+/// u = tan(pi / 8) of the quarter circle (1, 0) -> (0, 1) (homogeneous
+/// controls (1, 0, 1), (1, 1, 1), (0, 2, 2), point (1 - u^2, 2u) / (1 + u^2)).
+/// A great circle through (m, 0) maps to the plane circle through (m, 0) and
+/// its antipode's image (-1 / m, 0); the arc (m, 0) -> p of that circle is a
+/// rational quadratic with controls (m, 0), the tangents' intersection, and
+/// p, weights (1, 1, 1 / Q). The arc (0, m) -> p is its mirror image.
+/// Q2 and Q3 are ruled between half of the quarter circle and these arcs;
+/// Q1, around the pole, is the Coons patch of the two arcs and the segments
+/// N -> (m, 0), N -> (0, m) (exact, since its corners agree homogeneously).
+///
+/// m and c are rounded to m = 5 / 12 and c = 4 / 11 (within 2.5e-3 of the
+/// exact values; the three pieces' areas differ by 0.5 %, the centre is 0.4
+/// degrees off): the best small rationals for which every control stays an
+/// exact integer. The plane nets below, computed exactly in rationals and
+/// scaled by their common denominator 1143648, are integers below 2^22; their
+/// sphere images are integers below 2^51 with the common factor 288, taken
+/// out so that the solid's controls stay below 2^43 (exact in doubles after
+/// placement too). Shared sides use the same homogeneous controls in every
+/// patch, and the seams from the axes' midpoints are exact great circles
+/// (the seam from the equator's midpoint, a plane segment, is within 5e-4).
 inline std::array<PolyPatchD, 3> octant_patches() {
-    auto pt = [](double s, double t, double h) { return Vec4d{s, t, 0, h}; };
-    PolyPatchD q1(2, 2);
-    for (int i = 0; i <= 2; ++i)
-        for (int j = 0; j <= 2; ++j) q1.at(i, j) = pt(i / 4.0, j / 4.0, 1);
-    const Vec4d a0 = pt(1, 0, 1), am = pt(1, 0.5, 1), q = pt(0.75, 1, 1.25), bm = pt(0.5, 1.5, 1.5),
-                b2 = pt(0, 2, 2);
-    const PolyPatchD q2 = ruled({a0, am, q}, {pt(0.5, 0, 1), pt(0.5, 0.25, 1), pt(0.5, 0.5, 1)});
-    const PolyPatchD q3 = ruled({q, bm, b2}, {pt(0.5, 0.5, 1), pt(0.25, 0.5, 1), pt(0, 0.5, 1)});
-    return {sphere_image(q1), sphere_image(q2), sphere_image(q3)};
+    using H = std::array<double, 3>; // (S, T, H) of a plane control
+    auto net = [](int p, int q, std::initializer_list<H> v) {
+        PolyPatchD P(p, q);
+        auto it = v.begin();
+        for (int i = 0; i <= p; ++i)
+            for (int j = 0; j <= q; ++j, ++it) P.at(i, j) = Vec4d{(*it)[0], (*it)[1], 0, (*it)[2]};
+        return P;
+    };
+    auto image = [](const PolyPatchD& P) {
+        PolyPatchD R = sphere_image(P);
+        for (Vec4d& h : R.c) h = Vec4d{h.x / 288, h.y / 288, h.z / 288, h.w / 288}; // exact
+        return R;
+    };
+    // Q1 at (i, j): i along N -> (m, 0), j along N -> (0, m); corner (2, 2) = p.
+    const PolyPatchD q1 =
+        net(2, 2, {{0, 0, 1143648}, {0, 238260, 1143648}, {0, 476520, 1143648},
+                   {238260, 0, 1143648}, {236973, 236973, 1138698}, {211926, 473556, 1143648},
+                   {476520, 0, 1143648}, {473556, 211926, 1143648}, {423072, 423072, 1163448}});
+    // Q2: row j = 0 the quarter circle (1, 0) -> q, row j = 1 the arc (m, 0) -> p.
+    const PolyPatchD q2 = net(2, 1, {{1143648, 0, 1143648}, {476520, 0, 1143648},
+                                     {1143648, 476520, 1143648}, {473556, 211926, 1143648},
+                                     {945098, 953040, 1342198}, {423072, 423072, 1163448}});
+    // Q3: row j = 0 the quarter circle q -> (0, 1), row j = 1 the arc p -> (0, m).
+    const PolyPatchD q3 = net(2, 1, {{945098, 953040, 1342198}, {423072, 423072, 1163448},
+                                     {667128, 1620168, 1620168}, {211926, 473556, 1143648},
+                                     {0, 2287296, 2287296}, {0, 476520, 1143648}});
+    return {image(q1), image(q2), image(q3)};
 }
 
 } // namespace fillet_detail

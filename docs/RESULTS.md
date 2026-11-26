@@ -1445,7 +1445,7 @@ From `tests/op/fillet_test.cpp` (1,825 checks, 17 s). `op/fillet.hpp` builds the
 
 Every result audits closed, has only dyadic controls (contact B's weight 2 is carried consistently, and revolution uses quarter arcs with alternating end weights (1, 2) and (2, 1) so a full turn closes exactly), has no singular point on a 21 × 21 grid per face (min abs(Su × Sv) 0.008 to 0.16), and tessellates watertight (deviation below 3e-4).
 
-The sphere corners. A sphere octant is three-sided, so a single patch would be degenerate. Stereographic projection maps it to a quarter disc; that disc is cut into three quads (a square and two pieces ruled between half the arc and a segment), and the inverse projection, quadratic in homogeneous coordinates, turns them into sphere patches of bidegree (4, 4) and (4, 2). All controls are exact (the binomial denominators divide a common factor 144 carried by every patch), and sampled points lie on the unit sphere to 5.6e-16. Each cylinder is split lengthwise to meet the octant's boundary pieces, and the octants at its two ends are mirror images, so the rows match bitwise.
+The sphere corners. A sphere octant is three-sided, so a single patch would be degenerate. Stereographic projection maps it to a quarter disc; that disc is cut into three quads, and the inverse projection, quadratic in homogeneous coordinates, turns them into sphere patches of bidegree (4, 4) and (4, 2). Since 2026-11-26 the split is symmetric: the cuts run from the octant's centre to the midpoints of the three boundary arcs (the fillets' midlines), the two from the axes along exact great circles (rational quadratic arcs in the plane: the image of a great circle through (m, 0) is the circle through its antipode's image (−1/m, 0)). The square around the pole is the Coons patch of two segments and these two arcs; the other two pieces are ruled between half the boundary arc and an arc. The exact layout needs tan(π/8) and (√3 − 1)/2, rounded to 5/12 and 4/11, the best small rationals that keep every control an exact integer (below 2^43 after taking out the common factor 288): the three pieces' areas agree to 0.55 % (0.52231 to 0.52518, π/6 = 0.52360), the centre is 0.31° off and the axis seams lie on their great circles to 1e-16. Before, the pieces met at (2/3, 2/3, 1/3) on the sphere, about 16° off the centre. Sampled points lie on the unit sphere to 5.6e-16. Each cylinder is split lengthwise to meet the octant's boundary pieces, and the octants at its two ends are mirror images, so the rows match bitwise.
 
 As Boolean operands: the rounded box halved by z ≤ 1/2, cut by x ≥ 7/4 (a curved section through the fillet) and united with a block all match their closed forms to 1e-15. The rounded full ring cut by y ≥ 1/2 (through the torus) gives 3.621678018550, the same to 12 digits as an independent quadrature over the section.
 
@@ -1453,7 +1453,7 @@ What this does not show yet: edges of solids that are not swept (faces that are 
 
 ### A freeform fillet inside a solid (F5 on freeform supports, procedural faces)
 
-From `tests/op/proc_fillet_test.cpp` (41 checks, about 2 minutes, most of it the blend–plane intersections and the mesh-deviation measurement). `op/proc_fillet.hpp` builds a block whose top is a polynomial graph over the rectangle and rounds the edge between the top and the side x = a with a rolling ball. The dihedral angle varies along the edge, so the blend is not a rational surface. It is a procedural face: `Brep::procs` holds the `BlendCarrier` and the face is that carrier over its whole parameter square (docs/FEATURES.md §5.1). The top and the side are trimmed along the contact curves, which are procedural edges read in each support's parameters through the certified spine's own coordinates. The end faces are trimmed by the blend's end sections, which lie in the end planes because the top has zero slope across them.
+From `tests/op/proc_fillet_test.cpp` (70 checks, about 36 s, most of it the mesh-deviation measurement). `op/proc_fillet.hpp` builds a block whose top is a polynomial graph over the rectangle and rounds the edge between the top and the side x = a with a rolling ball. The dihedral angle varies along the edge, so the blend is not a rational surface. It is a procedural face: `Brep::procs` holds the `BlendCarrier` and the face is that carrier over its whole parameter square (docs/FEATURES.md §5.1). The top and the side are trimmed along the contact curves, which are procedural edges read in each support's parameters through the certified spine's own coordinates. The end faces are trimmed by the blend's end sections, which lie in the end planes because the top has zero slope across them.
 
 The top is z = h + c x s(y/L), with s the smoothstep 3t² − 2t³ (degree (1, 3); a = 1, L = 2, h = 3/4, r = 1/4).
 
@@ -1481,7 +1481,107 @@ Trimmed procedural faces. `round_block_edge(top, r, opt, cut)` ends the block at
 
 Both are closed with Euler 2 and mesh watertight (deviation 3.1e-4). The cost is the blend–plane intersection with its completeness proof: about 18 s here, against 1 s for the rest. Its verifier now splits a box where it is widest in space (parameter width times speed), which cut the boxes by a quarter. Getting to about 1 s needs tighter enclosures of the blend over boxes; that is a follow-up.
 
+Sloped ends (2026-11-24). The zero-slope restriction at the ends is gone. At any end where the top is not flat across the end plane, `round_block_edge` extends both supports a quarter of their length past the end (the polynomial continued), traces the spine over the extended supports, and trims the blend there by its certified curve with the end face, as for a cut. The test top is z = h + c x y / L (profile s = t), which crosses both end planes at an angle, so both ends are trimmed:
+
+| Case (top z = 0.75 + 0.5 x y / 2) | Faces / edges / vertices | Volume |
+|---|---|---|
+| Whole length | 7 / 15 / 10 | 1.701606293429266; removed 0.048393706571, by slices …572 (1.2e-12) |
+| Cut at 3L/4 | 7 / 15 / 10 | 1.234092371646494; removed 0.031532628354, by slices …353 (1.5e-13) |
+
+Each also matches its copy moved by (2, 1.5, 0) to 1e-10, is closed with Euler 2, and meshes watertight (deviation 2.5e-4). Each builds in under 1.2 s.
+
 What this does not show yet: Booleans on procedural faces (next: cuts by planar solids, decided 2026-11-24), blends meeting other blends (chains, caps), and freeform support pairs other than a graph top with a plane.
+
+### Fillets on general solids: any convex edge
+
+From `tests/op/round_edge_test.cpp` (68 checks, about 20 s). `op::round_edge(S, edge, r)` rounds a convex side edge of any Brep, not just the block's one edge. The two faces at the edge must each be a whole carrier bounded by side edges, and each end vertex must have three faces: the two supports and one end face. The supports are the faces' carriers, turned so that Su × Sv is outward (a flipped face is reversed in u), and continued a quarter of their length past both ends along the edge. The spine is their certified −r offset intersection. At each end, the blend is trimmed by its certified curve with the end face's carrier, so the end face may be curved and meet the edge at any angle. The old edge becomes the contact curve on the first face. The end vertices move to the contacts, and the edges along the end faces are shortened to them. Before building, the function checks that the edge is convex at its midpoint. Afterwards it checks that every loop closes and that the contact curves stay inside their faces (on samples).
+
+| Case | Faces / edges / vertices | Volume |
+|---|---|---|
+| Box, vertical edge | 7 / 15 / 10 | error −5.2e-13 against a b h − (1 − π/4) r² h |
+| Box, top edge along x | 7 / 15 / 10 | error 2.8e-13 |
+| Box, top edge along y | 7 / 15 / 10 | error 3.5e-12 |
+| Box, side reversed in u and flipped | 7 / 15 / 10 | error 4.0e-13 |
+| Box, two vertical edges in turn | 8 / 18 / 12 | error 7.5e-13 (the second rounding reads the first result) |
+| Freeform top, edge x = a | 7 / 15 / 10 | matches `round_block_edge` to 3.4e-13 |
+| Freeform top, edge x = 0 | 7 / 15 / 10 | matches the mirrored block's `round_block_edge` to 2.7e-13 |
+| Sloped top, edge with the end y = L | 7 / 15 / 10 | matches its moved copy to 4.8e-12 |
+
+Each result is closed with Euler characteristic 2 and meshes watertight (deviation about 2.5e-4). A radius too large for the faces is refused.
+
+What this does not check yet: whether the ball meets faces other than the three at each end, which happens when the radius is too large for the solid. Edges that meet at a rounded vertex (chains, and vertex blends where three rounded edges meet) are not covered yet.
+
+### Fillet corners: mitres through a proven touching point
+
+From `tests/op/round_edge_test.cpp` (second part). The box's top edge at x = a is rounded first with r1 = 0.25. Then the vertical edge at x = a, y = 0 is rounded with a smaller r2. The two fillets meet at the corner. Both touch the side x = a, along contact curves that cross at a point A, so the fillets touch each other at A and their intersection curve has a singular point there: two branches cross. `solve/blend_corner.hpp` proves the local picture:
+
+- A comes from a 2-D Krawczyk on the two contact curves in the side's parameters.
+- On the second fillet, h = (distance to the first spine) − r1 and its gradient vanish exactly at A. So along rays from A in the second fillet's scaled parameters, h / rho² is enclosed by the Hessian of h over each ray's box, using Taylor's integral form. The Hessian is that of the distance to a curve, with the spine's centre, c′ and c″ enclosures (`BlendCarrier::spine_box`), and the fillet's second partials (`jet2_over`).
+- Directions are covered in two stereographic charts. Exclusion holds wherever the enclosure misses zero. Near each root, Krawczyk on the direction, iterated with M ← K(M) ∩ M, proves exactly two branches for every rho up to 1e-3.
+- The sign of (P − p1) · (q1 − p1) / rho picks the branch that lies on the first fillet's arc.
+
+Away from A, the ordinary tracer proves the rest. It runs on the second fillet with a small rectangle around A cut out (`RectCarrier`): two strips beside the rectangle are proven empty, and one curve is proven in the remainder. `round_edge` then splits the first fillet's contact at A and its end curve at the mitre's far end, and joins the pieces.
+
+| Case | Faces / edges / vertices | Volume |
+|---|---|---|
+| Box, r1 = 0.25, r2 = 0.15 | 8 / 19 / 13 | error 2e-12 against the box less both quarter-round regions plus their overlap (integrated independently) |
+| Box, r2 = 0.10 | 8 / 19 / 13 | error 6e-13 |
+| Box, r2 = 0.20 | 8 / 19 / 13 | error 2e-12 |
+| Freeform top, r2 = 0.15 | 8 / 19 / 13 | matches its moved copy to 2e-11 |
+
+All are closed with Euler characteristic 2 and mesh watertight. Each corner takes about 4 s on the box and 6 s on the freeform top.
+
+**Equal radii and the larger radius second (2026-11-25).** The traced part of the mitre now ends in one of three places, read from which domain side its far end lies on (to 1e-9):
+
+- on the new fillet's far contact only: the smaller radius second, as above;
+- on both that contact and the first fillet's far contact: equal radii. The mitre ends at the first fillet's end vertex (checked to 1e-9), and the first fillet's end curve is removed;
+- on the first fillet's far contact only: the larger radius second. The mitre ends at P on that contact. Past P the new fillet meets the contact's face (the top), along a curve traced on the same region of the new fillet and cut at P. It runs to Q on the top's edge with the end face. The first fillet's contact is split at P, the top's edge at Q, and the end curve and its far vertex are removed.
+
+Unused edges and vertices are then dropped and the rest renumbered. The test now rounds the second edge with r2 = 0.25 (equal) and 0.35 after r1 = 0.25, and in the other order (0.15 then 0.25). It also rounds the top's front edge first, so that the shared face lies on the other side of the new fillet:
+
+| Case | Faces / edges / vertices | Volume error against the overlap integral |
+|---|---|---|
+| Top edge r1 = 0.25, vertical r2 = 0.25 (equal) | 8 / 18 / 12 | 6e-13 |
+| Top edge r1 = 0.25, vertical r2 = 0.35 (larger) | 8 / 19 / 13 | 3e-13 |
+| Vertical r1 = 0.15, top edge r2 = 0.25 (larger) | 8 / 19 / 13 | 6e-13 |
+| Front top edge r1 = 0.25, vertical r2 = 0.15 / 0.25 / front top 0.15 then vertical 0.25 | 8 / 19 / 13, 8 / 18 / 12, 8 / 19 / 13 | below 3e-12 |
+| Freeform top, r2 = 0.35 (larger) | 8 / 19 / 13 | matches its moved copy to 4e-12 |
+
+The overlap integral now substitutes x = a − rm sin²t with rm the smaller radius, which keeps the integrand smooth whichever radius is larger.
+
+The front-top cases found an error that the earlier tests could not see. The mitre piece next to A took its derivative in the fillet's coordinates from a two-point difference of step 1e-6. Its coordinates come from Newton solves, so the difference carried about 1e-10 of noise. The volume weighs that derivative by the face's flux function, which is near zero when A lies at theta = 0 (the earlier tests) and of order one when A lies at theta = 1. The volume was then off by 1e-9 and did not converge under refinement. `CornerEdge` now takes the derivative from a five-point stencil of step 1e-3 inside its piece, and the error is 1e-12.
+
+Three kernel changes came out of the corner work:
+
+- `BlendCarrier::eval` now gives analytic first partials. It solves for the spine's x′ in doubles and runs the arc in forward mode, where before it used central differences. Differences lost about half the digits, and a traced curve's tangent, solved from those partials, lost more where two surfaces meet at a small angle, as next to A. A moved copy of the box corner was off by 4e-9 in volume before and is off by 4e-12 now. The plain rounded block under translation went from 3e-11 to 2e-12.
+- `ProcEdge::on_proc_jet` gives procedural-face coordinates with their derivatives. `TracedEdge` answers from the curve's tangent, and volume uses it.
+- The second partials over a theta range are now hulled from 8 pieces, like the first, which narrows them several times.
+
+**Clearance (2026-11-25).** `round_edge` now proves that the ball stays clear of the rest of the solid. Over the blend's sigma span, the blend must meet no face except those at its own vertices (the supports, the end faces, and at a corner the faces around the earlier fillet's end vertex). Faces whose interval enclosures miss the blend's (16 × 2 pieces against 4 × 4) are skipped. For the rest, `intersect_carriers` must prove that there is no curve. The check is conservative: it refuses a face whose carrier meets the blend outside the face's trimmed region. Most oversized radii are already refused earlier, because a contact runs past the edge it splits. The new check catches what those checks cannot see. The test puts a small box-shaped cavity, 0.07 × 0.2 × 0.1, inside the corner region of the top edge. With r = 0.25 the ball would cut the cavity, and the fillet is refused. With r = 0.1 the blend passes beside it: the carriers are proven apart, and the volume matches the closed form less the cavity to 2e-12. The check adds about 25 s to round_edge_test, now about 175 s.
+
+### Fillet corners: three fillets at one corner
+
+From `tests/op/round_edge_test.cpp` (2026-11-25). The box's top edge at x = a is rounded with r1 = 0.25, the vertical edge at x = a, y = 0 with r2 = 0.15, then the top edge at y = 0 with r3. The third fillet's end vertex lies on the first fillet. Its far contact, on the front, crosses the second fillet's contact at a second touching point B. The third fillet then runs:
+
+- from A, where it touches the first fillet on the top,
+- along its mitre with the first fillet to T, where all three fillets meet,
+- along its mitre with the second fillet to B.
+
+Both touching points are proven as before (Krawczyk, then the polar blow-up), each with the largest rectangle that works at it. Each rectangle is proven free of the other earlier fillet. The two mitres are traced on the region between the rectangles, each with one curve and a completeness proof. T is found three ways: on each new mitre where it crosses the other earlier fillet, and on the first two fillets' mitre where it crosses the new one. A crossing counts only inside that fillet's arc (a wedge test), because the full cylinder is crossed twice. The three positions of T must agree to 1e-9. The first two fillets' mitre is cut at T, the second fillet's contact at B, and what is left of the first fillet's end curve is removed. With r3 = 0.01, small enough that the far contact meets that end curve, the two-fillet path applies.
+
+The reference volume is the box less the union of the three quarter-round regions, by inclusion and exclusion. The pairwise overlaps are integrated as before. The triple overlap is the integral, over the second region's cross-section, of the smaller of the other two regions' depths, split at its kinks.
+
+| r3 | Faces / edges / vertices | Volume error |
+|---|---|---|
+| 0.01 | 9 / 23 / 16 | 1.7e-12 |
+| 0.05 | 9 / 24 / 17 | 6.6e-13 |
+| 0.10 | 9 / 24 / 17 | 1.2e-12 |
+| 0.20 | 9 / 24 / 17 | 1.2e-13 |
+
+All are closed, with Euler characteristic 2, and mesh watertight. Each takes 8 to 14 s. Still refused:
+
+- three equal radii, where the third edge's end vertex has four faces;
+- some orders, such as the front top edge with r = 0.1 and then the vertical edge with r = 0.15. There the polar blow-up at A does not prove the two branches for rho ≥ 5e-4: Krawczyk stalls, though no enclosure straddles zero. At rho = 2.5e-4 the tracer cannot complete next to the small rectangle.
 
 ### Plane cuts of solids with procedural faces (first step of Booleans on them)
 

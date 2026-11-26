@@ -139,6 +139,10 @@ public:
     int proc[2] = {-1, -1};    ///< Brep::procs index of side a / b, or -1
     CurvePath path;
     double from = 0.0, to = 1.0;
+    /// Coordinates reported to faces: off[i] + scl[i] x[i] of the curve's
+    /// coordinates x (identity unless a side is a RectCarrier over part of
+    /// the face's carrier).
+    double off[4] = {0.0, 0.0, 0.0, 0.0}, scl[4] = {1.0, 1.0, 1.0, 1.0};
 
     solve::CarrierPairSystem sys() const { return solve::CarrierPairSystem(*a, *b); }
     double sigma(double tau) const { return from + tau * (to - from); }
@@ -164,13 +168,22 @@ public:
     bool coords(int side, double tau, double& u, double& v) const {
         solve::Pt4 x;
         if (!at(tau, x)) return false;
-        u = x[static_cast<std::size_t>(2 * side)];
-        v = x[static_cast<std::size_t>(2 * side + 1)];
+        u = off[2 * side] + scl[2 * side] * x[static_cast<std::size_t>(2 * side)];
+        v = off[2 * side + 1] + scl[2 * side + 1] * x[static_cast<std::size_t>(2 * side + 1)];
         return true;
     }
     bool on_carrier(int c, double tau, double& u, double& v, double& du, double& dv) const override {
         const int side = carrier[0] == c ? 0 : carrier[1] == c ? 1 : -1;
         if (side < 0) return false;
+        return side_jet(side, tau, u, v, du, dv);
+    }
+    bool on_proc_jet(int p, double tau, double& s, double& t, double& ds, double& dt) const override {
+        const int side = proc[0] == p ? 0 : proc[1] == p ? 1 : -1;
+        if (side < 0) return false;
+        return side_jet(side, tau, s, t, ds, dt);
+    }
+    /// The coordinates on one side and their tau-derivatives from the tangent.
+    bool side_jet(int side, double tau, double& u, double& v, double& du, double& dv) const {
         // The derivative from the curve's tangent: on the slice m . (x - a) =
         // c, dx/dc = t / (m . t); c is linear in sigma on the segment, and
         // sigma in tau.
@@ -184,10 +197,10 @@ public:
         const double w = path.brk[static_cast<std::size_t>(k) + 1] - path.brk[static_cast<std::size_t>(k)];
         if (!(std::fabs(mt) > 0.0) || !(w > 0.0)) return false;
         const double dc = (seg.reversed ? -seg.len : seg.len) / w * (to - from);
-        u = x[static_cast<std::size_t>(2 * side)];
-        v = x[static_cast<std::size_t>(2 * side + 1)];
-        du = t[static_cast<std::size_t>(2 * side)] / mt * dc;
-        dv = t[static_cast<std::size_t>(2 * side + 1)] / mt * dc;
+        u = off[2 * side] + scl[2 * side] * x[static_cast<std::size_t>(2 * side)];
+        v = off[2 * side + 1] + scl[2 * side + 1] * x[static_cast<std::size_t>(2 * side + 1)];
+        du = scl[2 * side] * t[static_cast<std::size_t>(2 * side)] / mt * dc;
+        dv = scl[2 * side + 1] * t[static_cast<std::size_t>(2 * side + 1)] / mt * dc;
         return true;
     }
     bool on_proc(int p, double tau, double& s, double& t) const override {

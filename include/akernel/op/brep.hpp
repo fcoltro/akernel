@@ -83,6 +83,11 @@ struct ProcEdge {
         (void)t1;
         return nullptr;
     }
+    /// Parameters on Brep::procs[proc] and their derivatives in tau. By
+    /// default from central differences inside tau's piece of breaks();
+    /// edges that know their tangent override it (differences lose digits
+    /// on short pieces).
+    virtual bool on_proc_jet(int proc, double tau, double& s, double& t, double& ds, double& dt) const;
 };
 
 /// Central differences of a curve's parameters in tau, inside tau's piece of
@@ -97,6 +102,12 @@ bool piece_derivative(const std::vector<double>& breaks, double tau, const F& uv
     du = (ub - ua) / (tb - ta);
     dv = (vb - va) / (tb - ta);
     return true;
+}
+
+inline bool ProcEdge::on_proc_jet(int proc, double tau, double& s, double& t, double& ds, double& dt) const {
+    if (!on_proc(proc, tau, s, t)) return false;
+    auto st = [&](double x, double& a, double& b) { return on_proc(proc, x, a, b); };
+    return piece_derivative(breaks(), tau, st, ds, dt);
 }
 
 struct BEdge {
@@ -329,14 +340,13 @@ inline double volume(const Brep& b, bool quick = false) {
                     const BEdge& e = b.edges[static_cast<std::size_t>(ce.edge)];
                     if (!e.proc) continue; // a procedural face is bounded by procedural edges
                     const std::vector<double> bt = e.proc->breaks();
-                    auto st = [&](double tau, double& s, double& t) { return e.proc->on_proc(face.proc, tau, s, t); };
                     for (std::size_t piece = 0; piece + 1 < bt.size(); ++piece)
                         for (int k = 0; k < 4; ++k) {
                             const double dt = (bt[piece + 1] - bt[piece]) / 4, t0 = bt[piece] + k * dt;
                             for (std::size_t i = 0; i < outer12.x.size(); ++i) {
                                 const double tau = t0 + outer12.x[i] * dt;
                                 double s, t, ds, dtt;
-                                if (!st(tau, s, t) || !piece_derivative(bt, tau, st, ds, dtt)) continue;
+                                if (!e.proc->on_proc_jet(face.proc, tau, s, t, ds, dtt)) continue;
                                 if (ds == 0.0) continue;
                                 flux += outer12.w[i] * F(s, t) * (ce.reversed ? -ds : ds) * dt;
                             }
