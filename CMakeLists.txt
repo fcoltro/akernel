@@ -71,3 +71,12 @@ target_link_libraries(ak_demo PRIVATE akernel)
 
 add_executable(ak_boolean_demo examples/boolean_demo.cpp)
 target_link_libraries(ak_boolean_demo PRIVATE akernel)
+
+# Random models checked by oracles (fuzz/README.md). The test runs a few
+# fixed seeds; the nightly workflow runs hundreds of new ones.
+add_executable(ak_random_models fuzz/random_models.cpp)
+target_link_libraries(ak_random_models PRIVATE akernel)
+target_include_directories(ak_random_models PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+add_test(NAME random_models_smoke COMMAND ak_random_models --seed 1 --count 12)
+add_test(NAME random_models_regressions
+         COMMAND ak_random_models --seeds-file ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/regression_seeds.txt)
