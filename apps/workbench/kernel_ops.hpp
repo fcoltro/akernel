@@ -326,10 +326,10 @@ inline op::fillet_detail::Section rectangle_section(double a, double b) {
 inline Outcome extrude_rect(const Vec3d& o, double W, double H, double L, Corner c, double r, double d2) {
     if (!(W > 0 && H > 0 && L > 0)) return refused("Extrude: sizes must be positive");
     if (c == Corner::None) {
-        Outcome r = from_blended("Extrusion", op::fillet_detail::extrude_section(rectangle_section(W, H), o, {1, 0, 0},
-                                                                                 {0, 1, 0}, {0, 0, 1}, L));
-        if (r.body) r.body->recipe = {Recipe::Box, o, o + Vec3d{W, H, L}};
-        return r;
+        Outcome out = from_blended("Extrusion", op::fillet_detail::extrude_section(rectangle_section(W, H), o, {1, 0, 0},
+                                                                                   {0, 1, 0}, {0, 0, 1}, L));
+        if (out.body) out.body->recipe = {Recipe::Box, o, o + Vec3d{W, H, L}};
+        return out;
     }
     return from_blended(c == Corner::Fillet ? "Extrusion, filleted edge" : "Extrusion, chamfered edge",
                         op::blend_box_edge(o, {W, 0, 0}, {0, H, 0}, {0, 0, L}, edge_cut(c, r, d2)));
