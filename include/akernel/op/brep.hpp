@@ -15,6 +15,14 @@
 //   vertex   a point with certified parameters ("charts") on every carrier
 //            it lies on
 //
+// Body types (Parasolid's): a solid is closed shells; a sheet is open
+// shells, whose boundary edges are sides of one carrier only (on[1] unset);
+// a wire is edges on no face, each a whole rational B-spline curve of
+// Brep::curves whose end control points are its vertices exactly; an acorn
+// is a vertex alone. body_kind() decides the type on the integer audit, and
+// check_wire_geometry() checks the wire edges' end points exactly.
+// Attributes (op/attribute.hpp) hang on the body, faces, edges and vertices.
+//
 // No entity stores a tolerance. What is stored instead are the certificates:
 // parameter enclosures of vertices and tube segments of arc edges.
 #pragma once
@@ -29,7 +37,10 @@
 #include <vector>
 
 #include <akernel/num/detmath.hpp>
+#include <akernel/num/expansion.hpp>
 #include <akernel/geom/carrier.hpp>
+#include <akernel/geom/nurbs_curve.hpp>
+#include <akernel/op/attribute.hpp>
 #include <akernel/op/contact.hpp>
 #include <akernel/op/patch_solid.hpp>
 #include <akernel/op/planar.hpp>
@@ -55,6 +66,7 @@ struct BVertex {
     /// they need not be dyadic where the point is.
     bool exact = false;
     geom::Vec4d xp{};
+    Attributes attributes;
     const Chart* chart(int carrier) const {
         for (const Chart& c : charts)
             if (c.carrier == carrier) return &c;
@@ -119,6 +131,13 @@ struct BEdge {
     // coordinates 0, 1) and carrier[1] (coordinates 2, 3).
     int carrier[2] = {-1, -1};
     std::shared_ptr<const ArcGeom> geom;
+
+    // Wire edge (on no face): the whole of Brep::curves[curve], from v0 at
+    // its first parameter to v1 at its last. Then arc is false, proc is null
+    // and on[] is unset.
+    int curve = -1;
+
+    Attributes attributes;
 };
 
 struct BCoedge {
@@ -131,6 +150,7 @@ struct BFace {
     int proc = -1;        ///< >= 0: the face is Brep::procs[proc] over its whole parameter square
     bool flipped = false; ///< outward normal is -(Su x Sv)
     std::vector<std::vector<BCoedge>> loops;
+    Attributes attributes;
 };
 
 struct Brep {
@@ -147,6 +167,10 @@ struct Brep {
     /// inside-out check (a volume quadrature) can be skipped. Clear it after
     /// editing a Brep by hand.
     bool outward_known = false;
+    /// Curves of the wire edges (BEdge::curve).
+    std::vector<geom::NurbsCurve> curves;
+    /// Attributes of the body itself.
+    Attributes attributes;
 };
 
 /// A patch solid as a Brep: every face is a whole carrier.
@@ -289,6 +313,106 @@ inline topo::Complex to_complex(const Brep& b) {
 }
 
 inline topo::AuditReport audit(const Brep& b) { return to_complex(b).audit(); }
+
+/// The body type, from the integer audit (topo::AuditReport::kind).
+inline topo::BodyKind body_kind(const Brep& b) { return audit(b).kind(); }
+
+/// Do two homogeneous points with positive weights name the same point?
+/// Exact: a.x * b.w == b.x * a.w (and y, z) in expansion arithmetic.
+inline bool same_point_h(const geom::Vec4d& a, const geom::Vec4d& b) {
+    if (!(a.w > 0.0) || !(b.w > 0.0)) return false;
+    const auto eq = [](double ax, double aw, double bx, double bw) {
+        return (num::Expansion(ax) * num::Expansion(bw) - num::Expansion(bx) * num::Expansion(aw)).sign() == 0;
+    };
+    return eq(a.x, a.w, b.x, b.w) && eq(a.y, a.w, b.y, b.w) && eq(a.z, a.w, b.z, b.w);
+}
+
+/// Is the knot vector clamped (end knots of multiplicity p + 1), nondecreasing,
+/// and the weights positive? Then the curve starts and ends exactly at its
+/// end control points.
+inline bool clamped_curve(const geom::NurbsCurve& c, std::string& error) {
+    const std::size_t n = c.cp.size(), p = static_cast<std::size_t>(c.p);
+    if (c.p < 1 || n < p + 1 || c.U.size() != n + p + 1) { error = "a wire curve has an inconsistent degree, knots or control points"; return false; }
+    for (std::size_t i = 1; i < c.U.size(); ++i)
+        if (!(c.U[i - 1] <= c.U[i])) { error = "a wire curve's knots decrease"; return false; }
+    for (std::size_t i = 1; i <= p; ++i)
+        if (c.U[i] != c.U[0] || c.U[c.U.size() - 1 - i] != c.U.back()) { error = "a wire curve's knot vector is not clamped"; return false; }
+    if (!(c.U[0] < c.U.back())) { error = "a wire curve has an empty domain"; return false; }
+    for (const geom::Vec4d& h : c.cp)
+        if (!(h.w > 0.0)) { error = "a wire curve has a weight that is not positive"; return false; }
+    return true;
+}
+
+/// Exact check of the wire edges' geometry: each is a clamped curve with
+/// positive weights whose first and last control points are its vertices'
+/// exact points (BVertex::exact). The curve then interpolates them, with no
+/// tolerance (thesis T1). Edges on faces are not checked here.
+inline bool check_wire_geometry(const Brep& b, std::string& error) {
+    for (std::size_t i = 0; i < b.edges.size(); ++i) {
+        const BEdge& e = b.edges[i];
+        if (e.curve < 0) continue;
+        const std::string at = "wire edge " + std::to_string(i) + ": ";
+        if (e.arc || e.proc || e.on[0].carrier >= 0 || e.on[1].carrier >= 0) { error = at + "it also has face geometry"; return false; }
+        if (e.curve >= static_cast<int>(b.curves.size())) { error = at + "no such curve"; return false; }
+        const geom::NurbsCurve& c = b.curves[static_cast<std::size_t>(e.curve)];
+        std::string why;
+        if (!clamped_curve(c, why)) { error = at + why; return false; }
+        for (int end = 0; end < 2; ++end) {
+            const int v = end == 0 ? e.v0 : e.v1;
+            if (v < 0 || v >= static_cast<int>(b.vertices.size())) { error = at + "no such vertex"; return false; }
+            const BVertex& V = b.vertices[static_cast<std::size_t>(v)];
+            if (!V.exact) { error = at + "a vertex has no exact point"; return false; }
+            if (!same_point_h(end == 0 ? c.cp.front() : c.cp.back(), V.xp)) {
+                error = at + "the curve does not end at its vertex";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/// A wire body from curves. Curve ends are joined into one vertex exactly
+/// when they are the same point (same_point_h): identity by construction,
+/// no distance is measured. A curve whose two ends are the same point is a
+/// ring edge with one vertex. Fails on a curve that is not clamped or has a
+/// weight that is not positive.
+inline bool make_wire(std::vector<geom::NurbsCurve> curves, Brep& out, std::string& error) {
+    out = Brep{};
+    for (const geom::NurbsCurve& c : curves)
+        if (!clamped_curve(c, error)) return false;
+    auto vertex_at = [&](const geom::Vec4d& h) {
+        for (std::size_t v = 0; v < out.vertices.size(); ++v)
+            if (same_point_h(out.vertices[v].xp, h)) return static_cast<int>(v);
+        BVertex V;
+        V.exact = true;
+        V.xp = h;
+        V.point = {h.x / h.w, h.y / h.w, h.z / h.w};
+        out.vertices.push_back(V);
+        return static_cast<int>(out.vertices.size()) - 1;
+    };
+    for (std::size_t i = 0; i < curves.size(); ++i) {
+        BEdge e;
+        e.v0 = vertex_at(curves[i].cp.front());
+        e.v1 = vertex_at(curves[i].cp.back());
+        e.curve = static_cast<int>(i);
+        out.edges.push_back(e);
+    }
+    out.curves = std::move(curves);
+    return true;
+}
+
+/// A sheet body from whole patches. Two patch sides are the same edge only
+/// if their control points are identical, in the same or the opposite order
+/// (as in PatchSolid::build); a side matched by no other is a boundary edge.
+/// Every patch is a face with outward normal Su x Sv, so the patches must be
+/// oriented alike. Check the result with body_kind() == Sheet.
+inline bool make_sheet(std::vector<PolyPatchD> patches, Brep& out, std::string& error) {
+    PatchSolid s;
+    s.faces = std::move(patches);
+    if (!s.build(error, /*open=*/true)) return false;
+    out = to_brep(s);
+    return true;
+}
 
 /// Volume enclosed by the Brep: (1/3) * sum over faces of the integral of
 /// S . n over the trimmed face, turned into loop integrals by Green's

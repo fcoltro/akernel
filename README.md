@@ -133,6 +133,28 @@ const op::SolidComparison c = op::compare_solids(x.solid, y.solid);   // c.same,
 
 Two solids are the same when their vertices match one to one by certified enclosures, their surfaces are identical (or exactly coplanar planes with the same outward side), and their edges and faces correspond. Seams (two faces of one surface glued along an edge) and vertices where an edge merely continues are removed first, since two correct routes to the same solid may split it differently.
 
+## Body types and attributes
+
+```cpp
+#include <akernel/op/brep_transform.hpp>
+
+op::Brep sheet, wire;
+std::string error;
+op::make_sheet(patches, sheet, error);              // whole patches; unmatched sides are the boundary
+op::make_wire({geom::exact_circle(2.0, 0.0, 4)}, wire, error); // curve ends joined where they are the same point
+op::body_kind(sheet);                               // topo::BodyKind::Sheet
+op::check_wire_geometry(wire, error);               // curve ends are the vertices, exactly
+
+op::Attribute a;
+a.name = "datum";
+a.points = {{0.5, 0.5, 1.0}};                       // moves with the body
+a.directions = {{0.0, 0.0, 1.0}};                   // turns with the body
+op::set_attribute(sheet.faces[0].attributes, a);
+const op::Brep both = op::merged(op::transformed(sheet, m), wire);   // one general body
+```
+
+The body type (solid, sheet, wire, acorn, general) is decided by the integer audit alone: a sheet is open oriented manifold shells, each of integer genus with its boundary edges forming cycles (V - E + F - rings = 2 - 2g - b); a wire is edges on no face, every component a simple path or cycle. A wire edge is a whole clamped rational B-spline whose end control points are its vertices, compared exactly in homogeneous coordinates, so no tolerance is involved. Attributes hang on the body, its faces, edges and vertices; they are copied with the Brep, mapped by rigid maps, kept by `merged`, and kept by Boolean operations on the face regions and edge pieces that come from an attributed face or edge.
+
 ## Surface intersection
 
 ```cpp
@@ -165,7 +187,7 @@ include/akernel/
   solve/  ssi.hpp  csi.hpp  contact_point.hpp
   var/    fill.hpp
   topo/   complex.hpp
-  op/     patch_solid.hpp  brep.hpp  trim.hpp  planar.hpp  surfaces.hpp  contact.hpp  tsi.hpp  boolean.hpp  tessellate.hpp  compare.hpp
+  op/     patch_solid.hpp  brep.hpp  attribute.hpp  brep_transform.hpp  trim.hpp  planar.hpp  surfaces.hpp  contact.hpp  tsi.hpp  boolean.hpp  tessellate.hpp  compare.hpp
   diag/   rate.hpp
 tests/    one executable per module (22)
 bench/    bench_main.cpp   (source of docs/RESULTS.md)

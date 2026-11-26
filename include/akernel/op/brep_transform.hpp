@@ -2,6 +2,10 @@
 // procedural faces and edges, and re-indexing of procedural edges when two
 // Breps are merged (docs/FEATURES.md §5.1).
 //
+// Attributes move with the body (op/attribute.hpp): their points by the
+// map, their directions by its linear part. merged() joins two Breps into
+// one body without comparing their geometry.
+//
 // A SignedPermutation map x'_i = s_i x_{p(i)} + t_i (quarter turns, mirror
 // images and translations) is exact on doubles for dyadic t of moderate
 // size: rational carriers keep exact control points, and procedural ones
@@ -141,10 +145,60 @@ inline Brep transformed(const Brep& B, const SignedPermutation& m) {
     }
     for (BEdge& e : R.edges)
         if (e.proc) e.proc = std::make_shared<transform_detail::MappedEdge>(e.proc, m, 0, 0);
+    for (geom::NurbsCurve& c : R.curves)
+        for (geom::Vec4d& h : c.cp) h = m.apply_h(h);
     if (m.det() < 0.0)
         for (BFace& f : R.faces) f.flipped = !f.flipped;
+    // Attributes: positions move with the body, directions turn with it.
+    const auto point = [&](const Vec3d& x) { return m.apply(x); };
+    const auto linear = [&](const Vec3d& x) { return m.linear(x); };
+    map_attributes(R.attributes, point, linear);
+    for (BVertex& v : R.vertices) map_attributes(v.attributes, point, linear);
+    for (BEdge& e : R.edges) map_attributes(e.attributes, point, linear);
+    for (BFace& f : R.faces) map_attributes(f.attributes, point, linear);
     R.outward_known = false;
     return R;
+}
+
+/// The disjoint union of A and B as one body: B's carriers, procs, curves,
+/// vertices, edges and faces appended after A's, with every index into
+/// them shifted. Geometry is copied, not compared: entities of A and B that
+/// coincide stay separate. The body's attributes are A's followed by those
+/// of B whose names A does not have.
+inline Brep merged(const Brep& A, const Brep& B) {
+    Brep M = A;
+    const int nc = static_cast<int>(A.carriers.size()), np = static_cast<int>(A.procs.size());
+    const int ncu = static_cast<int>(A.curves.size()), nv = static_cast<int>(A.vertices.size());
+    const int ne = static_cast<int>(A.edges.size());
+    M.carriers.insert(M.carriers.end(), B.carriers.begin(), B.carriers.end());
+    M.procs.insert(M.procs.end(), B.procs.begin(), B.procs.end());
+    M.curves.insert(M.curves.end(), B.curves.begin(), B.curves.end());
+    for (BVertex v : B.vertices) {
+        for (Chart& c : v.charts) c.carrier += nc;
+        M.vertices.push_back(std::move(v));
+    }
+    for (BEdge e : B.edges) {
+        e.v0 += nv;
+        e.v1 += nv;
+        for (auto& r : e.on)
+            if (r.carrier >= 0) r.carrier += nc;
+        for (int& c : e.carrier)
+            if (c >= 0) c += nc;
+        if (e.curve >= 0) e.curve += ncu;
+        e.proc = reindexed(e.proc, nc, np);
+        M.edges.push_back(std::move(e));
+    }
+    for (BFace f : B.faces) {
+        if (f.proc >= 0) f.proc += np;
+        else f.carrier += nc;
+        for (auto& loop : f.loops)
+            for (BCoedge& ce : loop) ce.edge += ne;
+        M.faces.push_back(std::move(f));
+    }
+    for (const Attribute& a : B.attributes)
+        if (!find_attribute(M.attributes, a.name)) M.attributes.push_back(a);
+    M.outward_known = A.outward_known && B.outward_known;
+    return M;
 }
 
 } // namespace ak::op

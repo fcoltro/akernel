@@ -6668,7 +6668,8 @@ inline BooleanResult select(const Imprint& im, Op op) {
         const auto it = vmap.find(v);
         if (it != vmap.end()) return it->second;
         const int id = static_cast<int>(out.vertices.size());
-        out.vertices.push_back({im.vertices[static_cast<std::size_t>(v)].point, {}});
+        out.vertices.emplace_back();
+        out.vertices.back().point = im.vertices[static_cast<std::size_t>(v)].point;
         out.vertices.back().exact = im.vertices[static_cast<std::size_t>(v)].exact;
         out.vertices.back().xp = im.vertices[static_cast<std::size_t>(v)].xp;
         vmap[v] = id;
@@ -6694,6 +6695,7 @@ inline BooleanResult select(const Imprint& im, Op op) {
             e.v0 = vertex(pc.v0);
             e.v1 = vertex(pc.v1);
             e.arc = src.arc;
+            e.attributes = src.attributes; // a piece of an edge keeps the edge's attributes
             if (src.arc) {
                 e.carrier[0] = carrier(cof[static_cast<std::size_t>(src.carrier[0])]);
                 e.carrier[1] = carrier(cof[static_cast<std::size_t>(src.carrier[1])]);
@@ -6728,6 +6730,7 @@ inline BooleanResult select(const Imprint& im, Op op) {
         BFace face;
         face.carrier = carrier(im.carrier_of[s][static_cast<std::size_t>(src.carrier)]);
         face.flipped = src.flipped != flip;
+        face.attributes = src.attributes; // a region of a face keeps the face's attributes
         for (const auto& loop : reg.loops) {
             std::vector<BCoedge> L;
             for (const Piece& p : loop) L.push_back({edge(p), !p.forward});
@@ -6798,6 +6801,15 @@ inline BooleanResult boolean_op(const Brep& A, const Brep& B, Op op, const Boole
         r.error = "Booleans on procedural faces are not supported yet (docs/FEATURES.md 5.1)";
         return r;
     }
+    // A body with no faces is the empty solid only if it has no edges and no
+    // vertices either: wires and acorns are not Boolean operands yet.
+    for (const Brep* b : {&A, &B})
+        if (b->faces.empty() && (!b->edges.empty() || !b->vertices.empty())) {
+            BooleanResult r;
+            r.op = op;
+            r.error = std::string("a ") + topo::to_string(body_kind(*b)) + " body is not a Boolean operand yet";
+            return r;
+        }
     if (A.faces.empty() || B.faces.empty()) {
         BooleanResult r;
         r.op = op;

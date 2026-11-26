@@ -13,10 +13,23 @@
 // definition shared by both faces) combinatorial closure implies geometric
 // closure, so this audit is the watertightness test.
 //
+// The same audit classifies a body by its topology (Parasolid's body types):
+//   solid   closed manifold shells (watertight());
+//   sheet   open manifold oriented shells: every edge used once (boundary)
+//           or twice in opposite directions, each shell an orientable
+//           surface of integer genus g with b boundary cycles,
+//           V - E + F - rings = 2 - 2g - b;
+//   wire    edges used by no face, each vertex at the end of at most two
+//           edge ends: every component is a simple path or a simple cycle;
+//   acorn   vertices only.
+// Anything else that is a valid chain (a closed non-manifold boundary,
+// faces and wires together) is a general body.
+//
 // Not checked here: self-intersection (op/validity.hpp checks it for
 // Breps of whole-carrier faces).
 #pragma once
 
+#include <algorithm>
 #include <map>
 #include <numeric>
 #include <utility>
@@ -47,8 +60,38 @@ struct ShellReport {
     int vertices = 0, edges = 0, faces = 0, rings = 0;
     int euler = 0;        ///< V - E + F - rings
     bool closed = false;  ///< no boundary edges
-    int genus = -1;       ///< for closed shells: (2 - euler) / 2, or -1 if not an integer >= 0
+    int boundary_edges = 0; ///< edges of the shell used once
+    int boundary_loops = 0; ///< cycles the boundary edges form (0 for a closed shell)
+    /// (2 - euler - boundary_loops) / 2 for a manifold shell whose boundary
+    /// is a disjoint union of cycles (closed or open shell); -1 if that is
+    /// not an integer >= 0 or the shell is not manifold.
+    int genus = -1;
 };
+
+/// One connected component of the edges used by no face.
+struct WireReport {
+    int vertices = 0, edges = 0;
+    int max_degree = 0;   ///< most edge ends at one vertex (a ring edge counts twice)
+    bool closed = false;  ///< every vertex has degree 2: a simple cycle
+    /// A simple path or a simple cycle: max_degree <= 2 and V - E is 1 or 0.
+    bool manifold() const { return max_degree <= 2 && (vertices - edges == 1 || (closed && vertices == edges)); }
+};
+
+/// Parasolid's body types, decided on the incidence structure alone.
+enum class BodyKind { Empty, Acorn, Wire, Sheet, Solid, General, Invalid };
+
+inline const char* to_string(BodyKind k) {
+    switch (k) {
+    case BodyKind::Empty: return "empty";
+    case BodyKind::Acorn: return "acorn";
+    case BodyKind::Wire: return "wire";
+    case BodyKind::Sheet: return "sheet";
+    case BodyKind::Solid: return "solid";
+    case BodyKind::General: return "general";
+    case BodyKind::Invalid: return "invalid";
+    }
+    return "?";
+}
 
 struct AuditReport {
     bool loops_closed = true;
@@ -56,11 +99,14 @@ struct AuditReport {
     int boundary_edges = 0;      ///< used once
     int nonmanifold_edges = 0;   ///< used more than twice
     int misoriented_edges = 0;   ///< used as often in one direction as in the other: no
+    int same_way_edges = 0;      ///< used by exactly two faces, both the same way: orientations disagree
     int unused_edges = 0;
     int nonmanifold_vertices = 0; ///< corners at the vertex form more than one fan
     int open_fans = 0;            ///< fans at a vertex that do not close around it
     int euler = 0;                ///< V - E + F - rings over the whole complex (used entities)
     std::vector<ShellReport> shells;
+    std::vector<WireReport> wires; ///< components of the edges used by no face
+    int isolated_vertices = 0;     ///< vertices on no edge (acorns)
     int ledger_entries = 0;      ///< entities with a recorded tolerance
     double max_tolerance = 0.0;
 
@@ -84,6 +130,37 @@ struct AuditReport {
         for (const auto& s : shells)
             if (!s.closed || s.genus < 0) return false;
         return true;
+    }
+    /// A valid manifold sheet: oriented, every shell open with boundary
+    /// cycles and an integer genus, no wire edges and no acorns.
+    bool sheet() const {
+        if (!loops_closed || !chain_condition || misoriented_edges || unused_edges || isolated_vertices) return false;
+        if (!manifold() || shells.empty()) return false;
+        for (const auto& s : shells)
+            if (s.closed || s.boundary_loops < 1 || s.genus < 0) return false;
+        return true;
+    }
+    /// A valid manifold wire: no faces, at least one edge, every component a
+    /// simple path or cycle, no acorns.
+    bool wire() const {
+        if (!shells.empty() || wires.empty() || isolated_vertices) return false;
+        for (const auto& w : wires)
+            if (!w.manifold()) return false;
+        return true;
+    }
+    /// The body type. A body that is not a valid chain (an open loop, a
+    /// broken chain condition) or whose faces disagree on orientation across
+    /// an edge of two faces is Invalid; a valid one that is not of a special
+    /// type is General (an edge of three faces, say, cannot balance its uses).
+    BodyKind kind() const {
+        if (!loops_closed || !chain_condition || same_way_edges) return BodyKind::Invalid;
+        if (shells.empty()) {
+            if (wires.empty()) return isolated_vertices ? BodyKind::Acorn : BodyKind::Empty;
+            return wire() ? BodyKind::Wire : BodyKind::General;
+        }
+        if (!unused_edges && !isolated_vertices && watertight()) return BodyKind::Solid;
+        if (sheet()) return BodyKind::Sheet;
+        return BodyKind::General;
     }
 };
 
@@ -170,6 +247,7 @@ public:
             else {
                 if (uses[e] > 2) ++r.nonmanifold_edges;
                 if (orient_sum[e] != 0) ++r.misoriented_edges;
+                if (uses[e] == 2 && orient_sum[e] != 0) ++r.same_way_edges;
             }
             if (edges[e].tol > 0.0) { ++r.ledger_entries; r.max_tolerance = std::max(r.max_tolerance, edges[e].tol); }
         }
@@ -274,13 +352,89 @@ public:
             // All fans in one shell: that shell is pinched at v.
             if (shells_at.size() == 1) shell_nonmanifold[static_cast<std::size_t>(shells_at.begin()->first)] = 1;
         }
+        // Boundary cycles per shell: components of the boundary edges. At a
+        // vertex with one fan the boundary edges number 0 or 2 (an open fan
+        // has two free ends), so on a manifold shell they form cycles.
+        std::vector<int> vparent(vertices.size());
+        std::iota(vparent.begin(), vparent.end(), 0);
+        auto vfind = [&](int x) {
+            while (vparent[static_cast<std::size_t>(x)] != x)
+                x = vparent[static_cast<std::size_t>(x)] = vparent[static_cast<std::size_t>(vparent[static_cast<std::size_t>(x)])];
+            return x;
+        };
+        auto valid_vertex = [&](int v) { return v >= 0 && v < static_cast<int>(vertices.size()); };
+        for (std::size_t s = 0; s < r.shells.size(); ++s)
+            for (const auto& kv : shell_edges[s])
+                if (uses[kv.first] == 1) {
+                    ++r.shells[s].boundary_edges;
+                    const Edge& e = edges[static_cast<std::size_t>(kv.first)];
+                    if (valid_vertex(e.v0) && valid_vertex(e.v1)) vparent[static_cast<std::size_t>(vfind(e.v0))] = vfind(e.v1);
+                }
+        for (std::size_t s = 0; s < r.shells.size(); ++s) {
+            std::map<int, bool> roots;
+            for (const auto& kv : shell_edges[s])
+                if (uses[kv.first] == 1 && valid_vertex(edges[static_cast<std::size_t>(kv.first)].v0))
+                    roots[vfind(edges[static_cast<std::size_t>(kv.first)].v0)] = true;
+            r.shells[s].boundary_loops = static_cast<int>(roots.size());
+        }
         for (std::size_t s = 0; s < r.shells.size(); ++s) {
             ShellReport& sh = r.shells[s];
             sh.vertices = static_cast<int>(shell_vertices[s].size());
             sh.edges = static_cast<int>(shell_edges[s].size());
             sh.euler = sh.vertices - sh.edges + sh.faces - sh.rings;
-            if (sh.closed && !shell_nonmanifold[s] && sh.euler <= 2 && (2 - sh.euler) % 2 == 0)
-                sh.genus = (2 - sh.euler) / 2;
+            const int chi = sh.euler + sh.boundary_loops; // 2 - 2g
+            // An open shell needs manifold edges used once or twice in
+            // opposite directions; a closed shell was checked above.
+            bool ok = !shell_nonmanifold[s];
+            if (!sh.closed)
+                for (const auto& kv : shell_edges[s])
+                    if (uses[kv.first] > 2 || (uses[kv.first] == 2 && orient_sum[kv.first] != 0)) ok = false;
+            if (ok && chi <= 2 && (2 - chi) % 2 == 0) sh.genus = (2 - chi) / 2;
+        }
+
+        // Wires: edges used by no face, as components over their vertices.
+        {
+            std::vector<int> wparent(vertices.size());
+            std::iota(wparent.begin(), wparent.end(), 0);
+            auto wfind = [&](int x) {
+                while (wparent[static_cast<std::size_t>(x)] != x)
+                    x = wparent[static_cast<std::size_t>(x)] = wparent[static_cast<std::size_t>(wparent[static_cast<std::size_t>(x)])];
+                return x;
+            };
+            std::vector<int> degree(vertices.size(), 0);
+            std::vector<char> on_edge(vertices.size(), 0);
+            for (int e = 0; e < nE; ++e) {
+                const Edge& E = edges[static_cast<std::size_t>(e)];
+                if (!valid_vertex(E.v0) || !valid_vertex(E.v1)) continue;
+                on_edge[static_cast<std::size_t>(E.v0)] = on_edge[static_cast<std::size_t>(E.v1)] = 1;
+                if (uses[e] != 0) continue;
+                ++degree[static_cast<std::size_t>(E.v0)];
+                ++degree[static_cast<std::size_t>(E.v1)];
+                wparent[static_cast<std::size_t>(wfind(E.v0))] = wfind(E.v1);
+            }
+            std::map<int, int> wire_of_root;
+            for (int e = 0; e < nE; ++e) {
+                const Edge& E = edges[static_cast<std::size_t>(e)];
+                if (uses[e] != 0 || !valid_vertex(E.v0) || !valid_vertex(E.v1)) continue;
+                const int root = wfind(E.v0);
+                if (!wire_of_root.count(root)) {
+                    wire_of_root[root] = static_cast<int>(r.wires.size());
+                    r.wires.push_back({});
+                }
+                ++r.wires[static_cast<std::size_t>(wire_of_root[root])].edges;
+            }
+            std::vector<char> all_two(r.wires.size(), 1);
+            for (std::size_t v = 0; v < vertices.size(); ++v) {
+                if (!on_edge[v]) { ++r.isolated_vertices; continue; }
+                if (degree[v] == 0) continue;
+                const auto it = wire_of_root.find(wfind(static_cast<int>(v)));
+                if (it == wire_of_root.end()) continue;
+                WireReport& w = r.wires[static_cast<std::size_t>(it->second)];
+                ++w.vertices;
+                w.max_degree = std::max(w.max_degree, degree[v]);
+                if (degree[v] != 2) all_two[static_cast<std::size_t>(it->second)] = 0;
+            }
+            for (std::size_t w = 0; w < r.wires.size(); ++w) r.wires[w].closed = all_two[w] != 0;
         }
         return r;
     }

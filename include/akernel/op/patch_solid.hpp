@@ -79,8 +79,9 @@ struct PatchSolid {
     std::vector<Vec3d> vertex_points;
 
     /// Derive edges and vertices from the faces. Fails unless every side is
-    /// shared by exactly two faces.
-    bool build(std::string& error) {
+    /// shared by exactly two faces; with `open`, a side of one face only is a
+    /// boundary edge (face[1] = -1): the faces of a sheet.
+    bool build(std::string& error, bool open = false) {
         const int nF = static_cast<int>(faces.size());
         sides.assign(static_cast<std::size_t>(nF), {});
         edges.clear();
@@ -121,8 +122,9 @@ struct PatchSolid {
                     sides[static_cast<std::size_t>(f)][static_cast<std::size_t>(s)] = {match, rev};
                 }
             }
-        for (const ModelEdge& me : edges)
-            if (me.face[1] < 0) { error = "a face side has no matching side: the shell is open"; return false; }
+        if (!open)
+            for (const ModelEdge& me : edges)
+                if (me.face[1] < 0) { error = "a face side has no matching side: the shell is open"; return false; }
 
         // Vertices: corner slots joined through the shared edges.
         std::vector<int> parent(static_cast<std::size_t>(4 * nF));
@@ -133,7 +135,7 @@ struct PatchSolid {
         };
         auto slot = [](int f, int corner) { return 4 * f + corner; };
         for (const ModelEdge& me : edges)
-            for (int end = 0; end < 2; ++end) {
+            for (int end = 0; end < 2 && me.face[1] >= 0; ++end) {
                 const int a = slot(me.face[0], side_corner(me.side[0], end));
                 const int b = slot(me.face[1], side_corner(me.side[1], me.rev[1] ? 1 - end : end));
                 parent[static_cast<std::size_t>(find(a))] = find(b);
