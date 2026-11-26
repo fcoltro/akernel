@@ -3,6 +3,8 @@
 # Dependencies are fetched at configure time (needs network once):
 #   GLFW 3.4        window, input and OpenGL context
 #   Dear ImGui      buttons and panels (GLFW + OpenGL 2 backends), needs git
+#   nlohmann/json   JSON for the MCP server (single header)
+#   stb_image_write PNG screenshots for the MCP server (single header)
 # The viewport uses fixed-function OpenGL 1.1/2.1, so no GL loader is needed:
 # opengl32 on Windows, libGL on Linux.
 include(FetchContent)
@@ -27,7 +29,15 @@ FetchContent_Declare(imgui
   GIT_REPOSITORY https://github.com/ocornut/imgui.git
   GIT_TAG v1.91.9
   GIT_SHALLOW TRUE)
-FetchContent_MakeAvailable(glfw imgui)
+FetchContent_Declare(nlohmann_json_header
+  URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp
+  URL_HASH SHA256=9bea4c8066ef4a1c206b2be5a36302f8926f7fdc6087af5d20b417d0cf103ea6
+  DOWNLOAD_NO_EXTRACT TRUE)
+FetchContent_Declare(stb_image_write
+  URL https://raw.githubusercontent.com/nothings/stb/6b5799bae8a1fe3792691ef4b72ae26434c3e799/stb_image_write.h
+  URL_HASH SHA256=5d89edc8bffd848f3e138b2a1dbec67aadbed591894bde16ade7c83dc233af9b
+  DOWNLOAD_NO_EXTRACT TRUE)
+FetchContent_MakeAvailable(glfw imgui nlohmann_json_header stb_image_write)
 
 find_package(OpenGL REQUIRED)
 
@@ -41,8 +51,16 @@ add_library(ak_imgui STATIC
 target_include_directories(ak_imgui SYSTEM PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
 target_link_libraries(ak_imgui PUBLIC glfw OpenGL::GL)
 
-add_executable(ak_workbench main.cpp)
-target_link_libraries(ak_workbench PRIVATE akernel ak_imgui)
+# Third-party single-header code, built without the kernel's strict flags.
+add_library(ak_wb_third STATIC stb_impl.cpp)
+target_include_directories(ak_wb_third SYSTEM PUBLIC ${stb_image_write_SOURCE_DIR}
+                           ${nlohmann_json_header_SOURCE_DIR})
+
+add_executable(ak_workbench main.cpp mcp_server.cpp)
+target_link_libraries(ak_workbench PRIVATE akernel ak_imgui ak_wb_third)
+if(WIN32)
+  target_link_libraries(ak_workbench PRIVATE ws2_32)
+endif()
 if(UNIX AND NOT APPLE)
   find_package(Threads REQUIRED)
   target_link_libraries(ak_workbench PRIVATE Threads::Threads)

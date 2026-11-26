@@ -12,9 +12,16 @@
 // Mouse: left drag orbits, right or middle drag pans, wheel zooms. Click a
 // body to make it A, Shift+click to make it B. F fits the view.
 //
-// Command line (for scripted checks): --demo builds a small scene at start;
-// --shot file.ppm renders it once, saves the window as a PPM image and exits.
+// MCP: the app serves the Model Context Protocol at http://127.0.0.1:7878/mcp
+// (loopback only) so an assistant such as Claude Code can work in the same
+// scene: create bodies, run the kernel's tools, read results, take
+// screenshots (mcp_server.hpp, register_tools below).
+//
+// Command line: --demo builds a small scene at start; --mcp-port N serves MCP
+// on another port; --no-mcp turns it off; --shot file.ppm renders the scene
+// once, saves the window as a PPM image and exits (for scripted checks).
 #include "kernel_ops.hpp"
+#include "mcp_server.hpp"
 
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
@@ -22,14 +29,20 @@
 
 #include <GLFW/glfw3.h>
 
+#include <stb_image_write.h>
+
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <deque>
 #include <exception>
 #include <fstream>
 #include <functional>
+#include <future>
+#include <memory>
 #include <mutex>
 #include <numbers>
+#include <stdexcept>
 #include <thread>
 
 #ifndef GL_MULTISAMPLE
@@ -158,6 +171,20 @@ struct App {
     bool hide_operands = true;
     bool show_edges = true, show_grid = true;
     std::vector<int> pending_operands; ///< bodies to hide when the running job succeeds
+    int next_id = 1;
+
+    // Work handed to the UI thread by the MCP server thread (see on_ui).
+    std::mutex ui_mutex;
+    std::vector<std::function<void()>> ui_queue;
+    bool closing = false;
+    // A screenshot asked for by an MCP client: filled after the next frame is drawn.
+    struct Capture {
+        int max_width = 900;
+        bool full_window = false;
+        std::promise<std::vector<unsigned char>> png;
+    };
+    std::shared_ptr<Capture> capture;
+    std::string mcp_status;
 
     // Tool parameters (dyadic defaults, so the kernel's controls stay exact).
     Vec3d origin{0, 0, 0}, size{1, 1, 0.5};
@@ -189,7 +216,8 @@ struct App {
         static const std::array<float, 3> palette[] = {{0.62f, 0.70f, 0.82f}, {0.78f, 0.72f, 0.60f},
                                                        {0.64f, 0.78f, 0.66f}, {0.80f, 0.64f, 0.70f},
                                                        {0.70f, 0.66f, 0.82f}, {0.62f, 0.78f, 0.80f}};
-        if (b.solid) b.color = palette[bodies.size() % 6];
+        if (b.solid) b.color = palette[static_cast<std::size_t>(next_id - 1) % 6];
+        b.id = next_id++;
         bodies.push_back(std::move(b));
         selA = static_cast<int>(bodies.size()) - 1;
         if (selB == selA) selB = -1;
@@ -223,6 +251,33 @@ struct App {
                 }
             }
         if (any) cam.fit(lo, hi);
+    }
+
+    /// Index of the body with this id, or -1.
+    int index_of(int id) const {
+        for (std::size_t i = 0; i < bodies.size(); ++i)
+            if (bodies[i].id == id) return static_cast<int>(i);
+        return -1;
+    }
+
+    /// Run f on the UI thread (from another thread) and wait for its result.
+    template <class F>
+    auto on_ui(F f) -> decltype(f()) {
+        std::packaged_task<decltype(f())()> task(std::move(f));
+        auto fut = task.get_future();
+        {
+            std::lock_guard<std::mutex> lk(ui_mutex);
+            ui_queue.push_back([&task] { task(); });
+        }
+        return fut.get();
+    }
+    void drain_ui() {
+        std::vector<std::function<void()>> q;
+        {
+            std::lock_guard<std::mutex> lk(ui_mutex);
+            q.swap(ui_queue);
+        }
+        for (auto& f : q) f();
     }
 
     const Body* body(int i) const {
@@ -574,7 +629,7 @@ void tools_panel(App& app, float height) {
         ImGui::EndDisabled();
     }
 
-    if (ImGui::CollapsingHeader("View")) {
+    if (ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Checkbox("Edges", &app.show_edges);
         ImGui::SameLine();
         ImGui::Checkbox("Grid", &app.show_grid);
@@ -582,6 +637,12 @@ void tools_panel(App& app, float height) {
         ImGui::SameLine();
         if (ImGui::Button("Demo scene")) app.demo();
         ImGui::TextWrapped("Left drag: orbit. Right/middle drag: pan. Wheel: zoom. Click: select A. Shift+click: select B.");
+        if (!app.mcp_status.empty()) {
+            ImGui::Separator();
+            ImGui::TextWrapped("%s", app.mcp_status.c_str());
+            help("Model Context Protocol server for an assistant such as Claude Code, on this computer only. Connect with:\n"
+                 "claude mcp add --transport http akernel http://127.0.0.1:7878/mcp");
+        }
     }
     ImGui::PopItemWidth();
     ImGui::End();
@@ -608,7 +669,7 @@ void bodies_panel(App& app, float width, float height) {
             ImGui::Checkbox("##vis", &b.visible);
             ImGui::SameLine();
             const char* role = idx == app.selA ? "[A] " : idx == app.selB ? "[B] " : "";
-            const std::string label = wb::fmt("%s%d  %s%s", role, idx + 1, b.name.c_str(), b.solid ? "" : "  (surface)");
+            const std::string label = wb::fmt("%s#%d  %s%s", role, b.id, b.name.c_str(), b.solid ? "" : "  (surface)");
             if (ImGui::Selectable(label.c_str(), idx == app.selA || idx == app.selB, 0, ImVec2(w - 110, 0))) {
                 if (ImGui::GetIO().KeyShift) { app.selB = idx; if (app.selA == idx) app.selA = -1; }
                 else { app.selA = idx; if (app.selB == idx) app.selB = -1; }
@@ -639,7 +700,7 @@ void bodies_panel(App& app, float width, float height) {
         if (b->solid && !b->tess.tris.empty()) {
             ImGui::PushID(tag);
             if (ImGui::SmallButton("Export OBJ")) {
-                const std::string path = wb::fmt("akernel_body_%d.obj", i + 1);
+                const std::string path = wb::fmt("akernel_body_%d.obj", b->id);
                 std::ofstream out(path);
                 ak::op::write_obj(out, b->tess);
                 app.say(static_cast<bool>(out), (out ? "Wrote " : "Could not write ") + path);
@@ -679,15 +740,463 @@ void save_ppm(const char* path, int w, int h) {
                   static_cast<std::streamsize>(w) * 3);
 }
 
+// ------------------------------------------------------------ MCP tools
+//
+// Each tool parses its arguments on the server thread, copies what it needs
+// from the app on the UI thread (App::on_ui), runs the kernel on the server
+// thread, and hands the new body back to the UI thread, which logs it as
+// "Claude: ..." so the person at the window sees what was done.
+
+/// Read pixels of the current frame as a PNG, cropped to the viewport between
+/// the panels (or the whole window), downscaled to at most max_width pixels.
+std::vector<unsigned char> grab_png(int fw, int fh, int ww, int max_width, bool full_window) {
+    const double sc = ww > 0 ? double(fw) / ww : 1.0;
+    int x0 = 0, x1 = fw;
+    if (!full_window) {
+        x0 = std::min(fw - 1, static_cast<int>(330 * sc));
+        x1 = std::max(x0 + 1, fw - static_cast<int>(400 * sc));
+    }
+    const int w = x1 - x0, h = fh;
+    std::vector<unsigned char> px(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 3);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadBuffer(GL_BACK);
+    glReadPixels(x0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, px.data());
+    // Box filter down to at most max_width, flipping rows (GL is bottom-up).
+    const double f = std::max(1.0, double(w) / std::max(64, max_width));
+    const int ow = std::max(1, static_cast<int>(w / f)), oh = std::max(1, static_cast<int>(h / f));
+    std::vector<unsigned char> out(static_cast<std::size_t>(ow) * static_cast<std::size_t>(oh) * 3);
+    for (int y = 0; y < oh; ++y)
+        for (int x = 0; x < ow; ++x) {
+            const int sx0 = static_cast<int>(x * f), sx1 = std::max(sx0 + 1, static_cast<int>((x + 1) * f));
+            const int sy0 = static_cast<int>(y * f), sy1 = std::max(sy0 + 1, static_cast<int>((y + 1) * f));
+            unsigned acc[3] = {0, 0, 0}, n = 0;
+            for (int yy = sy0; yy < std::min(sy1, h); ++yy)
+                for (int xx = sx0; xx < std::min(sx1, w); ++xx) {
+                    const std::size_t i = (static_cast<std::size_t>(h - 1 - yy) * static_cast<std::size_t>(w) + static_cast<std::size_t>(xx)) * 3;
+                    for (std::size_t k = 0; k < 3; ++k) acc[k] += px[i + k];
+                    ++n;
+                }
+            const std::size_t o = (static_cast<std::size_t>(y) * static_cast<std::size_t>(ow) + static_cast<std::size_t>(x)) * 3;
+            for (std::size_t k = 0; k < 3; ++k) out[o + k] = static_cast<unsigned char>(n ? acc[k] / n : 0);
+        }
+    std::vector<unsigned char> png;
+    stbi_write_png_to_func(
+        [](void* ctx, void* data, int size) {
+            auto* v = static_cast<std::vector<unsigned char>*>(ctx);
+            const auto* p = static_cast<const unsigned char*>(data);
+            v->insert(v->end(), p, p + size);
+        },
+        &png, ow, oh, 3, out.data(), ow * 3);
+    return png;
+}
+
+using mcp::json;
+
+json schema(json props, std::vector<std::string> required = {}) {
+    json s = {{"type", "object"}, {"properties", std::move(props)}};
+    if (!required.empty()) s["required"] = required;
+    return s;
+}
+json num(const char* d) { return {{"type", "number"}, {"description", d}}; }
+json integer(const char* d) { return {{"type", "integer"}, {"description", d}}; }
+json vec3(const char* d) {
+    return {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 3}, {"maxItems", 3}, {"description", d}};
+}
+json choice(std::vector<std::string> v, const char* d) { return {{"type", "string"}, {"enum", v}, {"description", d}}; }
+
+Vec3d v3(const json& a, const char* key, Vec3d def) {
+    if (!a.contains(key)) return def;
+    const json& j = a[key];
+    if (!j.is_array() || j.size() != 3) throw std::runtime_error(std::string(key) + " must be [x, y, z]");
+    return {j[0].get<double>(), j[1].get<double>(), j[2].get<double>()};
+}
+double d1(const json& a, const char* key, double def) { return a.contains(key) ? a[key].get<double>() : def; }
+int i1(const json& a, const char* key, int def) { return a.contains(key) ? a[key].get<int>() : def; }
+std::string s1(const json& a, const char* key, const char* def) {
+    return a.contains(key) ? a[key].get<std::string>() : std::string(def);
+}
+
+wb::Corner corner_of(const std::string& c) {
+    if (c == "none") return wb::Corner::None;
+    if (c == "fillet") return wb::Corner::Fillet;
+    if (c == "chamfer") return wb::Corner::Chamfer;
+    throw std::runtime_error("corner must be none, fillet or chamfer");
+}
+
+std::string describe(const Body& b) {
+    std::string s = wb::fmt("#%d %s%s%s\n", b.id, b.name.c_str(), b.solid ? "" : " (open surface)", b.visible ? "" : " [hidden]");
+    if (!b.mesh.empty())
+        s += wb::fmt("  bounding box [%.6g, %.6g, %.6g] .. [%.6g, %.6g, %.6g]\n", b.mesh.lo[0], b.mesh.lo[1],
+                     b.mesh.lo[2], b.mesh.hi[0], b.mesh.hi[1], b.mesh.hi[2]);
+    for (const std::string& l : b.info) s += "  " + l + "\n";
+    return s;
+}
+
+/// Run a kernel call for an MCP client and put its body in the scene.
+json kernel_call(App& app, const std::string& label, const std::function<Outcome()>& f, std::vector<int> hide_ids = {}) {
+    app.on_ui([&] { app.say(true, "Claude: " + label + " ..."); });
+    Outcome o;
+    try {
+        o = wb::timed(f);
+    } catch (const std::exception& e) {
+        o = wb::refused(std::string("exception: ") + e.what());
+    }
+    return app.on_ui([&]() -> json {
+        if (!o.ok || !o.body) {
+            app.say(false, wb::fmt("Claude: refused: %s  (%.2f s)", o.message.c_str(), o.seconds));
+            return mcp::text(wb::fmt("Refused by the kernel (%.2f s): %s", o.seconds, o.message.c_str()), true);
+        }
+        for (int id : hide_ids) {
+            const int i = app.index_of(id);
+            if (i >= 0) app.bodies[static_cast<std::size_t>(i)].visible = false;
+        }
+        const bool first = app.bodies.empty();
+        app.add(std::move(*o.body));
+        if (first) app.fit_all();
+        const Body& b = app.bodies.back();
+        app.say(true, wb::fmt("Claude: %s -> #%d  (%.2f s)", o.message.c_str(), b.id, o.seconds));
+        return mcp::text(wb::fmt("Created body #%d in %.2f s.\n", b.id, o.seconds) + describe(b));
+    });
+}
+
+/// A copy of the body with this id (for an operation's operand).
+Body body_copy(App& app, int id) {
+    return app.on_ui([&] {
+        const int i = app.index_of(id);
+        if (i < 0) throw std::runtime_error(wb::fmt("no body #%d", id));
+        return app.bodies[static_cast<std::size_t>(i)];
+    });
+}
+
+void register_tools(mcp::Server& srv, App& app) {
+    srv.set_instructions(
+        "akernel workbench: a live 3D view of the akernel certified B-rep kernel. Bodies are numbered by id "
+        "(list_bodies). Units are model units; prefer dyadic values (multiples of 1/2^k such as 0.125) so the "
+        "kernel's control points stay exact. Every created body is audited by the kernel (topology, volume, "
+        "certified volume enclosure where covered, edge gap bound, watertight mesh); a refused operation returns "
+        "the kernel's reason as an error. Results appear live in the person's window; use screenshot to see it.");
+
+    srv.add({"list_bodies", "List the bodies in the scene with their ids, names, visibility and the kernel's audit lines.",
+             schema(json::object()), [&app](const json&) {
+                 return app.on_ui([&] {
+                     std::string s;
+                     for (const Body& b : app.bodies) s += describe(b);
+                     if (s.empty()) s = "The scene is empty.";
+                     const Body* a = app.body(app.selA);
+                     const Body* b = app.body(app.selB);
+                     s += wb::fmt("Selection in the window: A = %s, B = %s\n", a ? ("#" + std::to_string(a->id)).c_str() : "none",
+                                  b ? ("#" + std::to_string(b->id)).c_str() : "none");
+                     return mcp::text(s);
+                 });
+             }});
+
+    srv.add({"create_primitive",
+             "Create a solid primitive. box: origin + size. bump_box: box whose top has a quadratic hill of height "
+             "'bump'. spline_box: box whose top is a quadratic B-spline wave with spans_u x spans_v spans and "
+             "amplitude 'wave'. rounded_box: box with all 12 edges rounded by 'radius' (exact cylinders and sphere "
+             "octants).",
+             schema({{"kind", choice({"box", "bump_box", "spline_box", "rounded_box"}, "primitive")},
+                     {"origin", vec3("lowest corner, default [0,0,0]")},
+                     {"size", vec3("extent in x, y, z, default [1,1,0.5]")},
+                     {"bump", num("bump_box hill height, default 0.25")},
+                     {"radius", num("rounded_box radius, default 0.125")},
+                     {"spans_u", integer("spline_box spans in x, default 2")},
+                     {"spans_v", integer("spline_box spans in y, default 2")},
+                     {"wave", num("spline_box wave amplitude, default 0.0625")}},
+                    {"kind"}),
+             [&app](const json& a) {
+                 const std::string k = a.at("kind").get<std::string>();
+                 const Vec3d o = v3(a, "origin", {0, 0, 0}), s = v3(a, "size", {1, 1, 0.5});
+                 std::function<Outcome()> f;
+                 if (k == "box") f = [=] { return wb::box(o, s); };
+                 else if (k == "bump_box") { const double b = d1(a, "bump", 0.25); f = [=] { return wb::bump_box(o, s, b); }; }
+                 else if (k == "spline_box") {
+                     const int m = i1(a, "spans_u", 2), n = i1(a, "spans_v", 2);
+                     const double w = d1(a, "wave", 0.0625);
+                     f = [=] { return wb::spline_box(o, s, m, n, w); };
+                 } else if (k == "rounded_box") { const double r = d1(a, "radius", 0.125); f = [=] { return wb::rounded_box(o, s, r); }; }
+                 else throw std::runtime_error("unknown kind " + k);
+                 return kernel_call(app, k, f);
+             }});
+
+    srv.add({"extrude",
+             "Extrude the rectangle width x height (in x, y at origin) by length along z. corner: none, fillet "
+             "(radius) or chamfer (setbacks radius on the x = width face and setback_b on the y = height face) on "
+             "the edge at (width, height). With step_a1 and step_b1 the profile is an L-step instead (without the "
+             "notch x > step_a1, y > step_b1) and its concave inside edge gets the fillet or chamfer.",
+             schema({{"origin", vec3("default [0,0,0]")}, {"width", num("default 1")}, {"height", num("default 0.5")},
+                     {"length", num("default 1")}, {"corner", choice({"none", "fillet", "chamfer"}, "default none")},
+                     {"radius", num("fillet radius or first chamfer setback, default 0.125")},
+                     {"setback_b", num("second chamfer setback, default = radius")},
+                     {"step_a1", num("L-step notch x")}, {"step_b1", num("L-step notch y")}}),
+             [&app](const json& a) {
+                 const Vec3d o = v3(a, "origin", {0, 0, 0});
+                 const double W = d1(a, "width", 1), H = d1(a, "height", 0.5), L = d1(a, "length", 1);
+                 const wb::Corner c = corner_of(s1(a, "corner", "none"));
+                 const double r = d1(a, "radius", 0.125), d2 = d1(a, "setback_b", r);
+                 if (a.contains("step_a1") || a.contains("step_b1")) {
+                     const double a1 = d1(a, "step_a1", W / 2), b1 = d1(a, "step_b1", H / 2);
+                     return kernel_call(app, "extrude step", [=] { return wb::extrude_step(o, W, H, L, a1, b1, c, r, d2); });
+                 }
+                 return kernel_call(app, "extrude", [=] { return wb::extrude_rect(o, W, H, L, c, r, d2); });
+             }});
+
+    srv.add({"revolve",
+             "Revolve the rectangle r0..r1 x z0..z1 about the z axis by quarter_turns (1-4; 4 is a closed ring). "
+             "Optionally fillet or chamfer one of its circular edges.",
+             schema({{"r0", num("inner radius > 0, default 0.25")}, {"r1", num("outer radius, default 0.5")},
+                     {"z0", num("default 0")}, {"z1", num("default 0.5")}, {"quarter_turns", integer("1..4, default 4")},
+                     {"corner", choice({"none", "fillet", "chamfer"}, "default none")},
+                     {"edge", choice({"outer_top", "outer_bottom", "inner_top", "inner_bottom"}, "default outer_top")},
+                     {"radius", num("fillet radius or chamfer setback on the cylinder, default 0.125")},
+                     {"setback_b", num("chamfer setback on the flat face, default = radius")}}),
+             [&app](const json& a) {
+                 const double r0 = d1(a, "r0", 0.25), r1 = d1(a, "r1", 0.5), z0 = d1(a, "z0", 0), z1 = d1(a, "z1", 0.5);
+                 const int q = i1(a, "quarter_turns", 4);
+                 if (q < 1 || q > 4) throw std::runtime_error("quarter_turns must be 1..4");
+                 const wb::Corner c = corner_of(s1(a, "corner", "none"));
+                 const std::string e = s1(a, "edge", "outer_top");
+                 const int ei = e == "outer_top" ? 0 : e == "outer_bottom" ? 1 : e == "inner_top" ? 2 : e == "inner_bottom" ? 3 : -1;
+                 if (ei < 0) throw std::runtime_error("bad edge");
+                 const double r = d1(a, "radius", 0.125), d2 = d1(a, "setback_b", r);
+                 return kernel_call(app, "revolve", [=] { return wb::revolve_rect(r0, r1, z0, z1, q, ei, c, r, d2); });
+             }});
+
+    srv.add({"sweep_surface",
+             "Open NURBS surface: an exact circle of 'radius' at origin moved without rotation along a cubic Bezier "
+             "path from origin through origin+ctrl1, origin+ctrl2 to origin+end (translational sweep).",
+             schema({{"origin", vec3("default [0,0,0]")}, {"radius", num("default 0.25")}, {"ctrl1", vec3("default [0,0.5,0.5]")},
+                     {"ctrl2", vec3("default [0.5,0.5,1]")}, {"end", vec3("default [1,0,1.5]")}}),
+             [&app](const json& a) {
+                 const Vec3d o = v3(a, "origin", {0, 0, 0}), c1 = v3(a, "ctrl1", {0, 0.5, 0.5}), c2 = v3(a, "ctrl2", {0.5, 0.5, 1}),
+                             e = v3(a, "end", {1, 0, 1.5});
+                 const double r = d1(a, "radius", 0.25);
+                 return kernel_call(app, "sweep", [=] { return wb::sweep_circle(o, r, c1, c2, e); });
+             }});
+
+    srv.add({"loft_surface", "Open NURBS surface skinned through three horizontal circles about the vertical axis through origin.",
+             schema({{"origin", vec3("default [0,0,0]")}, {"r_bottom", num("default 0.5")}, {"r_middle", num("default 0.25")},
+                     {"r_top", num("default 0.375")}, {"height", num("default 1")}}),
+             [&app](const json& a) {
+                 const Vec3d o = v3(a, "origin", {0, 0, 0});
+                 const double r0 = d1(a, "r_bottom", 0.5), r1 = d1(a, "r_middle", 0.25), r2 = d1(a, "r_top", 0.375), h = d1(a, "height", 1);
+                 return kernel_call(app, "loft", [=] { return wb::loft_circles(o, r0, r1, r2, h); });
+             }});
+
+    srv.add({"freeform_fillet",
+             "A block under the freeform top z = h + slope*x*s(y) over [0,a] x [0,L] (s the smoothstep), with its "
+             "edge at x = a rounded by a rolling ball of 'radius' (a procedural blend face with a certified spine). "
+             "end_cut in (0,1] ends the block at y = end_cut*L.",
+             schema({{"a", num("default 1")}, {"L", num("default 2")}, {"h", num("default 0.5")}, {"slope", num("default 0.25")},
+                     {"radius", num("default 0.125")}, {"end_cut", num("default 1")}}),
+             [&app](const json& a) {
+                 const double A = d1(a, "a", 1), L = d1(a, "L", 2), h = d1(a, "h", 0.5), c = d1(a, "slope", 0.25),
+                              r = d1(a, "radius", 0.125), cut = d1(a, "end_cut", 1);
+                 return kernel_call(app, "freeform fillet", [=] { return wb::freeform_fillet(A, L, h, c, r, cut); });
+             }});
+
+    srv.add({"boolean",
+             "Boolean of two solids by id: union, difference (a minus b) or intersection. Uses the procedural-face "
+             "Booleans when an operand has blend faces. Operands are hidden afterwards unless hide_operands is false.",
+             schema({{"a", integer("id of the first solid")}, {"b", integer("id of the second solid")},
+                     {"op", choice({"union", "difference", "intersection"}, "operation")},
+                     {"hide_operands", {{"type", "boolean"}, {"description", "default true"}}}},
+                    {"a", "b", "op"}),
+             [&app](const json& a) {
+                 const int ia = a.at("a").get<int>(), ib = a.at("b").get<int>();
+                 const std::string op = a.at("op").get<std::string>();
+                 const int k = op == "union" ? 0 : op == "difference" ? 1 : op == "intersection" ? 2 : -1;
+                 if (k < 0) throw std::runtime_error("op must be union, difference or intersection");
+                 Body A = body_copy(app, ia), B = body_copy(app, ib);
+                 std::vector<int> hide;
+                 if (a.value("hide_operands", true)) hide = {ia, ib};
+                 return kernel_call(app, wb::fmt("%s of #%d and #%d", op.c_str(), ia, ib), [&] { return wb::boolean(A, B, k); }, hide);
+             }});
+
+    srv.add({"plane_cut", "Cut a solid by the plane normal . x = d, keeping the side normal . x <= d (certified section curves).",
+             schema({{"id", integer("solid id")}, {"normal", vec3("plane normal")}, {"d", num("plane offset")},
+                     {"hide_operand", {{"type", "boolean"}, {"description", "default true"}}}},
+                    {"id", "normal", "d"}),
+             [&app](const json& a) {
+                 const int id = a.at("id").get<int>();
+                 const Vec3d n = v3(a, "normal", {0, 0, 1});
+                 const double d = a.at("d").get<double>();
+                 Body A = body_copy(app, id);
+                 std::vector<int> hide;
+                 if (a.value("hide_operand", true)) hide = {id};
+                 return kernel_call(app, wb::fmt("plane cut of #%d", id), [&] { return wb::plane_cut(A, n, d); }, hide);
+             }});
+
+    srv.add({"transform",
+             "Move a solid exactly (a new body): translate by 'vector', quarter turns about an axis through the "
+             "origin, or mirror in a coordinate plane through the origin.",
+             schema({{"id", integer("solid id")},
+                     {"op", choice({"translate", "turn_x", "turn_y", "turn_z", "mirror_x", "mirror_y", "mirror_z"}, "map")},
+                     {"vector", vec3("translation, for translate")},
+                     {"hide_operand", {{"type", "boolean"}, {"description", "default true"}}}},
+                    {"id", "op"}),
+             [&app](const json& a) {
+                 const int id = a.at("id").get<int>();
+                 const std::string op = a.at("op").get<std::string>();
+                 using SP = ak::op::SignedPermutation;
+                 SP m;
+                 if (op == "translate") m = SP::translation(v3(a, "vector", {0, 0, 0}));
+                 else if (op == "turn_x") { m.perm = {0, 2, 1}; m.sign = {1, -1, 1}; }
+                 else if (op == "turn_y") { m.perm = {2, 1, 0}; m.sign = {1, 1, -1}; }
+                 else if (op == "turn_z") m = SP::quarter_turn_z();
+                 else if (op == "mirror_x") m.sign = {-1, 1, 1};
+                 else if (op == "mirror_y") m.sign = {1, -1, 1};
+                 else if (op == "mirror_z") m.sign = {1, 1, -1};
+                 else throw std::runtime_error("unknown op " + op);
+                 Body A = body_copy(app, id);
+                 std::vector<int> hide;
+                 if (a.value("hide_operand", true)) hide = {id};
+                 return kernel_call(app, op + wb::fmt(" of #%d", id), [&] { return wb::place(A, m, ""); }, hide);
+             }});
+
+    srv.add({"edit_scene",
+             "Change the scene: show, hide or delete bodies by id, select bodies as A and B in the window (as the "
+             "person would by clicking), clear everything, or load the demo scene.",
+             schema({{"action", choice({"show", "hide", "delete", "select", "clear", "demo"}, "what to do")},
+                     {"ids", {{"type", "array"}, {"items", {{"type", "integer"}}}, {"description", "body ids (select: [A] or [A, B])"}}}},
+                    {"action"}),
+             [&app](const json& a) {
+                 const std::string act = a.at("action").get<std::string>();
+                 std::vector<int> ids;
+                 if (a.contains("ids")) ids = a["ids"].get<std::vector<int>>();
+                 return app.on_ui([&]() -> json {
+                     if (act == "demo") {
+                         app.demo();
+                         app.say(true, "Claude: loaded the demo scene");
+                         return mcp::text("Demo scene loaded.");
+                     }
+                     if ((act == "delete" || act == "clear") && app.worker.busy())
+                         return mcp::text("The window is running an operation; try again when it finishes.", true);
+                     if (act == "clear") {
+                         app.bodies.clear();
+                         app.selA = app.selB = -1;
+                         app.say(true, "Claude: cleared the scene");
+                         return mcp::text("Scene cleared.");
+                     }
+                     std::string missing;
+                     for (int id : ids)
+                         if (app.index_of(id) < 0) missing += " #" + std::to_string(id);
+                     if (!missing.empty()) return mcp::text("No such bodies:" + missing, true);
+                     if (act == "select") {
+                         app.selA = ids.size() > 0 ? app.index_of(ids[0]) : -1;
+                         app.selB = ids.size() > 1 ? app.index_of(ids[1]) : -1;
+                     } else if (act == "show" || act == "hide") {
+                         for (int id : ids) app.bodies[static_cast<std::size_t>(app.index_of(id))].visible = act == "show";
+                     } else if (act == "delete") {
+                         for (int id : ids) {
+                             const int i = app.index_of(id);
+                             app.bodies.erase(app.bodies.begin() + i);
+                             auto fix = [&](int& s) { s = s == i ? -1 : s > i ? s - 1 : s; };
+                             fix(app.selA);
+                             fix(app.selB);
+                         }
+                     } else {
+                         return mcp::text("unknown action " + act, true);
+                     }
+                     app.say(true, "Claude: " + act + " " + a.value("ids", json::array()).dump());
+                     return mcp::text("Done.");
+                 });
+             }});
+
+    srv.add({"view",
+             "Set the camera: a preset direction (iso, top, bottom, front, back, left, right), fit to the visible "
+             "bodies, or explicit yaw/pitch (radians, z up), distance and target. Also toggles edges and grid.",
+             schema({{"preset", choice({"iso", "top", "bottom", "front", "back", "left", "right"}, "view direction")},
+                     {"fit", {{"type", "boolean"}, {"description", "fit the visible bodies (default true with a preset)"}}},
+                     {"yaw", num("radians")}, {"pitch", num("radians, -1.55..1.55")}, {"distance", num("from target")},
+                     {"target", vec3("look-at point")}, {"edges", {{"type", "boolean"}}}, {"grid", {{"type", "boolean"}}}}),
+             [&app](const json& a) {
+                 return app.on_ui([&] {
+                     Camera& c = app.cam;
+                     if (a.contains("preset")) {
+                         const std::string p = a["preset"].get<std::string>();
+                         const double pi = std::numbers::pi;
+                         if (p == "iso") { c.yaw = -pi / 4; c.pitch = 0.6155; }
+                         else if (p == "top") { c.yaw = -pi / 2; c.pitch = 1.55; }
+                         else if (p == "bottom") { c.yaw = -pi / 2; c.pitch = -1.55; }
+                         else if (p == "front") { c.yaw = -pi / 2; c.pitch = 0; }
+                         else if (p == "back") { c.yaw = pi / 2; c.pitch = 0; }
+                         else if (p == "right") { c.yaw = 0; c.pitch = 0; }
+                         else if (p == "left") { c.yaw = pi; c.pitch = 0; }
+                     }
+                     if (a.contains("yaw")) c.yaw = a["yaw"].get<double>();
+                     if (a.contains("pitch")) c.pitch = std::clamp(a["pitch"].get<double>(), -1.55, 1.55);
+                     if (a.value("fit", a.contains("preset"))) app.fit_all();
+                     if (a.contains("distance")) c.dist = std::max(1e-6, a["distance"].get<double>());
+                     if (a.contains("target")) c.target = v3(a, "target", c.target);
+                     if (a.contains("edges")) app.show_edges = a["edges"].get<bool>();
+                     if (a.contains("grid")) app.show_grid = a["grid"].get<bool>();
+                     return mcp::text(wb::fmt("Camera: yaw %.4g, pitch %.4g, distance %.4g, target [%.4g, %.4g, %.4g]", c.yaw,
+                                              c.pitch, c.dist, c.target.x, c.target.y, c.target.z));
+                 });
+             }});
+
+    srv.add({"screenshot", "A PNG of the 3D viewport as the person sees it now (or the whole window with the panels).",
+             schema({{"max_width", integer("downscale to at most this many pixels wide, default 900")},
+                     {"full_window", {{"type", "boolean"}, {"description", "include the tool panels, default false"}}}}),
+             [&app](const json& a) {
+                 auto cap = std::make_shared<App::Capture>();
+                 cap->max_width = std::clamp(i1(a, "max_width", 900), 64, 4096);
+                 cap->full_window = a.value("full_window", false);
+                 auto fut = cap->png.get_future();
+                 app.on_ui([&] {
+                     if (app.closing) cap->png.set_value({});
+                     else app.capture = cap;
+                 });
+                 if (fut.wait_for(std::chrono::seconds(10)) != std::future_status::ready)
+                     return mcp::text("The window did not draw a frame in 10 s (is it minimised?)", true);
+                 const std::vector<unsigned char> png = fut.get();
+                 if (png.empty()) return mcp::text("No image (the window is closing).", true);
+                 return mcp::image_png(png, "");
+             }});
+
+    srv.add({"export_obj", "Write the kernel's watertight mesh of a solid as a Wavefront OBJ file (one group per face, edges as polylines).",
+             schema({{"id", integer("solid id")}, {"path", {{"type", "string"}, {"description", "file path on the person's computer"}}}},
+                    {"id", "path"}),
+             [&app](const json& a) {
+                 const int id = a.at("id").get<int>();
+                 const std::string path = a.at("path").get<std::string>();
+                 const Body b = body_copy(app, id);
+                 if (b.tess.tris.empty()) return mcp::text("This body has no kernel mesh (an open surface, or tessellation was refused).", true);
+                 std::ofstream out(path);
+                 ak::op::write_obj(out, b.tess);
+                 if (!out) return mcp::text("Could not write " + path, true);
+                 app.on_ui([&] { app.say(true, "Claude: wrote " + path); });
+                 return mcp::text(wb::fmt("Wrote #%d to %s (%d triangles).", id, path.c_str(), static_cast<int>(b.tess.tris.size())));
+             }});
+
+    srv.add({"get_log", "The workbench log, newest first: results and refusals of everything done in the window or by MCP.",
+             schema({{"limit", integer("lines, default 30")}}), [&app](const json& a) {
+                 const int n = std::max(1, i1(a, "limit", 30));
+                 return app.on_ui([&] {
+                     std::string s;
+                     int k = 0;
+                     for (const LogLine& l : app.log) {
+                         if (k++ >= n) break;
+                         s += (l.ok ? "ok   " : "FAIL ") + l.text + "\n";
+                     }
+                     return mcp::text(s.empty() ? "The log is empty." : s);
+                 });
+             }});
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
-    bool demo = false;
+    bool demo = false, serve_mcp = true;
+    int mcp_port = 7878;
     const char* shot = nullptr;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--demo") demo = true;
         else if (a == "--shot" && i + 1 < argc) shot = argv[++i];
+        else if (a == "--no-mcp") serve_mcp = false;
+        else if (a == "--mcp-port" && i + 1 < argc) mcp_port = std::atoi(argv[++i]);
     }
 
     if (!glfwInit()) return 1;
@@ -718,12 +1227,27 @@ int main(int argc, char** argv) {
     if (demo || shot) app.demo();
     app.say(true, "Ready. Every result lists what the kernel certified; refusals show the kernel's reason.");
 
+    mcp::Server server;
+    register_tools(server, app);
+    if (serve_mcp && !shot) {
+        std::string err;
+        if (server.start(mcp_port, err)) {
+            app.mcp_status = wb::fmt("MCP: http://127.0.0.1:%d/mcp", mcp_port);
+            app.say(true, app.mcp_status + " (Claude Code: claude mcp add --transport http akernel " +
+                              wb::fmt("http://127.0.0.1:%d/mcp)", mcp_port));
+        } else {
+            app.mcp_status = "MCP off: " + err;
+            app.say(false, app.mcp_status);
+        }
+    }
+
     double lastx = 0, lasty = 0, pressx = 0, pressy = 0;
     bool dragging = false;
     int frames = 0;
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
         app.poll();
+        app.drain_ui();
 
         int fw = 0, fh = 0, ww = 0, wh = 0;
         glfwGetFramebufferSize(window, &fw, &fh);
@@ -778,7 +1302,15 @@ int main(int argc, char** argv) {
         ImGui::Render();
 
         draw_scene(app, fw, fh);
+        if (app.capture && !app.capture->full_window) {
+            app.capture->png.set_value(grab_png(fw, fh, ww, app.capture->max_width, false));
+            app.capture.reset();
+        }
         ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
+        if (app.capture) {
+            app.capture->png.set_value(grab_png(fw, fh, ww, app.capture->max_width, true));
+            app.capture.reset();
+        }
 
         if (shot && ++frames == 3) {
             save_ppm(shot, fw, fh);
@@ -786,6 +1318,23 @@ int main(int argc, char** argv) {
         }
         glfwSwapBuffers(window);
     }
+
+    // Stop the MCP server; a request in flight may still be waiting for the UI thread.
+    app.closing = true;
+    if (app.capture) {
+        app.capture->png.set_value({});
+        app.capture.reset();
+    }
+    std::atomic<bool> stopped{false};
+    std::thread stopper([&] {
+        server.stop();
+        stopped = true;
+    });
+    while (!stopped) {
+        app.drain_ui();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    stopper.join();
 
     ImGui_ImplOpenGL2_Shutdown();
     ImGui_ImplGlfw_Shutdown();

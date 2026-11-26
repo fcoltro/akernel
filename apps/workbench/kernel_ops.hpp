@@ -47,6 +47,7 @@ struct RenderMesh {
 };
 
 struct Body {
+    int id = 0;                     ///< stable id shown in the UI and used by the MCP tools
     std::string name;
     bool solid = true;              ///< false: an open surface (sweep, loft), not a Brep
     std::optional<op::Brep> brep;   ///< set for solids
