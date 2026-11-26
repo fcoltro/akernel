@@ -13,7 +13,8 @@
 // definition shared by both faces) combinatorial closure implies geometric
 // closure, so this audit is the watertightness test.
 //
-// Not checked here: self-intersection.
+// Not checked here: self-intersection (op/validity.hpp checks it for
+// Breps of whole-carrier faces).
 #pragma once
 
 #include <map>
