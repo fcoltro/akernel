@@ -42,8 +42,19 @@ namespace geom = ak::geom;
 struct RenderMesh {
     std::vector<float> tri;   ///< x y z nx ny nz, three vertices per triangle
     std::vector<float> lines; ///< x y z, two vertices per segment
+    std::vector<int> tri_face;  ///< Brep face of each triangle (-1 for surfaces)
+    std::vector<int> line_edge; ///< Brep edge of each segment (-1 for surface boundaries)
     std::array<float, 3> lo{0, 0, 0}, hi{0, 0, 0};
     bool empty() const { return tri.empty() && lines.empty(); }
+};
+
+/// What generated a body, so that a picked edge can be blended by
+/// regenerating it (op/fillet.hpp blends edges of swept sections).
+struct Recipe {
+    enum Kind { None, Box, Ring } kind = None;
+    Vec3d lo{}, hi{};                  ///< Box
+    double r0 = 0, r1 = 0, z0 = 0, z1 = 0; ///< Ring (revolved rectangle)
+    int quarters = 4;
 };
 
 struct Body {
@@ -56,6 +67,7 @@ struct Body {
     std::vector<std::string> info;  ///< the inspector's lines: what the kernel certified or measured
     bool visible = true;
     std::array<float, 3> color{0.7f, 0.75f, 0.8f};
+    Recipe recipe;                  ///< how it was made, for edits that regenerate it
 };
 
 struct Outcome {
@@ -115,12 +127,16 @@ inline RenderMesh render_mesh(const op::Mesh& m) {
             grow(r, static_cast<float>(p.x), static_cast<float>(p.y), static_cast<float>(p.z));
             push3(r.tri, p);
             push3(r.tri, n);
+            if (k == 0) r.tri_face.push_back(m.tri_face[t]);
         }
-    for (const auto& e : m.edges)
+    for (std::size_t ei = 0; ei < m.edges.size(); ++ei) {
+        const auto& e = m.edges[ei];
         for (std::size_t k = 1; k < e.size(); ++k) {
             push3(r.lines, m.points[static_cast<std::size_t>(e[k - 1])]);
             push3(r.lines, m.points[static_cast<std::size_t>(e[k])]);
+            r.line_edge.push_back(static_cast<int>(ei));
         }
+    }
     return r;
 }
 
@@ -201,10 +217,13 @@ inline Body make_surface_body(std::string name, const geom::NurbsSurface& S, int
         push3(body.mesh.tri, P[k]);
         push3(body.mesh.tri, N[k]);
     };
+    auto tri_done = [&] { body.mesh.tri_face.push_back(-1); };
     for (int i = 0; i < n; ++i)
         for (int j = 0; j < n; ++j) {
             for (std::size_t k : {id(i, j), id(i + 1, j), id(i + 1, j + 1)}) vert(k);
+            tri_done();
             for (std::size_t k : {id(i, j), id(i + 1, j + 1), id(i, j + 1)}) vert(k);
+            tri_done();
         }
     // Boundary curves as edges.
     for (int k = 0; k < n; ++k)
@@ -212,6 +231,7 @@ inline Body make_surface_body(std::string name, const geom::NurbsSurface& S, int
                             std::pair{id(0, k), id(0, k + 1)}, std::pair{id(n, k), id(n, k + 1)}}) {
             push3(body.mesh.lines, P[a]);
             push3(body.mesh.lines, P[b]);
+            body.mesh.line_edge.push_back(-1);
         }
     body.info.push_back(fmt("Open NURBS surface, degree (%d, %d), %d x %d control points", S.p, S.q, S.nu, S.nv));
     auto wr = std::minmax_element(S.cp.begin(), S.cp.end(), [](const Vec4d& a, const Vec4d& b) { return a.w < b.w; });
@@ -258,7 +278,9 @@ inline Outcome from_blended(std::string name, const op::BlendedSolid& s) {
 
 inline Outcome box(const Vec3d& o, const Vec3d& size) {
     if (!(size.x > 0 && size.y > 0 && size.z > 0)) return refused("Box: sizes must be positive");
-    return from_patch_solid("Box", op::make_box(o, o + size));
+    Outcome r = from_patch_solid("Box", op::make_box(o, o + size));
+    if (r.body) r.body->recipe = {Recipe::Box, o, o + size};
+    return r;
 }
 
 inline Outcome bump_box(const Vec3d& o, const Vec3d& size, double bump) {
@@ -303,9 +325,12 @@ inline op::fillet_detail::Section rectangle_section(double a, double b) {
 /// (W, H) optionally rounded or chamfered along the whole length.
 inline Outcome extrude_rect(const Vec3d& o, double W, double H, double L, Corner c, double r, double d2) {
     if (!(W > 0 && H > 0 && L > 0)) return refused("Extrude: sizes must be positive");
-    if (c == Corner::None)
-        return from_blended("Extrusion",
-                            op::fillet_detail::extrude_section(rectangle_section(W, H), o, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, L));
+    if (c == Corner::None) {
+        Outcome r = from_blended("Extrusion", op::fillet_detail::extrude_section(rectangle_section(W, H), o, {1, 0, 0},
+                                                                                 {0, 1, 0}, {0, 0, 1}, L));
+        if (r.body) r.body->recipe = {Recipe::Box, o, o + Vec3d{W, H, L}};
+        return r;
+    }
     return from_blended(c == Corner::Fillet ? "Extrusion, filleted edge" : "Extrusion, chamfered edge",
                         op::blend_box_edge(o, {W, 0, 0}, {0, H, 0}, {0, 0, L}, edge_cut(c, r, d2)));
 }
@@ -325,9 +350,16 @@ inline Outcome revolve_rect(double r0, double r1, double z0, double z1, int quar
                             double d2) {
     if (!(r0 > 0 && r1 > r0 && z1 > z0)) return refused("Revolve: needs 0 < r0 < r1 and z0 < z1");
     const char* turn = quarters == 4 ? "full turn" : quarters == 1 ? "quarter turn" : quarters == 2 ? "half turn" : "3/4 turn";
-    if (c == Corner::None)
-        return from_blended(fmt("Revolution (%s)", turn),
-                            op::fillet_detail::revolve_section(rectangle_section(r1 - r0, z1 - z0), r0, z0, 1.0, 1.0, quarters));
+    if (c == Corner::None) {
+        Outcome o = from_blended(fmt("Revolution (%s)", turn), op::fillet_detail::revolve_section(
+                                                                   rectangle_section(r1 - r0, z1 - z0), r0, z0, 1.0, 1.0, quarters));
+        if (o.body) {
+            o.body->recipe.kind = Recipe::Ring;
+            o.body->recipe.r0 = r0, o.body->recipe.r1 = r1, o.body->recipe.z0 = z0, o.body->recipe.z1 = z1;
+            o.body->recipe.quarters = quarters;
+        }
+        return o;
+    }
     return from_blended(fmt("Revolution (%s), %s edge", turn, c == Corner::Fillet ? "filleted" : "chamfered"),
                         op::blend_ring_edge(r0, r1, z0, z1, static_cast<op::RingEdge>(edge), edge_cut(c, r, d2), quarters));
 }

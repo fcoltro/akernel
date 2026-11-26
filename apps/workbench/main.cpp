@@ -12,6 +12,12 @@
 // Mouse: left drag orbits, right or middle drag pans, wheel zooms. Click a
 // body to make it A, Shift+click to make it B. F fits the view.
 //
+// Editing (edit_ops.hpp): four pick modes, keys 1-4. Body: arrows on A move
+// it (drag, snapped), plus typed moves and rotations. Face: pick a face to
+// push or pull it. Edge: pick an edge to fillet or chamfer it. Sketch: click
+// points on a work plane to draw a closed polyline, then extrude or revolve
+// it. Edits replace the body in place and keep its id.
+//
 // MCP: the app serves the Model Context Protocol at http://127.0.0.1:7878/mcp
 // (loopback only) so an assistant such as Claude Code can work in the same
 // scene: create bodies, run the kernel's tools, read results, take
@@ -20,6 +26,7 @@
 // Command line: --demo builds a small scene at start; --mcp-port N serves MCP
 // on another port; --no-mcp turns it off; --shot file.ppm renders the scene
 // once, saves the window as a PPM image and exits (for scripted checks).
+#include "edit_ops.hpp"
 #include "kernel_ops.hpp"
 #include "mcp_server.hpp"
 
@@ -143,6 +150,19 @@ struct Camera {
                               -dot(s, e), -dot(u, e), dot(f, e), 1};
         glLoadMatrixd(m);
     }
+    /// Pixel position (y down) of a world point in a w x h viewport; false if
+    /// the point is behind the eye.
+    bool project(const Vec3d& p, int w, int h, double& x, double& y) const {
+        Vec3d f, s, u;
+        frame(f, s, u);
+        const Vec3d r = p - eye();
+        const double z = dot(r, f);
+        if (!(z > 1e-9)) return false;
+        const double t = std::tan(0.5 * fovy), aspect = h > 0 ? double(w) / h : 1.0;
+        x = (dot(r, s) / (z * t * aspect) + 1.0) * 0.5 * w;
+        y = (1.0 - dot(r, u) / (z * t)) * 0.5 * h;
+        return true;
+    }
     /// The ray through pixel (x, y) of a w x h viewport (y down).
     void ray(double x, double y, int w, int h, Vec3d& o, Vec3d& d) const {
         Vec3d f, s, u;
@@ -202,14 +222,74 @@ struct App {
     double cut_d = 0.25;
     Vec3d move_t{0.5, 0, 0};
 
+    // Editing. Picks refer to the body with id pick_id (a face or an edge of it).
+    enum Mode { ModeBody, ModeFace, ModeEdge, ModeSketch };
+    int mode = ModeBody;
+    int pick_id = 0, pick_face = -1, pick_edge = -1;
+    int hover_body = -1, hover_face = -1, hover_edge = -1; ///< under the mouse (index, face, edge)
+    int pending_replace = 0;  ///< id of the body the running job replaces (0: it adds a new one)
+    double snap = 0.125;      ///< move and sketch snap
+    int gizmo_axis = -1, gizmo_hover = -1;
+    Vec3d gizmo_offset{0, 0, 0};
+    double rot_deg = 90;
+    double pp_dist = 0.25;
+    int eb_corner = 1;
+    double eb_r = 0.125, eb_d2 = 0.125;
+    // Sketch: a polyline in a work plane, in plane coordinates (x, y) or (x, z).
+    int sk_plane = 0; ///< 0: XY at z = level, 1: XZ at y = level
+    double sk_level = 0, sk_dist = 0.5;
+    int sk_quarters = 4;
+    std::vector<wb::P2> sketch;
+    bool sk_closed = false, sk_cursor_ok = false;
+    wb::P2 sk_cursor{0, 0};
+    // The 3D viewport: the window region between the panels (window pixels).
+    double vp_x0 = 330, vp_x1 = 1100, vp_h = 900;
+    int vp_w() const { return std::max(1, static_cast<int>(vp_x1 - vp_x0)); }
+    int vp_hi() const { return std::max(1, static_cast<int>(vp_h)); }
+
     void say(bool ok, std::string s) {
         log.push_front({ok, std::move(s)});
         if (log.size() > 200) log.pop_back();
     }
 
     void run(std::string label, std::function<Outcome()> f, std::vector<int> operands = {}) {
-        if (worker.start(label, std::move(f))) pending_operands = std::move(operands);
-        else say(false, "Busy: wait for \"" + worker.label() + "\" to finish");
+        if (worker.start(label, std::move(f))) {
+            pending_operands = std::move(operands);
+            pending_replace = 0;
+        } else {
+            say(false, "Busy: wait for \"" + worker.label() + "\" to finish");
+        }
+    }
+
+    /// Run an edit whose result replaces the body with this id (same id and colour).
+    void edit(std::string label, int id, std::function<Outcome()> f) {
+        if (worker.start(label, std::move(f))) {
+            pending_operands.clear();
+            pending_replace = id;
+        } else {
+            say(false, "Busy: wait for \"" + worker.label() + "\" to finish");
+        }
+    }
+
+    /// Put b in place of the body at index i, keeping its id, colour and visibility.
+    void replace(int i, Body b) {
+        Body& old = bodies[static_cast<std::size_t>(i)];
+        b.id = old.id;
+        b.color = old.color;
+        b.visible = true;
+        old = std::move(b);
+        if (pick_id == old.id) clear_pick();
+    }
+
+    void clear_pick() {
+        pick_id = 0;
+        pick_face = pick_edge = -1;
+    }
+
+    /// The body a face or edge pick refers to, or nullptr.
+    const Body* picked() const {
+        const int i = index_of(pick_id);
+        return i >= 0 ? &bodies[static_cast<std::size_t>(i)] : nullptr;
     }
 
     void add(Body b) {
@@ -230,13 +310,19 @@ struct App {
             for (int i : pending_operands)
                 if (hide_operands && i >= 0 && i < static_cast<int>(bodies.size())) bodies[static_cast<std::size_t>(i)].visible = false;
             say(true, wb::fmt("%s  (%.2f s)", o->message.c_str(), o->seconds));
-            const bool first = bodies.empty();
-            add(std::move(*o->body));
-            if (first) fit_all();
+            const int ri = pending_replace ? index_of(pending_replace) : -1;
+            if (ri >= 0) {
+                replace(ri, std::move(*o->body));
+            } else {
+                const bool first = bodies.empty();
+                add(std::move(*o->body));
+                if (first) fit_all();
+            }
         } else {
             say(false, wb::fmt("Refused: %s  (%.2f s)", o->message.c_str(), o->seconds));
         }
         pending_operands.clear();
+        pending_replace = 0;
     }
 
     void fit_all() {
@@ -286,8 +372,16 @@ struct App {
 
     /// Nearest visible body hit by the ray, or -1.
     int pick(const Vec3d& o, const Vec3d& d) const {
-        double best = 1e300;
+        int tri = -1;
+        double t = 0;
+        return pick_tri(o, d, tri, t);
+    }
+
+    /// Nearest visible body hit by the ray (or -1), its triangle and ray parameter.
+    int pick_tri(const Vec3d& o, const Vec3d& d, int& tri, double& best) const {
+        best = 1e300;
         int hit = -1;
+        tri = -1;
         for (std::size_t bi = 0; bi < bodies.size(); ++bi) {
             const Body& b = bodies[bi];
             if (!b.visible) continue;
@@ -307,10 +401,192 @@ struct App {
                 if (s > 0 && s < best) {
                     best = s;
                     hit = static_cast<int>(bi);
+                    tri = static_cast<int>(k / 18);
                 }
             }
         }
         return hit;
+    }
+
+    // ------------------------------------------------ editing: picking
+
+    /// Ray through the viewport pixel (x, y) (window pixels).
+    void ray_at(double x, double y, Vec3d& o, Vec3d& d) const { cam.ray(x - vp_x0, y, vp_w(), vp_hi(), o, d); }
+    bool project(const Vec3d& p, double& x, double& y) const {
+        if (!cam.project(p, vp_w(), vp_hi(), x, y)) return false;
+        x += vp_x0;
+        return true;
+    }
+
+    /// The face under the pixel: the body's index (or -1) and the face.
+    int face_at(double x, double y, int& face) const {
+        Vec3d o, d;
+        ray_at(x, y, o, d);
+        int tri = -1;
+        double t = 0;
+        const int b = pick_tri(o, d, tri, t);
+        face = -1;
+        if (b < 0) return -1;
+        const auto& tf = bodies[static_cast<std::size_t>(b)].mesh.tri_face;
+        if (tri >= 0 && tri < static_cast<int>(tf.size())) face = tf[static_cast<std::size_t>(tri)];
+        return face >= 0 ? b : -1; // open surfaces have no Brep faces
+    }
+
+    /// The edge nearest the pixel (within 8 pixels, not hidden behind a face):
+    /// the body's index (or -1) and the edge.
+    int edge_at(double x, double y, int& edge) const {
+        Vec3d o, d;
+        ray_at(x, y, o, d);
+        int tri = -1;
+        double t = 0;
+        const int fb = pick_tri(o, d, tri, t);
+        Vec3d f, sv, u;
+        cam.frame(f, sv, u);
+        const Vec3d eye = cam.eye();
+        const double front = fb >= 0 ? t * dot(d, f) : 1e300;
+        double best = 8.0;
+        int hit = -1;
+        edge = -1;
+        for (std::size_t bi = 0; bi < bodies.size(); ++bi) {
+            const Body& b = bodies[bi];
+            if (!b.visible || !b.solid) continue;
+            const auto& L = b.mesh.lines;
+            for (std::size_t k = 0; k < b.mesh.line_edge.size() && 6 * k + 5 < L.size(); ++k) {
+                const Vec3d p0{L[6 * k], L[6 * k + 1], L[6 * k + 2]}, p1{L[6 * k + 3], L[6 * k + 4], L[6 * k + 5]};
+                double x0, y0, x1, y1;
+                if (!project(p0, x0, y0) || !project(p1, x1, y1)) continue;
+                const double dx = x1 - x0, dy = y1 - y0, l2 = dx * dx + dy * dy;
+                const double s = l2 > 0 ? std::clamp(((x - x0) * dx + (y - y0) * dy) / l2, 0.0, 1.0) : 0.0;
+                const double dist = std::hypot(x0 + s * dx - x, y0 + s * dy - y);
+                if (dist >= best) continue;
+                const double depth = dot(p0 + (p1 - p0) * s - eye, f);
+                if (depth > front + 0.01 * cam.dist) continue; // behind the face under the mouse
+                best = dist;
+                hit = static_cast<int>(bi);
+                edge = b.mesh.line_edge[k];
+            }
+        }
+        return edge >= 0 ? hit : -1;
+    }
+
+    // ------------------------------------------------ editing: move arrows
+
+    static Vec3d center(const Body& b) {
+        return {0.5 * (double(b.mesh.lo[0]) + b.mesh.hi[0]), 0.5 * (double(b.mesh.lo[1]) + b.mesh.hi[1]),
+                0.5 * (double(b.mesh.lo[2]) + b.mesh.hi[2])};
+    }
+    double gizmo_len() const { return cam.dist * 0.15; }
+    static Vec3d axis_dir(int k) { return {k == 0 ? 1.0 : 0.0, k == 1 ? 1.0 : 0.0, k == 2 ? 1.0 : 0.0}; }
+    /// The body the arrows move (A in Body mode), or nullptr.
+    const Body* gizmo_body() const {
+        const Body* A = body(selA);
+        return mode == ModeBody && A && A->solid && A->visible && !A->mesh.empty() ? A : nullptr;
+    }
+    /// The arrow under the pixel (0, 1, 2 = x, y, z) or -1.
+    int gizmo_at(double x, double y) const {
+        const Body* A = gizmo_body();
+        if (!A) return -1;
+        const Vec3d c = center(*A);
+        double x0, y0;
+        if (!project(c, x0, y0)) return -1;
+        double best = 9.0;
+        int hit = -1;
+        for (int k = 0; k < 3; ++k) {
+            double x1, y1;
+            if (!project(c + axis_dir(k) * gizmo_len(), x1, y1)) continue;
+            const double dx = x1 - x0, dy = y1 - y0, l2 = dx * dx + dy * dy;
+            if (l2 < 1) continue;
+            const double s = std::clamp(((x - x0) * dx + (y - y0) * dy) / l2, 0.15, 1.0);
+            const double dist = std::hypot(x0 + s * dx - x, y0 + s * dy - y);
+            if (dist < best) {
+                best = dist;
+                hit = k;
+            }
+        }
+        return hit;
+    }
+    /// The snapped offset along the dragged arrow for a mouse drag (px, py) -> (x, y).
+    double gizmo_drag(double px, double py, double x, double y) const {
+        const Body* A = gizmo_body();
+        if (!A || gizmo_axis < 0) return 0;
+        const Vec3d c = center(*A);
+        double x0, y0, x1, y1;
+        if (!project(c, x0, y0) || !project(c + axis_dir(gizmo_axis) * gizmo_len(), x1, y1)) return 0;
+        const double dx = x1 - x0, dy = y1 - y0, l2 = dx * dx + dy * dy;
+        if (l2 < 1) return 0;
+        const double raw = ((x - px) * dx + (y - py) * dy) / l2 * gizmo_len();
+        return snap > 0 ? std::round(raw / snap) * snap : raw;
+    }
+    /// Move the body at index i by t, in place (exact for dyadic t).
+    void move_body(int i, const Vec3d& t) {
+        const Body* b = body(i);
+        if (!b || !b->solid) return;
+        const Body a = *b;
+        edit("Move", a.id, [a, t] {
+            Outcome o = wb::place(a, ak::op::SignedPermutation::translation(t), "");
+            if (o.ok) o.message = a.name + wb::fmt(", moved by (%g, %g, %g)", t.x, t.y, t.z);
+            if (o.body) {
+                o.body->name = a.name;
+                o.body->recipe = a.recipe;
+                if (a.recipe.kind == wb::Recipe::Box) {
+                    o.body->recipe.lo = a.recipe.lo + t;
+                    o.body->recipe.hi = a.recipe.hi + t;
+                } else {
+                    o.body->recipe.kind = wb::Recipe::None; // a ring off the z axis is no longer a plain revolution
+                }
+            }
+            return o;
+        });
+    }
+    /// Rotate the body at index i about an axis through its centre (snapped to 1/64), in place.
+    void rotate_body(int i, int axis, double deg) {
+        const Body* b = body(i);
+        if (!b || !b->solid) return;
+        const Body a = *b;
+        Vec3d c = center(a);
+        c = {std::round(c.x * 64) / 64, std::round(c.y * 64) / 64, std::round(c.z * 64) / 64};
+        edit("Rotate", a.id, [a, axis, deg, c] { return wb::rotate(a, axis, deg, c); });
+    }
+
+    // ------------------------------------------------ editing: sketch
+
+    /// The snapped sketch-plane point under the pixel.
+    bool sketch_at(double x, double y, wb::P2& q) const {
+        Vec3d o, d;
+        ray_at(x, y, o, d);
+        const double dn = sk_plane == 0 ? d.z : d.y, on = sk_plane == 0 ? o.z : o.y;
+        if (std::fabs(dn) < 1e-9) return false;
+        const double t = (sk_level - on) / dn;
+        if (!(t > 0)) return false;
+        const Vec3d P = o + d * t;
+        const double a = P.x, b = sk_plane == 0 ? P.y : P.z;
+        const double g = snap > 0 ? snap : 1e-9;
+        q = {std::round(a / g) * g, std::round(b / g) * g};
+        return true;
+    }
+    Vec3d sketch3(const wb::P2& q) const { return sk_plane == 0 ? Vec3d{q[0], q[1], sk_level} : Vec3d{q[0], sk_level, q[1]}; }
+    void sketch_add(const wb::P2& q) {
+        if (sk_closed) {
+            sketch.clear();
+            sk_closed = false;
+        }
+        if (sketch.size() >= 3 && q == sketch.front()) {
+            sk_closed = true;
+            return;
+        }
+        if (!sketch.empty() && q == sketch.back()) return;
+        sketch.push_back(q);
+    }
+    void sketch_extrude() {
+        const auto pts = sketch;
+        const auto pl = sk_plane == 0 ? wb::Plane::XY : wb::Plane::XZ;
+        const double lv = sk_level, dist = sk_dist;
+        run("Extrude sketch", [=] { return wb::extrude_sketch(pts, pl, lv, dist); });
+    }
+    void sketch_revolve() {
+        const auto pts = sketch;
+        const int q = sk_quarters;
+        run("Revolve sketch", [=] { return wb::revolve_sketch(pts, q); });
     }
 
     void demo() {
@@ -402,10 +678,133 @@ void draw_body(const Body& b, int role, bool edges) {
     glDisableClientState(GL_VERTEX_ARRAY);
 }
 
-void draw_scene(const App& app, int w, int h) {
-    glViewport(0, 0, w, h);
+/// Triangles of one Brep face of a body, as a flat overlay.
+void draw_face(const Body& b, int face, float r, float g, float bl, float a) {
+    const auto& t = b.mesh.tri;
+    glDisable(GL_LIGHTING);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(-1.0f, -1.0f);
+    glColor4f(r, g, bl, a);
+    glBegin(GL_TRIANGLES);
+    for (std::size_t k = 0; k < b.mesh.tri_face.size() && 18 * k + 17 < t.size(); ++k) {
+        if (b.mesh.tri_face[k] != face) continue;
+        for (std::size_t v = 0; v < 3; ++v) glVertex3f(t[18 * k + 6 * v], t[18 * k + 6 * v + 1], t[18 * k + 6 * v + 2]);
+    }
+    glEnd();
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    glDisable(GL_BLEND);
+}
+
+/// Segments of one Brep edge of a body.
+void draw_edge(const Body& b, int edge, float r, float g, float bl, float width) {
+    const auto& L = b.mesh.lines;
+    glDisable(GL_LIGHTING);
+    glDisable(GL_DEPTH_TEST);
+    glLineWidth(width);
+    glColor3f(r, g, bl);
+    glBegin(GL_LINES);
+    for (std::size_t k = 0; k < b.mesh.line_edge.size() && 6 * k + 5 < L.size(); ++k) {
+        if (b.mesh.line_edge[k] != edge) continue;
+        glVertex3f(L[6 * k], L[6 * k + 1], L[6 * k + 2]);
+        glVertex3f(L[6 * k + 3], L[6 * k + 4], L[6 * k + 5]);
+    }
+    glEnd();
+    glEnable(GL_DEPTH_TEST);
+}
+
+void draw_gizmo(const App& app) {
+    const Body* A = app.gizmo_body();
+    if (!A) return;
+    const Vec3d c = App::center(*A) + app.gizmo_offset;
+    const double L = app.gizmo_len();
+    static const float col[3][3] = {{0.95f, 0.3f, 0.3f}, {0.3f, 0.85f, 0.3f}, {0.35f, 0.55f, 1.0f}};
+    glDisable(GL_LIGHTING);
+    glDisable(GL_DEPTH_TEST);
+    for (int k = 0; k < 3; ++k) {
+        const bool hot = k == app.gizmo_axis || (app.gizmo_axis < 0 && k == app.gizmo_hover);
+        const float* cc = col[k];
+        const float m = hot ? 1.0f : 0.8f;
+        glColor3f(hot ? 1.0f : cc[0] * m, hot ? 0.9f : cc[1] * m, hot ? 0.3f : cc[2] * m);
+        const Vec3d tip = c + App::axis_dir(k) * L;
+        glLineWidth(hot ? 5.0f : 3.0f);
+        glBegin(GL_LINES);
+        glVertex3d(c.x, c.y, c.z);
+        glVertex3d(tip.x, tip.y, tip.z);
+        glEnd();
+        glPointSize(hot ? 13.0f : 10.0f);
+        glBegin(GL_POINTS);
+        glVertex3d(tip.x, tip.y, tip.z);
+        glEnd();
+    }
+    glPointSize(6.0f);
+    glColor3f(0.9f, 0.9f, 0.9f);
+    glBegin(GL_POINTS);
+    glVertex3d(c.x, c.y, c.z);
+    glEnd();
+    glEnable(GL_DEPTH_TEST);
+}
+
+void draw_sketch(const App& app) {
+    glDisable(GL_LIGHTING);
+    // The work plane's grid, at the snap step (at least 1/8, at most 41 lines a side).
+    const double g = std::max(app.snap, 0.125);
+    const int n = std::min(20, static_cast<int>(2.5 / g));
+    glLineWidth(1.0f);
+    glColor3f(0.35f, 0.42f, 0.5f);
+    glBegin(GL_LINES);
+    for (int i = -n; i <= n; ++i) {
+        const double t = g * i, e = g * n;
+        const Vec3d a = app.sketch3({t, -e}), b = app.sketch3({t, e}), c = app.sketch3({-e, t}), d = app.sketch3({e, t});
+        glVertex3d(a.x, a.y, a.z);
+        glVertex3d(b.x, b.y, b.z);
+        glVertex3d(c.x, c.y, c.z);
+        glVertex3d(d.x, d.y, d.z);
+    }
+    glEnd();
+    glDisable(GL_DEPTH_TEST);
+    glLineWidth(3.0f);
+    glColor3f(1.0f, 0.85f, 0.25f);
+    glBegin(app.sk_closed ? GL_LINE_LOOP : GL_LINE_STRIP);
+    for (const wb::P2& q : app.sketch) {
+        const Vec3d p = app.sketch3(q);
+        glVertex3d(p.x, p.y, p.z);
+    }
+    glEnd();
+    if (!app.sk_closed && !app.sketch.empty() && app.sk_cursor_ok) { // rubber band to the cursor
+        glLineWidth(1.5f);
+        glColor3f(1.0f, 0.85f, 0.25f);
+        glBegin(GL_LINES);
+        const Vec3d a = app.sketch3(app.sketch.back()), b = app.sketch3(app.sk_cursor);
+        glVertex3d(a.x, a.y, a.z);
+        glVertex3d(b.x, b.y, b.z);
+        glEnd();
+    }
+    glPointSize(8.0f);
+    glBegin(GL_POINTS);
+    for (std::size_t i = 0; i < app.sketch.size(); ++i) {
+        const Vec3d p = app.sketch3(app.sketch[i]);
+        if (i == 0) glColor3f(1.0f, 0.4f, 0.3f); // click the first point to close
+        else glColor3f(1.0f, 0.85f, 0.25f);
+        glVertex3d(p.x, p.y, p.z);
+    }
+    if (app.sk_cursor_ok && !app.sk_closed) {
+        glColor3f(1, 1, 1);
+        const Vec3d p = app.sketch3(app.sk_cursor);
+        glVertex3d(p.x, p.y, p.z);
+    }
+    glEnd();
+    glEnable(GL_DEPTH_TEST);
+}
+
+/// The scene in the viewport between the panels; sc = framebuffer / window pixels.
+void draw_scene(const App& app, int fw, int fh, double sc) {
+    glViewport(0, 0, fw, fh);
     glClearColor(0.16f, 0.17f, 0.19f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    const int x0 = static_cast<int>(app.vp_x0 * sc), w = std::max(1, static_cast<int>(app.vp_w() * sc)), h = fh;
+    glViewport(x0, 0, w, h);
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_MULTISAMPLE);
     // Head lights: set with the identity model-view so they follow the camera.
@@ -436,10 +835,30 @@ void draw_scene(const App& app, int w, int h) {
         const Body& b = app.bodies[i];
         if (!b.visible) continue;
         const int idx = static_cast<int>(i);
-        draw_body(b, idx == app.selA ? 1 : idx == app.selB ? 2 : 0, app.show_edges);
+        const bool moving = idx == app.selA && app.gizmo_axis >= 0;
+        if (moving) { // preview of an arrow drag
+            glPushMatrix();
+            glTranslated(app.gizmo_offset.x, app.gizmo_offset.y, app.gizmo_offset.z);
+        }
+        // In the face and edge modes bodies keep their own colours so the picks stand out.
+        const bool picking = app.mode == App::ModeFace || app.mode == App::ModeEdge;
+        draw_body(b, picking ? 0 : idx == app.selA ? 1 : idx == app.selB ? 2 : 0, app.show_edges || app.mode == App::ModeEdge);
+        if (moving) glPopMatrix();
     }
+    // Hovered and picked faces and edges.
+    if (app.mode == App::ModeFace && app.hover_body >= 0 && app.hover_face >= 0)
+        draw_face(app.bodies[static_cast<std::size_t>(app.hover_body)], app.hover_face, 1.0f, 1.0f, 1.0f, 0.25f);
+    if (app.mode == App::ModeEdge && app.hover_body >= 0 && app.hover_edge >= 0)
+        draw_edge(app.bodies[static_cast<std::size_t>(app.hover_body)], app.hover_edge, 1.0f, 1.0f, 1.0f, 3.0f);
+    if (const Body* p = app.picked(); p && p->visible) {
+        if (app.pick_face >= 0) draw_face(*p, app.pick_face, 1.0f, 0.75f, 0.15f, 0.6f);
+        if (app.pick_edge >= 0) draw_edge(*p, app.pick_edge, 1.0f, 0.75f, 0.15f, 5.0f);
+    }
+    draw_gizmo(app);
+    if (app.mode == App::ModeSketch) draw_sketch(app);
     glDisable(GL_LIGHTING);
     glDisable(GL_DEPTH_TEST);
+    glViewport(0, 0, fw, fh);
 }
 
 // ------------------------------------------------------------------- UI
@@ -479,13 +898,126 @@ void corner_inputs(const char* id, int& corner, double& r, double& d2) {
     ImGui::PopID();
 }
 
+const char* kSnaps[] = {"1", "1/2", "1/4", "1/8", "1/16", "1/32", "off"};
+
+void snap_input(App& app) {
+    static const double v[] = {1, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0};
+    int cur = 6;
+    for (int k = 0; k < 7; ++k)
+        if (app.snap == v[k]) cur = k;
+    if (ImGui::Combo("Snap", &cur, kSnaps, 7)) app.snap = v[cur];
+}
+
+/// The Edit section: pick mode and the operations on what is picked.
+void edit_panel(App& app) {
+    if (!ImGui::CollapsingHeader("Edit", ImGuiTreeNodeFlags_DefaultOpen)) return;
+    static const char* modes[] = {"Body", "Face", "Edge", "Sketch"};
+    for (int k = 0; k < 4; ++k) {
+        if (k) ImGui::SameLine();
+        if (ImGui::RadioButton(modes[k], app.mode == k)) app.mode = k;
+    }
+    help("Keys 1-4 switch the mode. Body: click a body (A), drag its arrows to move it. Face: click a face. "
+         "Edge: click an edge. Sketch: click points on the work plane. Left drag still orbits in every mode.");
+    const bool busy = app.worker.busy();
+    const Body* A = app.body(app.selA);
+    const Body* P = app.picked();
+    ImGui::Separator();
+    if (app.mode == App::ModeBody) {
+        ImGui::TextColored(ImVec4(0.45f, 0.7f, 1, 1), "A: %s", A ? A->name.c_str() : "(click a body)");
+        snap_input(app);
+        ImGui::BeginDisabled(!(A && A->solid) || busy);
+        drag3("Move by", app.move_t);
+        if (ImGui::Button("Move A")) app.move_body(app.selA, app.move_t);
+        help("Or drag one of the arrows on A in the view (snapped). The body keeps its id. Exact for dyadic steps.");
+        drag1("Angle (deg)", app.rot_deg, 1.0, -360.0, 360.0);
+        for (int k = 0; k < 3; ++k) {
+            if (k) ImGui::SameLine();
+            if (ImGui::Button(wb::fmt("Rotate %c", "XYZ"[k]).c_str())) app.rotate_body(app.selA, k, app.rot_deg);
+        }
+        help("About an axis through the centre of A. Multiples of 90 deg are exact for any solid; other angles work "
+             "on solids whose edges are all patch sides (boxes, extrusions, sketches), and round the vertices.");
+        ImGui::EndDisabled();
+    } else if (app.mode == App::ModeFace) {
+        if (P && app.pick_face >= 0) {
+            ImGui::TextColored(ImVec4(1, 0.75f, 0.2f, 1), "#%d %s", P->id, P->name.c_str());
+            ImGui::TextWrapped("%s", wb::face_info(*P, app.pick_face).c_str());
+        } else {
+            ImGui::TextDisabled("Click a face of a solid.");
+        }
+        drag1("Distance", app.pp_dist, 0.0625, 0.0, 1e9);
+        ImGui::BeginDisabled(!(P && app.pick_face >= 0) || busy);
+        auto go = [&](double d) {
+            const Body a = *P;
+            const int f = app.pick_face;
+            app.edit(d > 0 ? "Pull face" : "Push face", a.id, [a, f, d] { return wb::push_pull(a, f, d); });
+        };
+        if (ImGui::Button("Pull (add)")) go(app.pp_dist);
+        ImGui::SameLine();
+        if (ImGui::Button("Push (cut)")) go(-app.pp_dist);
+        help("A flat face normal to x, y or z with straight edges is extruded along its normal and united with the "
+             "body (pull) or subtracted from it (push): a kernel Boolean.");
+        ImGui::EndDisabled();
+    } else if (app.mode == App::ModeEdge) {
+        if (P && app.pick_edge >= 0) {
+            ImGui::TextColored(ImVec4(1, 0.75f, 0.2f, 1), "#%d %s", P->id, P->name.c_str());
+            ImGui::TextWrapped("%s", wb::edge_info(*P, app.pick_edge).c_str());
+        } else {
+            ImGui::TextDisabled("Click an edge of a solid.");
+        }
+        static const char* corners[] = {"Fillet", "Chamfer"};
+        int c = app.eb_corner - 1;
+        if (ImGui::Combo("Corner##eb", &c, corners, 2)) app.eb_corner = c + 1;
+        if (app.eb_corner == 1) drag1("Radius##eb", app.eb_r, 0.015625, 0.0, 1e9);
+        else {
+            drag1("Setback A##eb", app.eb_r, 0.015625, 0.0, 1e9);
+            drag1("Setback B##eb", app.eb_d2, 0.015625, 0.0, 1e9);
+        }
+        ImGui::BeginDisabled(!(P && app.pick_edge >= 0) || busy);
+        if (ImGui::Button(app.eb_corner == 1 ? "Fillet edge" : "Chamfer edge")) {
+            const Body a = *P;
+            const int e = app.pick_edge;
+            const auto corner = static_cast<wb::Corner>(app.eb_corner);
+            const double r = app.eb_r, d2 = app.eb_d2;
+            app.edit("Blend edge", a.id, [a, e, corner, r, d2] { return wb::blend_picked_edge(a, e, corner, r, d2); });
+        }
+        help("Works on boxes and extrusions (any of the 12 edges) and plain revolved rings (the circular edges), "
+             "which are rebuilt with the edge blended. Any edge of any solid needs op::round_edge (PR #13).");
+        ImGui::EndDisabled();
+    } else {
+        static const char* planes[] = {"XY (z = level)", "XZ (y = level)"};
+        ImGui::Combo("Plane", &app.sk_plane, planes, 2);
+        drag1("Level", app.sk_level, 0.0625);
+        snap_input(app);
+        ImGui::Text("%d point(s)%s", static_cast<int>(app.sketch.size()), app.sk_closed ? ", closed" : "");
+        ImGui::TextWrapped("Click to add points, click the first point (red) or press Enter to close. Backspace: undo. "
+                           "Esc: clear.");
+        const bool ready = app.sk_closed && app.sketch.size() >= 3 && !busy;
+        drag1("Distance##sk", app.sk_dist, 0.0625);
+        ImGui::BeginDisabled(!ready);
+        if (ImGui::Button("Extrude sketch")) app.sketch_extrude();
+        ImGui::EndDisabled();
+        help("XY: along +z (negative: -z). XZ: along -y (negative: +y).");
+        ImGui::SliderInt("Turns (1/4)##sk", &app.sk_quarters, 1, 4);
+        ImGui::BeginDisabled(!ready || app.sk_plane != 1 || app.sk_level != 0);
+        if (ImGui::Button("Revolve sketch about z")) app.sketch_revolve();
+        ImGui::EndDisabled();
+        help("Draw in the XZ plane at level 0 with x > 0; the profile turns about the z axis.");
+        if (ImGui::Button("Clear sketch")) {
+            app.sketch.clear();
+            app.sk_closed = false;
+        }
+    }
+}
+
 void tools_panel(App& app, float height) {
     ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(330, height), ImGuiCond_Always);
     ImGui::Begin("Tools", nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
     ImGui::PushItemWidth(170);
 
-    if (ImGui::CollapsingHeader("Primitives", ImGuiTreeNodeFlags_DefaultOpen)) {
+    edit_panel(app);
+
+    if (ImGui::CollapsingHeader("Primitives")) {
         drag3("Origin", app.origin);
         drag3("Size", app.size);
         if (ImGui::Button("Box")) { const Vec3d o = app.origin, s = app.size; app.run("Box", [=] { return wb::box(o, s); }); }
@@ -833,7 +1365,9 @@ std::string describe(const Body& b) {
 }
 
 /// Run a kernel call for an MCP client and put its body in the scene.
-json kernel_call(App& app, const std::string& label, const std::function<Outcome()>& f, std::vector<int> hide_ids = {}) {
+/// With replace_id, the result takes the place (and id) of that body instead.
+json kernel_call(App& app, const std::string& label, const std::function<Outcome()>& f, std::vector<int> hide_ids = {},
+                 int replace_id = 0) {
     app.on_ui([&] { app.say(true, "Claude: " + label + " ..."); });
     Outcome o;
     try {
@@ -849,6 +1383,13 @@ json kernel_call(App& app, const std::string& label, const std::function<Outcome
         for (int id : hide_ids) {
             const int i = app.index_of(id);
             if (i >= 0) app.bodies[static_cast<std::size_t>(i)].visible = false;
+        }
+        const int ri = replace_id ? app.index_of(replace_id) : -1;
+        if (ri >= 0) {
+            app.replace(ri, std::move(*o.body));
+            const Body& b = app.bodies[static_cast<std::size_t>(ri)];
+            app.say(true, wb::fmt("Claude: %s (#%d)  (%.2f s)", o.message.c_str(), b.id, o.seconds));
+            return mcp::text(wb::fmt("Changed body #%d in %.2f s.\n", b.id, o.seconds) + describe(b));
         }
         const bool first = app.bodies.empty();
         app.add(std::move(*o.body));
@@ -874,7 +1415,9 @@ void register_tools(mcp::Server& srv, App& app) {
         "(list_bodies). Units are model units; prefer dyadic values (multiples of 1/2^k such as 0.125) so the "
         "kernel's control points stay exact. Every created body is audited by the kernel (topology, volume, "
         "certified volume enclosure where covered, edge gap bound, watertight mesh); a refused operation returns "
-        "the kernel's reason as an error. Results appear live in the person's window; use screenshot to see it.");
+        "the kernel's reason as an error. Results appear live in the person's window; use screenshot to see it. "
+        "The person can pick a body, face or edge or draw a sketch in the window: get_selection tells you what they "
+        "picked, and move, push_pull, blend_edge, sketch_extrude and sketch_revolve act on it (edits keep the id).");
 
     srv.add({"list_bodies", "List the bodies in the scene with their ids, names, visibility and the kernel's audit lines.",
              schema(json::object()), [&app](const json&) {
@@ -1052,6 +1595,170 @@ void register_tools(mcp::Server& srv, App& app) {
                  std::vector<int> hide;
                  if (a.value("hide_operand", true)) hide = {id};
                  return kernel_call(app, op + wb::fmt(" of #%d", id), [&] { return wb::place(A, m, ""); }, hide);
+             }});
+
+    // ---- editing tools (the same operations as the Edit panel)
+
+    srv.add({"get_selection",
+             "What the person has selected in the window: the pick mode, bodies A and B, the picked face or edge "
+             "(with its kernel description) and the sketch being drawn. Use it to act on what they point at.",
+             schema(json::object()), [&app](const json&) {
+                 return app.on_ui([&] {
+                     static const char* modes[] = {"body", "face", "edge", "sketch"};
+                     std::string s = wb::fmt("Mode: %s\n", modes[app.mode]);
+                     const Body* a = app.body(app.selA);
+                     const Body* b = app.body(app.selB);
+                     s += a ? wb::fmt("A: #%d %s\n", a->id, a->name.c_str()) : std::string("A: none\n");
+                     s += b ? wb::fmt("B: #%d %s\n", b->id, b->name.c_str()) : std::string("B: none\n");
+                     if (const Body* p = app.picked()) {
+                         if (app.pick_face >= 0) s += wb::fmt("Picked on #%d: ", p->id) + wb::face_info(*p, app.pick_face) + "\n";
+                         if (app.pick_edge >= 0) s += wb::fmt("Picked on #%d: ", p->id) + wb::edge_info(*p, app.pick_edge) + "\n";
+                     } else {
+                         s += "No face or edge picked.\n";
+                     }
+                     s += wb::fmt("Sketch (%s plane at level %g, %s): ", app.sk_plane == 0 ? "XY" : "XZ", app.sk_level,
+                                  app.sk_closed ? "closed" : "open");
+                     json pts = json::array();
+                     for (const wb::P2& q : app.sketch) pts.push_back({q[0], q[1]});
+                     s += pts.dump() + "\n";
+                     return mcp::text(s);
+                 });
+             }});
+
+    srv.add({"topology",
+             "The faces and edges of a solid with their indices, for push_pull (face) and blend_edge (edge): each "
+             "face's kind and loops, each edge's kind, length and end points.",
+             schema({{"id", integer("solid id")}, {"what", choice({"faces", "edges", "both"}, "default both")}}, {"id"}),
+             [&app](const json& a) {
+                 const Body b = body_copy(app, a.at("id").get<int>());
+                 if (!b.brep) return mcp::text("Not a solid.", true);
+                 const std::string what = s1(a, "what", "both");
+                 std::string s;
+                 if (what != "edges")
+                     for (int f = 0; f < static_cast<int>(b.brep->faces.size()); ++f) s += wb::face_info(b, f) + "\n";
+                 if (what != "faces")
+                     for (int e = 0; e < static_cast<int>(b.brep->edges.size()); ++e) s += wb::edge_info(b, e) + "\n";
+                 return mcp::text(s);
+             }});
+
+    srv.add({"move",
+             "Move a solid in place (it keeps its id): translate by 'vector', and/or rotate by 'degrees' about the "
+             "x, y or z axis through 'pivot' (default: the centre of its bounding box snapped to 1/64). Multiples "
+             "of 90 degrees are exact for any solid; other angles need a solid whose edges are all patch sides.",
+             schema({{"id", integer("solid id")}, {"vector", vec3("translation")},
+                     {"axis", choice({"x", "y", "z"}, "rotation axis")}, {"degrees", num("rotation angle")},
+                     {"pivot", vec3("point on the rotation axis")}},
+                    {"id"}),
+             [&app](const json& a) {
+                 const int id = a.at("id").get<int>();
+                 Body A = body_copy(app, id);
+                 json last;
+                 if (a.contains("vector")) {
+                     const Vec3d t = v3(a, "vector", {0, 0, 0});
+                     const Body src = A;
+                     last = kernel_call(app, wb::fmt("move #%d", id), [&] {
+                         Outcome o = wb::place(src, ak::op::SignedPermutation::translation(t), "");
+            if (o.ok) o.message = src.name + wb::fmt(", moved by (%g, %g, %g)", t.x, t.y, t.z);
+                         if (o.body) {
+                             o.body->name = src.name;
+                             o.body->recipe = src.recipe;
+                             if (src.recipe.kind == wb::Recipe::Box) { o.body->recipe.lo = src.recipe.lo + t; o.body->recipe.hi = src.recipe.hi + t; }
+                             else o.body->recipe.kind = wb::Recipe::None;
+                         }
+                         return o;
+                     }, {}, id);
+                     if (last.value("isError", false)) return last;
+                     A = body_copy(app, id);
+                 }
+                 if (a.contains("degrees")) {
+                     const std::string ax = s1(a, "axis", "z");
+                     const int k = ax == "x" ? 0 : ax == "y" ? 1 : ax == "z" ? 2 : -1;
+                     if (k < 0) throw std::runtime_error("axis must be x, y or z");
+                     Vec3d c = App::center(A);
+                     c = {std::round(c.x * 64) / 64, std::round(c.y * 64) / 64, std::round(c.z * 64) / 64};
+                     c = v3(a, "pivot", c);
+                     const double deg = a["degrees"].get<double>();
+                     last = kernel_call(app, wb::fmt("rotate #%d", id), [&] { return wb::rotate(A, k, deg, c); }, {}, id);
+                 }
+                 if (last.is_null()) return mcp::text("Nothing to do: give vector and/or degrees.", true);
+                 return last;
+             }});
+
+    srv.add({"push_pull",
+             "Pull (distance > 0, adds material) or push (distance < 0, cuts) a flat face of a solid in place. The "
+             "face must be normal to x, y or z with straight edges and one loop. Face index from topology or "
+             "get_selection.",
+             schema({{"id", integer("solid id")}, {"face", integer("face index")}, {"distance", num("signed distance")}},
+                    {"id", "face", "distance"}),
+             [&app](const json& a) {
+                 const int id = a.at("id").get<int>(), f = a.at("face").get<int>();
+                 const double d = a.at("distance").get<double>();
+                 const Body A = body_copy(app, id);
+                 return kernel_call(app, wb::fmt("%s face %d of #%d", d > 0 ? "pull" : "push", f, id),
+                                    [&] { return wb::push_pull(A, f, d); }, {}, id);
+             }});
+
+    srv.add({"blend_edge",
+             "Fillet or chamfer one edge of a solid in place. Works on boxes and plain extrusions (any of the 12 "
+             "edges) and plain revolved rings (circular edges); other solids are refused until op::round_edge "
+             "lands. Edge index from topology or get_selection.",
+             schema({{"id", integer("solid id")}, {"edge", integer("edge index")},
+                     {"corner", choice({"fillet", "chamfer"}, "default fillet")},
+                     {"radius", num("fillet radius or first chamfer setback, default 0.125")},
+                     {"setback_b", num("second chamfer setback, default = radius")}},
+                    {"id", "edge"}),
+             [&app](const json& a) {
+                 const int id = a.at("id").get<int>(), e = a.at("edge").get<int>();
+                 const wb::Corner c = corner_of(s1(a, "corner", "fillet"));
+                 const double r = d1(a, "radius", 0.125), d2 = d1(a, "setback_b", r);
+                 const Body A = body_copy(app, id);
+                 return kernel_call(app, wb::fmt("blend edge %d of #%d", e, id),
+                                    [&] { return wb::blend_picked_edge(A, e, c, r, d2); }, {}, id);
+             }});
+
+    auto points_of = [](const json& a) {
+        std::vector<wb::P2> pts;
+        if (!a.contains("points") || !a["points"].is_array()) throw std::runtime_error("points must be [[u, v], ...]");
+        for (const json& q : a["points"]) {
+            if (!q.is_array() || q.size() != 2) throw std::runtime_error("each point must be [u, v]");
+            pts.push_back({q[0].get<double>(), q[1].get<double>()});
+        }
+        return pts;
+    };
+    const json pts_schema = {{"type", "array"},
+                             {"items", {{"type", "array"}, {"items", {{"type", "number"}}}, {"minItems", 2}, {"maxItems", 2}}},
+                             {"description", "closed polygon, no repeated first point: [[u, v], ...]"}};
+
+    srv.add({"sketch_extrude",
+             "Extrude a closed polygon sketch into a solid. plane xy: points are (x, y) at z = level, extruded along "
+             "+z by distance (negative: -z). plane xz: points are (x, z) at y = level, extruded along -y (negative: "
+             "+y). Omit points to use the sketch the person drew in the window.",
+             schema({{"points", pts_schema}, {"plane", choice({"xy", "xz"}, "default xy")}, {"level", num("default 0")},
+                     {"distance", num("default 0.5")}}),
+             [&app, points_of](const json& a) {
+                 std::vector<wb::P2> pts;
+                 wb::Plane pl = s1(a, "plane", "xy") == "xz" ? wb::Plane::XZ : wb::Plane::XY;
+                 double lv = d1(a, "level", 0);
+                 if (a.contains("points")) pts = points_of(a);
+                 else app.on_ui([&] {
+                     pts = app.sketch;
+                     pl = app.sk_plane == 0 ? wb::Plane::XY : wb::Plane::XZ;
+                     lv = app.sk_level;
+                 });
+                 const double dist = d1(a, "distance", 0.5);
+                 return kernel_call(app, "sketch extrude", [&] { return wb::extrude_sketch(pts, pl, lv, dist); });
+             }});
+
+    srv.add({"sketch_revolve",
+             "Revolve a closed polygon sketch in the XZ plane (points (x, z) with x > 0) about the z axis by "
+             "quarter_turns (1-4). Omit points to use the sketch the person drew in the window.",
+             schema({{"points", pts_schema}, {"quarter_turns", integer("1..4, default 4")}}),
+             [&app, points_of](const json& a) {
+                 std::vector<wb::P2> pts;
+                 if (a.contains("points")) pts = points_of(a);
+                 else app.on_ui([&] { pts = app.sketch; });
+                 const int q = i1(a, "quarter_turns", 4);
+                 return kernel_call(app, "sketch revolve", [&] { return wb::revolve_sketch(pts, q); });
              }});
 
     srv.add({"edit_scene",
@@ -1257,26 +1964,88 @@ int main(int argc, char** argv) {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
+        // The viewport is the window region between the panels.
+        app.vp_x0 = 330;
+        app.vp_x1 = std::max(app.vp_x0 + 1, static_cast<double>(ww) - 400);
+        app.vp_h = wh;
+
         // Viewport input, unless the UI has the mouse.
         double mx = 0, my = 0;
         glfwGetCursorPos(window, &mx, &my);
-        const bool ui = io.WantCaptureMouse;
+        const bool ui = io.WantCaptureMouse || mx < app.vp_x0 || mx > app.vp_x1;
         const bool l = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
         const bool r = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS ||
                        glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS;
+        // Hover: the arrow, face, edge or sketch point under the mouse.
+        app.gizmo_hover = -1;
+        app.hover_body = app.hover_face = app.hover_edge = -1;
+        app.sk_cursor_ok = false;
+        if (!ui && app.gizmo_axis < 0 && !dragging) {
+            if (app.mode == App::ModeBody && !app.worker.busy()) app.gizmo_hover = app.gizmo_at(mx, my);
+            else if (app.mode == App::ModeFace) app.hover_body = app.face_at(mx, my, app.hover_face);
+            else if (app.mode == App::ModeEdge) app.hover_body = app.edge_at(mx, my, app.hover_edge);
+        }
+        if (!ui && app.mode == App::ModeSketch) app.sk_cursor_ok = app.sketch_at(mx, my, app.sk_cursor);
         if (!ui && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            dragging = true;
             pressx = mx;
             pressy = my;
+            if (app.gizmo_hover >= 0) { // start an arrow drag
+                app.gizmo_axis = app.gizmo_hover;
+                app.gizmo_offset = {0, 0, 0};
+            } else {
+                dragging = true;
+            }
+        }
+        if (app.gizmo_axis >= 0) {
+            if (l) {
+                app.gizmo_offset = App::axis_dir(app.gizmo_axis) * app.gizmo_drag(pressx, pressy, mx, my);
+            } else { // released: move the body for real
+                if (norm(app.gizmo_offset) > 0) app.move_body(app.selA, app.gizmo_offset);
+                app.gizmo_axis = -1;
+                app.gizmo_offset = {0, 0, 0};
+            }
         }
         if (dragging && !l) {
             dragging = false;
-            if (std::fabs(mx - pressx) + std::fabs(my - pressy) < 4.0) {
-                Vec3d o, d;
-                app.cam.ray(mx, my, ww, wh, o, d);
-                const int hit = app.pick(o, d);
-                if (io.KeyShift) { app.selB = hit; if (app.selA == hit) app.selA = -1; }
-                else { app.selA = hit; if (app.selB == hit && hit >= 0) app.selB = -1; }
+            if (std::fabs(mx - pressx) + std::fabs(my - pressy) < 4.0) { // a click, not an orbit
+                if (app.mode == App::ModeSketch) {
+                    wb::P2 q;
+                    if (app.sketch_at(mx, my, q)) app.sketch_add(q);
+                } else if (app.mode == App::ModeFace || app.mode == App::ModeEdge) {
+                    int fe = -1;
+                    const int hit = app.mode == App::ModeFace ? app.face_at(mx, my, fe) : app.edge_at(mx, my, fe);
+                    app.clear_pick();
+                    if (hit >= 0) {
+                        app.selA = hit;
+                        if (app.selB == hit) app.selB = -1;
+                        app.pick_id = app.bodies[static_cast<std::size_t>(hit)].id;
+                        (app.mode == App::ModeFace ? app.pick_face : app.pick_edge) = fe;
+                    }
+                } else {
+                    Vec3d o, d;
+                    app.ray_at(mx, my, o, d);
+                    const int hit = app.pick(o, d);
+                    if (io.KeyShift) { app.selB = hit; if (app.selA == hit) app.selA = -1; }
+                    else { app.selA = hit; if (app.selB == hit && hit >= 0) app.selB = -1; }
+                }
+            }
+        }
+        if (!io.WantCaptureKeyboard) {
+            for (int k = 0; k < 4; ++k)
+                if (ImGui::IsKeyPressed(static_cast<ImGuiKey>(ImGuiKey_1 + k), false)) app.mode = k;
+            if (app.mode == App::ModeSketch) {
+                if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false))
+                    app.sk_closed = app.sketch.size() >= 3;
+                if (ImGui::IsKeyPressed(ImGuiKey_Backspace)) {
+                    if (app.sk_closed) app.sk_closed = false;
+                    else if (!app.sketch.empty()) app.sketch.pop_back();
+                }
+                if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+                    app.sketch.clear();
+                    app.sk_closed = false;
+                }
+            } else if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+                app.clear_pick();
             }
         }
         const double dx = mx - lastx, dy = my - lasty;
@@ -1301,7 +2070,7 @@ int main(int argc, char** argv) {
         bodies_panel(app, W, H);
         ImGui::Render();
 
-        draw_scene(app, fw, fh);
+        draw_scene(app, fw, fh, ww > 0 ? double(fw) / ww : 1.0);
         if (app.capture && !app.capture->full_window) {
             app.capture->png.set_value(grab_png(fw, fh, ww, app.capture->max_width, false));
             app.capture.reset();
